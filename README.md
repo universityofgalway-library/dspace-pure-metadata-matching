@@ -55,6 +55,15 @@ The script matches DSpace records to Pure records using the following identifier
 - Normalized title comparison: `dc.title` (DSpace) > `title.value` (Pure)
 - Case-insensitive, stripped from whitespaces
 
+#### Step 4: Duplicate Resolution
+- Prefer visibility FREE or CAMPUS
+- Prefer the record with most non-empty metadata fields, excluding the system fields
+- Prefer real users (as opposed to "root", "atira", "sync_user", "admin", "system")
+
+#### Step 5: Update or Create record
+- If matched, update the record according to the precedence rules
+- If unmatched, create a new records according to DSpace-Pure type mapping
+
 ### Author Matching
 
 For each author in `dc.contributor.author` (semicolon-separated), the script performs the following steps.
