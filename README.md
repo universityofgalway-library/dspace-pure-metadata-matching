@@ -56,9 +56,9 @@ The script matches DSpace records to Pure records using the following identifier
 - Case-insensitive, stripped from whitespaces
 
 #### Step 4: Duplicate Resolution
-- Prefer visibility FREE or CAMPUS
+- Prefer `visibility: "FREE"` or `"CAMPUS"`
 - Prefer the record with most non-empty metadata fields, excluding the system fields
-- Prefer real users (as opposed to "root", "atira", "sync_user", "admin", "system")
+- Prefer real users (as opposed to `root`, `atira`, `sync_user`, `admin`, `system`)
 
 #### Step 5: Update or Create record
 - If matched, update the record according to the precedence rules
