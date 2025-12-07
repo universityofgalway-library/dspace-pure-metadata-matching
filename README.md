@@ -105,19 +105,19 @@ For **matched records**, the script updates Pure metadata according to these pre
 
 | DSpace Field | Pure Target Field | Rule | Notes |
 |--------------|-------------------|------|-------|
-| `dc.contributor.author` | `contributors[]` | **Append** (no duplicates) | Maps to Person/ExternalPerson; preserves existing authors |
-| `dc.contributor.funder` | `fundingDetails.organizations[]` | **Fill if blank** | Not implemented (requires funder matching)  |
-| `dc.date.embargo` | `electronicVersions[].embargoPeriod.endDate` | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025` |
-| `dc.date.issued` | `publicationStatuses[].publicationDate` | **Fill if blank, upgrade only** | Flags year conflicts; doesn't overwrite existing year |
-| `dc.description.abstract` | `abstract.en_GB` | **Fill if blank** | |
-| `dc.description.sponsorship` | `fundingText.en_GB` | **Fill if blank** | |
-| `dc.identifier.doi` | `electronicVersions[]` | **Add if missing** | Creates new electronic version (publisher version) |
-| `dc.identifier.uri` (DOI) | `electronicVersions[]` | **Always add** | Creates new electronic version as author's accepted manuscript (open access) |
-| `dc.identifier.uri` (Handle) | `links[].url` | **Always add** | Never added as electronic version, only as a link |
-| `dc.language.iso` | `language.uri` | **Fill if blank** | Maps  ISO 639 codes to Pure codes |
-| `dc.publisher` | `managingOrganization` | **Fill if blank** | Not implemented (requires publisher matching) |
-| `dc.rights` | `electronicVersions[].licenseType` | **Overwrite** (repo version only) | Only for repository electronic versions |
-| `dc.title` | `title.value` | **Fill if blank** | Preserves existing Pure titles |
+| `dc.contributor.author` | `contributors[]` | **Append** (no duplicates) | Map to Person/ExternalPerson; preserve existing authors and order of the authors |
+| `dc.contributor.funder` | `fundingDetails.organizations[]` | **Fill if blank** | Prefer Pure when already authority-linked. Not implemented (requires funder matching)  |
+| `dc.date.embargo` | `electronicVersions[].embargoPeriod.endDate` | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; repository is authoritative for OA timing. |
+| `dc.date.issued` | `publicationStatuses[].publicationDate` | **Fill if blank, upgrade only** | Flag year conflicts; don't overwrite existing year |
+| `dc.description.abstract` | `abstract.en_GB` | **Fill if blank** | Do not overwrite Pure curated abstracts.|
+| `dc.description.sponsorship` | `fundingText.en_GB` | **Fill if blank** | Prefer Pure's funding info where present.|
+| `dc.identifier.doi` | `electronicVersions[]` | **Add if missing** | Create new electronic version (publisher version) if missing. Never overwrite a different DOI without review. |
+| `dc.identifier.uri` (DOI) | `electronicVersions[]` | **Always add** | Create new electronic version as author's accepted manuscript (open access) |
+| `dc.identifier.uri` (Handle) | `links[].url` | **Always add** | Add as link, never as an electronic version |
+| `dc.language.iso` | `language.uri` | **Fill if blank** | Map ISO 639 codes to Pure codes |
+| `dc.publisher` | `managingOrganization` | **Fill if blank** | Prefer authority-linked value in Pure. Not implemented (requires publisher matching) |
+| `dc.rights` | `electronicVersions[].licenseType` | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; OA licence is repository-authoritative |
+| `dc.title` | `title.value` | **Fill if blank** | Preserve existing Pure titles |
 
 
 ## DSpace to Pure Type Mapping
