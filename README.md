@@ -82,9 +82,9 @@ Searches the Person Mapping JSON for:
 #### Step 3: Duplicate Resolution
 If multiple matches are found, the following priority order is used.
 1. **Internal over External**: Person (internal) preferred over ExternalPerson
-2. **Visibility (Internal duplicates)**: prefer `visibility: "FREE"` or `"CAMPUS"`
-3. **Metadata Completeness (External duplicates)**:
-   - Fetches full external person records via API
+2. **Visibility (Internal duplicates only)**: prefer `visibility: "FREE"` or `"CAMPUS"`
+3. **Metadata Completeness**:
+   - Fetches full internal/external person records via API
    - Selects person with most non-empty metadata fields, excluding the system fields
 4. **First Match**: if still tied, use first remaining option
 
