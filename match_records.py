@@ -178,11 +178,11 @@ def find_person_match(person_name, person_mapping):
 import requests
 
 def resolve_author_duplicate(matches):
-    """Prefer Person over External Person, then by visibility (internal), then by metadata richness (external)"""
+    """Prefer Person over External Person, then by visibility (internal), then by metadata richness (both internal and external)"""
     if not matches:
         return None
 
-    # Sort by: internal > external, then by visibility (for internal), then by metadata richness (for external)
+    # Sort by: internal > external, then by visibility (for internal), then by metadata richness (for both)
     def score(person):
         internal = person.get("internal", False)
         external = person.get("external", False)
@@ -192,17 +192,53 @@ def resolve_author_duplicate(matches):
         # For internal: prefer FREE or CAMPUS
         vis_score = 0
         if internal:
-            vis = person.get("visibility", "")
-            if vis in ["FREE", "CAMPUS"]:
-                vis_score = 2
-            elif vis in ["BACKEND", "CONFIDENTIAL"]:
-                vis_score = 1
-            else:
-                vis_score = 0
+            internalUUIDs = person.get("internalUUIDs", [])
+            if internalUUIDs and isinstance(internalUUIDs, list) and len(internalUUIDs) > 0:
+                # Handle dict format with visibility
+                if isinstance(internalUUIDs[0], dict):
+                    vis = internalUUIDs[0].get("visibility", "")
+                    if vis in ["FREE", "CAMPUS"]:
+                        vis_score = 2
+                    elif vis in ["BACKEND", "CONFIDENTIAL"]:
+                        vis_score = 1
 
-        # For external: fetch full record for each UUID and pick the most complete
+        # For both internal and external: fetch full record for each UUID and pick the most complete
         metadata_score = 0
-        if external:
+        
+        if internal:
+            internalUUIDs = person.get("internalUUIDs", [])
+            if internalUUIDs:
+                best_uuid = None
+                max_fields = -1
+                for uuid_obj in internalUUIDs:
+                    # Extract UUID string from dict or use directly
+                    uuid = uuid_obj.get("uuid") if isinstance(uuid_obj, dict) else uuid_obj
+                    try:
+                        response = requests.get(
+                            f"https://galway-staging.elsevierpure.com/ws/api/persons/{uuid}",
+                            headers={
+                                "accept": "application/json",
+                                "api-key": API_KEY  
+                            },
+                            timeout=10
+                        )
+                        if response.status_code == 200:
+                            internal_person = response.json()
+                            # Count non-empty fields (excluding system ones)
+                            field_count = sum(1 for k, v in internal_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
+                            if field_count > max_fields:
+                                max_fields = field_count
+                                best_uuid = uuid_obj  # Keep original format (dict or string)
+                    except Exception as e:
+                        # Log error but continue
+                        print(f"⚠️ Failed to fetch internal person {uuid}: {e}")
+                # Use the best UUID found
+                if best_uuid:
+                    # Update person's internalUUIDs to use the best one
+                    person["internalUUIDs"] = [best_uuid]
+                    metadata_score = max_fields
+        
+        elif external:
             externalUUIDs = person.get("externalUUIDs", [])
             if externalUUIDs:
                 best_uuid = None
@@ -246,7 +282,8 @@ def resolve_record_duplicate(records):
     def score(record):
         # 1. Prefer visibility FREE or CAMPUS
         vis = record.get("visibility", {}).get("key", "")
-        vis_score = 2 if vis in ["FREE", "CAMPUS"] else (1 if vis in ["BACKEND", "CONFIDENTIAL"] else 0)
+        # No reason to give any score to CONFIDENTIAL or BACKEND records
+        vis_score = 1 if vis in ["FREE", "CAMPUS"] else 0
 
         # 2. Count filled fields (excluding system ones)
         field_count = sum(1 for k, v in record.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"])
