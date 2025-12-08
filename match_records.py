@@ -15,9 +15,9 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-DSpace_CSV = "./matching_test/dspace_test_100.csv"
-Pure_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
-Person_Mapping_JSON = "./matching_test/matched_authors/test_authors_all.json"
+DSPACE_CSV = "./matching_test/dspace_test_100.csv"
+PURE_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all.json"
 OUTPUT_DIR = "./matching_test/test_output"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -35,7 +35,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 # --- TYPE MAPPING ---
-DSpace_to_Pure_Type = {
+dspace_pure_subtype_map = {
     "journal article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
     "review article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
     "review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
@@ -83,6 +83,9 @@ class LoggerOutput:
 def normalize(s):
     return s.strip().lower() if s else ""
 
+def extract_uuid(uuid_entry):
+    return uuid_entry["uuid"] if isinstance(uuid_entry, dict) else uuid_entry
+
 def extract_dois_from_uri(uri_str):
     """Extract DOIs from dc.identifier.uri (semicolon-separated)"""
     if not uri_str:
@@ -120,6 +123,47 @@ def get_pure_type_key(pure_type_uri):
     if len(parts) >= 3:
         return parts[-2]
     return "unknown"
+
+def type_requires_peer_review(type_discriminator):
+    """Check if a research output type requires the peerReview field"""
+    types_without_peer_review = {
+        "WorkingPaper",
+        "NonTextual", 
+        "ContributionToPeriodical",
+        "Thesis",
+        "Memorandum"
+    }
+    return type_discriminator not in types_without_peer_review
+
+def get_default_peer_review_status(type_discriminator):
+    """Get default peer review status for types that require it"""
+    # Types typically peer-reviewed
+    typically_peer_reviewed = {
+        "ContributionToJournal",
+        "ContributionToBookAnthology",
+        "BookAnthology"
+    }
+    return type_discriminator in typically_peer_reviewed
+
+def add_type_specific_fields(record, dspace_row):
+    """Add type-specific required fields based on typeDiscriminator"""
+    type_disc = record["typeDiscriminator"]
+    
+    # Add peerReview if required for this type
+    if type_requires_peer_review(type_disc):
+        record["peerReview"] = get_default_peer_review_status(type_disc)
+        
+    if type_disc == "ContributionToJournal":
+        record["journalAssociation"] = {
+            "title": ""
+        }
+        
+    if type_disc == "ContributionToBookAnthology":
+        record["hostPublicationTitle"] = {
+            "value": ""
+        }
+    
+    return record
 
 def parse_author_names(author_str):
     """Parse semicolon-separated author names from DSpace"""
@@ -192,11 +236,11 @@ def resolve_author_duplicate(matches):
         # For internal: prefer FREE or CAMPUS
         vis_score = 0
         if internal:
-            internalUUIDs = person.get("internalUUIDs", [])
-            if internalUUIDs and isinstance(internalUUIDs, list) and len(internalUUIDs) > 0:
+            internal_uuids = person.get("internalUUIDs", [])
+            if internal_uuids and isinstance(internal_uuids, list) and len(internal_uuids) > 0:
                 # Handle dict format with visibility
-                if isinstance(internalUUIDs[0], dict):
-                    vis = internalUUIDs[0].get("visibility", "")
+                if isinstance(internal_uuids[0], dict):
+                    vis = internal_uuids[0].get("visibility", "")
                     if vis in ["FREE", "CAMPUS"]:
                         vis_score = 2
                     elif vis in ["BACKEND", "CONFIDENTIAL"]:
@@ -206,16 +250,15 @@ def resolve_author_duplicate(matches):
         metadata_score = 0
         
         if internal:
-            internalUUIDs = person.get("internalUUIDs", [])
-            if internalUUIDs:
+            internal_uuids = person.get("internalUUIDs", [])
+            if internal_uuids:
                 best_uuid = None
                 max_fields = -1
-                for uuid_obj in internalUUIDs:
-                    # Extract UUID string from dict or use directly
-                    uuid = uuid_obj.get("uuid") if isinstance(uuid_obj, dict) else uuid_obj
+                for uuid_obj in internal_uuids:
+                    uuid_value = extract_uuid(uuid_obj)
                     try:
                         response = requests.get(
-                            f"https://galway-staging.elsevierpure.com/ws/api/persons/{uuid}",
+                            f"https://galway-staging.elsevierpure.com/ws/api/persons/{uuid_value}",
                             headers={
                                 "accept": "application/json",
                                 "api-key": API_KEY  
@@ -228,25 +271,22 @@ def resolve_author_duplicate(matches):
                             field_count = sum(1 for k, v in internal_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
                             if field_count > max_fields:
                                 max_fields = field_count
-                                best_uuid = uuid_obj  # Keep original format (dict or string)
+                                best_uuid = uuid_value 
                     except Exception as e:
                         # Log error but continue
-                        print(f"⚠️ Failed to fetch internal person {uuid}: {e}")
-                # Use the best UUID found
-                if best_uuid:
-                    # Update person's internalUUIDs to use the best one
-                    person["internalUUIDs"] = [best_uuid]
-                    metadata_score = max_fields
+                        print(f"⚠️ Failed to fetch internal person {uuid_value}: {e}")
+                # Don't modify the person object; just score it
+                metadata_score = max_fields if best_uuid else 0
         
         elif external:
-            externalUUIDs = person.get("externalUUIDs", [])
-            if externalUUIDs:
+            external_uuids = person.get("externalUUIDs", [])
+            if external_uuids:
                 best_uuid = None
                 max_fields = -1
-                for uuid in externalUUIDs:
+                for uuid_value in external_uuids:
                     try:
                         response = requests.get(
-                            f"https://galway-staging.elsevierpure.com/ws/api/external-persons/{uuid}",
+                            f"https://galway-staging.elsevierpure.com/ws/api/external-persons/{uuid_value}",
                             headers={
                                 "accept": "application/json",
                                 "api-key": API_KEY  
@@ -259,15 +299,12 @@ def resolve_author_duplicate(matches):
                             field_count = sum(1 for k, v in external_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
                             if field_count > max_fields:
                                 max_fields = field_count
-                                best_uuid = uuid
+                                best_uuid = uuid_value
                     except Exception as e:
                         # Log error but continue
-                        print(f"⚠️ Failed to fetch external person {uuid}: {e}")
-                # Use the best UUID found
-                if best_uuid:
-                    # Update person's externalUUIDs to use the best one
-                    person["externalUUIDs"] = [best_uuid]
-                    metadata_score = max_fields
+                        print(f"⚠️ Failed to fetch external person {uuid_value}: {e}")
+                # Don't modify the person object; just score it
+                metadata_score = max_fields if best_uuid else 0
 
         return (type_score, vis_score, metadata_score)
 
@@ -297,32 +334,36 @@ def resolve_record_duplicate(records):
     sorted_records = sorted(records, key=score, reverse=True)
     return sorted_records[0]
 
-def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN", license_type="UNKNOWN", embargo_end_date=None):
-    """Build electronic version object"""
+def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
+                             license_type="UNSPECIFIED", embargo_end_date=None):
+    """
+    Build electronic version object ONLY when a DOI exists.
+    If no DOI is supplied, return None (Pure must not receive an electronicVersion entry).
+    """
+    if not doi:
+        return None  # <-- NEW: skip creating electronicVersion entirely
+
     ev = {
+        "typeDiscriminator": "DoiElectronicVersion",
+        "doi": doi,
         "accessType": {
-            "uri": f"/dk/atira/pure/researchoutput/electronicversion/accesstypes/{access_type.lower()}"
+            "uri": f"/dk/atira/pure/core/openaccesspermission/{access_type.lower()}"
         },
         "licenseType": {
-            "uri": f"/dk/atira/pure/researchoutput/electronicversion/licensetypes/{license_type.lower()}"
+            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
         },
         "versionType": {
             "uri": version_type_uri
-        },
-        "typeDiscriminator": "electronicVersion"
+        }
     }
-    
-    if doi:
-        ev["doi"] = doi
-
 
     if embargo_end_date:
         ev["embargoPeriod"] = {
-            # "startDate": "1970-01-01",
             "endDate": embargo_end_date
         }
 
     return ev
+
 
 def build_link(url, alias="", description=""):
     return {
@@ -338,6 +379,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     """
     success = True
     errors = []
+
+    pure_type = pure_record.get("typeDiscriminator", "")
 
     # --- 1. Authors (dc.contributor.author) > overwrite with mapped list from DSpace, but don't overwrite existing authors
     dspace_authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
@@ -386,24 +429,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 last = matched_person.get("lastName", "")
                 uuid_value = None
 
-                # Extract UUID consistently as a STRING
-                if matched_person.get("internal", False):
-                    internal_uuids = matched_person.get("internalUUIDs", [])
-                    if internal_uuids:
-                        # Always extract the string UUID from dict or use directly
-                        if isinstance(internal_uuids[0], dict):
-                            uuid_value = internal_uuids[0].get("uuid")
-                        else:
-                            uuid_value = internal_uuids[0]
-                elif matched_person.get("external", False):
-                    external_uuids = matched_person.get("externalUUIDs", [])
-                    if external_uuids:
-                        # External UUIDs should be strings, but handle dicts just in case
-                        if isinstance(external_uuids[0], dict):
-                            uuid_value = external_uuids[0].get("uuid")
-                        else:
-                            uuid_value = external_uuids[0]
-
                 name_key = (normalize(first), normalize(last))
                 if name_key in existing_author_keys or (uuid_value and uuid_value in existing_uuids):
                     # If author already exists, skip adding/updating
@@ -411,25 +436,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
                 # Create contributor object
                 if matched_person.get("internal", False) and matched_person.get("internalUUIDs"):
+                    internal_uuids = matched_person.get("internalUUIDs")
+                    uuid_value = extract_uuid(internal_uuids[0])
                     contributor = {
                         "typeDiscriminator": "InternalContributorAssociation",
                         "hidden": False,
+                        "correspondingAuthor": False, 
                         "name": {
                             "firstName": matched_person.get("firstName", ""),
                             "lastName": matched_person.get("lastName", "")
                         },
                         "role": {
-                            "uri": "/dk/atira/pure/researchoutput/roles/contributiontojournal/author",
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
                             "term": {"en_IE": "Author"}
                         },
                         "person": {
                             "systemName": "Person",
-                            "uuid": matched_person["internalUUIDs"][0]
+                            "uuid": uuid_value
                         }
                     }
                     # Add internal organizations if available
                     if "internalOrganizations" in matched_person:
-                        contributor["internalOrganizations"] = [
+                        contributor["organizations"] = [
                             {
                                 "systemName": "Organization",
                                 "uuid": org_uuid
@@ -437,21 +465,26 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                             for org_uuid in matched_person["internalOrganizations"]
                         ]
                     mapped_contributors.append(contributor)
+
                 elif matched_person.get("external", False) and matched_person.get("externalUUIDs"):
+                    external_uuids = matched_person.get("externalUUIDs")
+                    uuid_value = extract_uuid(external_uuids[0])
+
                     contributor = {
                         "typeDiscriminator": "ExternalContributorAssociation",
                         "hidden": False,
+                        "correspondingAuthor": False, 
                         "name": {
                             "firstName": matched_person.get("firstName", ""),
                             "lastName": matched_person.get("lastName", "")
                         },
                         "role": {
-                            "uri": "/dk/atira/pure/researchoutput/roles/contributiontojournal/author",
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
                             "term": {"en_IE": "Author"}
                         },
                         "externalPerson": {
                             "systemName": "ExternalPerson",
-                            "uuid": matched_person["externalUUIDs"][0]
+                            "uuid": uuid_value
                         }
                     }
                     # Add external organizations if available
@@ -494,7 +527,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         else:
             # Add new electronic version for repository
             ev = build_electronic_version(
-                doi=f"https://doi.org/10.13025/{pure_record.get('uuid', 'unknown')}",
+                doi=f"https://doi.org/10.13025/{pure_record.get('uuid')}",
                 version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
                 access_type="EMBARGOED",
                 license_type="CC_BY_NC_ND",
@@ -518,7 +551,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         if not pub_status:
             pure_record["publicationStatuses"] = [{
                 "publicationStatus": {
-                    "uri": "/dk/atira/pure/researchoutput/publicationstatuses/published",
+                    "uri": "/dk/atira/pure/researchoutput/status/published",
                     "term": {"en_GB": "Published"}
                 },
                 "publicationDate": {
@@ -570,7 +603,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 ev = build_electronic_version(
                     doi=f"https://doi.org/{doi}",
                     version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type="OPEN_ACCESS",
+                    access_type="OPEN",
                     license_type="CC_BY_NC_ND"
                 )
                 if "electronicVersions" not in pure_record:
@@ -597,7 +630,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         }
         lang_code = lang_map.get(lang.lower(), "en_GB")
         pure_record["language"] = {
-            "uri": f"/dk/atira/pure/researchoutput/languages/{lang_code}"
+            "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
 
     # --- 10. Publisher (dc.publisher) > fill if blank ---
@@ -627,7 +660,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             }
             license_type = license_map.get(rights, "CC_BY_NC_ND")
             repo_ev["licenseType"] = {
-                "uri": f"/dk/atira/pure/researchoutput/electronicversion/licensetypes/{license_type.lower()}"
+                "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
             }
 
     # --- 12. Title (dc.title) > fill if blank ---
@@ -643,32 +676,73 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 def create_new_record_from_dspace(dspace_row, person_mapping):
     """Create new Pure record from DSpace row"""
     record = {
-        "version": "string",  # Will be set by API
+        "version": None,  # Will be set by API
         "title": {"value": dspace_row.get("dc.title", "").strip()},
         "type": {
             "uri": ""
         },
         "category": {
-            "uri": "/dk/atira/pure/researchoutput/categories/uncategorized"
+            "uri": "/dk/atira/pure/researchoutput/category/research"
         },
         "language": {
-            "uri": "/dk/atira/pure/researchoutput/languages/en_GB"
+            "uri": "/dk/atira/pure/core/languages/en_GB"
         },
         "electronicVersions": [],
         "links": [],
+        "organizations": [
+                {
+                "systemName": "Organization",
+                "uuid": "1becab14-37ce-4810-9b95-fc014063bcae",
+                "name": {
+                        "en_IE": "University of Galway"
+                        },
+                "type": {
+                        "uri": "/dk/atira/pure/organisation/organisationtypes/organisation/university",
+                        "term": {
+                            "en_IE": "University"
+                            }
+                        }
+                }
+        ],
+        "managingOrganization": {
+            "uuid": "1becab14-37ce-4810-9b95-fc014063bcae",
+            "systemName": "Organization"
+            }, 
         "visibility": {
             "key": "FREE"
         },
         "workflow": {
             "step": "forApproval"
         },
-        "typeDiscriminator": "researchOutput"
+        "typeDiscriminator": "OtherContribution"
     }
 
-    # Set type based on dc.type
+    # Determine valid typeDiscriminator from Pure type URI
+    pure_type_map = {
+        "contributiontojournal": "ContributionToJournal",
+        "contributiontoconference": "ContributionToConference",
+        "contributiontobookanthology": "ContributionToBookAnthology",
+        "bookanthology": "BookAnthology",
+        "workingpaper": "WorkingPaper",
+        "nontextual": "NonTextual",
+        "contributiontoperiodical": "ContributionToPeriodical",
+        "thesis": "Thesis",
+        "othercontribution": "OtherContribution",
+        "patent": "Patent",
+        "memorandum": "Memorandum"
+    }
+
+    # Set Pure subtype based on dc.type
     dspace_type = dspace_row.get("dc.type", "").strip().lower()
-    pure_type_uri = DSpace_to_Pure_Type.get(dspace_type, "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other")
+    pure_type_uri = dspace_pure_subtype_map.get(dspace_type, "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other")
     record["type"]["uri"] = pure_type_uri
+
+    # Set Pute type
+    pure_type_key = get_pure_type_key(pure_type_uri)
+    record["typeDiscriminator"] = pure_type_map.get(pure_type_key, "OtherContribution")
+
+    # Add type-specific required fields
+    record = add_type_specific_fields(record, dspace_row)
 
     # Set publication date
     issued = dspace_row.get("dc.date.issued", "").strip()
@@ -679,7 +753,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
         day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
         record["publicationStatuses"] = [{
             "publicationStatus": {
-                "uri": "/dk/atira/pure/researchoutput/publicationstatuses/published"
+                "uri": "/dk/atira/pure/researchoutput/status/published"
             },
             "publicationDate": {
                 "year": year,
@@ -705,7 +779,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
         }
         lang_code = lang_map.get(lang.lower(), "en_GB")
         record["language"] = {
-            "uri": f"/dk/atira/pure/researchoutput/languages/{lang_code}"
+            "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
 
     # Set title
@@ -728,28 +802,28 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             matched_person = resolve_author_duplicate(matches)
             if matched_person:
                 if matched_person.get("internal", False) and matched_person.get("internalUUIDs"):
-                    internalUUIDs = matched_person.get("internalUUIDs", [])
-                    if not internalUUIDs:
-                        print(f"      ⚠️ No internal UUIDs — skipping")  # Log skipped
-                        continue
+                    internal_uuids = matched_person.get("internalUUIDs")
+                    uuid_value = extract_uuid(internal_uuids[0])
 
                     contributor = {
                         "typeDiscriminator": "InternalContributorAssociation",
                         "hidden": False,
+                        "correspondingAuthor": False,
                         "name": {
                             "firstName": matched_person.get("firstName", ""),
                             "lastName": matched_person.get("lastName", "")
                         },
                         "role": {
-                            "uri": "/dk/atira/pure/researchoutput/roles/contributiontojournal/author"
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/author",
+                            "term": {"en_IE": "Author"}
                         },
                         "person": {
                             "systemName": "Person",
-                            "uuid": internalUUIDs[0]
+                            "uuid": uuid_value
                         }
                     }
                     if "internalOrganizations" in matched_person:
-                        contributor["internalOrganizations"] = [
+                        contributor["organizations"] = [
                             {
                                 "systemName": "Organization",
                                 "uuid": org_uuid
@@ -758,25 +832,26 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
                         ]
                     mapped_contributors.append(contributor)
                     print(f"      ✅ Added as InternalContributor: {matched_person.get('firstName')} {matched_person.get('lastName')}")
+
                 elif matched_person.get("external", False) and matched_person.get("externalUUIDs"):
-                    externalUUIDs = matched_person.get("externalUUIDs", [])
-                    if not externalUUIDs:
-                        print(f"      ⚠️ No external UUIDs — skipping")  # Log skiped
-                        continue
+                    external_uuids = matched_person.get("externalUUIDs")
+                    uuid_value = extract_uuid(external_uuids[0])
 
                     contributor = {
                         "typeDiscriminator": "ExternalContributorAssociation",
                         "hidden": False,
+                        "correspondingAuthor": False,
                         "name": {
                             "firstName": matched_person.get("firstName", ""),
                             "lastName": matched_person.get("lastName", "")
                         },
                         "role": {
-                            "uri": "/dk/atira/pure/researchoutput/roles/contributiontojournal/author"
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/author",
+                            "term": {"en_IE": "Author"}
                         },
                         "externalPerson": {
                             "systemName": "ExternalPerson",
-                            "uuid": externalUUIDs[0]
+                            "uuid": uuid_value
                         }
                     }
                     if "externalOrganizations" in matched_person:
@@ -796,10 +871,55 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             print(f"      ⚠️ No matches found — adding to unmatched")  # Log
             unmatched_authors.append(author_name)
 
+    # Check if we have any contributors - if not, skip this record
+    if not mapped_contributors:
+        print(f"❌ No matched contributors found for this record - skipping")
+        return None  # Return None to indicate record should be skipped
+    
     # Always ensure author info is present
-    if mapped_contributors:
-        record["contributors"] = mapped_contributors
-        print(f"✅ Added {len(mapped_contributors)} contributors")
+    record["contributors"] = mapped_contributors
+
+    print(f"✅ Added {len(mapped_contributors)} contributors")
+    
+    # Collect all organizations from contributors and add to top-level organizations
+    all_org_uuids = set()
+    first_internal_org_uuid = None  # Track first internal contributor's first organization
+    
+    for i, contributor in enumerate(mapped_contributors):
+        # Collect from internal organizations
+        if "organizations" in contributor:
+            for j, org in enumerate(contributor["organizations"]):
+                org_uuid = org.get("uuid")
+                if org_uuid:
+                    all_org_uuids.add(org_uuid)
+                    # Capture first internal contributor's first organization
+                    if i == 0 and j == 0 and first_internal_org_uuid is None:
+                        first_internal_org_uuid = org_uuid
+        # Collect from external organizations
+        if "externalOrganizations" in contributor:
+            for org in contributor["externalOrganizations"]:
+                org_uuid = org.get("uuid")
+                if org_uuid:
+                    all_org_uuids.add(org_uuid)
+    
+    # Add collected organizations to top-level organizations (avoid duplicates)
+    if all_org_uuids:
+        existing_org_uuids = {org.get("uuid") for org in record.get("organizations", []) if org.get("uuid")}
+        for org_uuid in all_org_uuids:
+            if org_uuid not in existing_org_uuids:
+                record["organizations"].append({
+                    "systemName": "Organization",
+                    "uuid": org_uuid
+                })
+    
+    # Set managingOrganization from first internal contributor's first organization
+    if first_internal_org_uuid:
+        record["managingOrganization"] = {
+            "uuid": first_internal_org_uuid,
+            "systemName": "Organization"
+        }
+        print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
+
     
     # Only add unmatched authors as keywordGroups if there are actually unmatched authors
     if unmatched_authors:
@@ -845,13 +965,13 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
                 ev = build_electronic_version(
                     doi=f"https://doi.org/{doi}",
                     version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type="OPEN_ACCESS",
+                    access_type="OPEN",
                     license_type="CC_BY_NC_ND"
                 )
-                if "electronicVersions" not in record:
-                    record["electronicVersions"] = []
-                record["electronicVersions"].append(ev)
-
+                if ev:  # Check if not None
+                    if "electronicVersions" not in record:
+                        record["electronicVersions"] = []
+                    record["electronicVersions"].append(ev)
         for handle in handles:
             link = build_link(f"http://hdl.handle.net/{handle}", alias="Handle", description="Repository Handle")
             if "links" not in record:
@@ -880,7 +1000,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             }
             license_type = license_map.get(rights, "CC_BY_NC_ND")
             repo_ev["licenseType"] = {
-                "uri": f"/dk/atira/pure/researchoutput/electronicversion/licensetypes/{license_type.lower()}"
+                "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
             }
 
     return record
@@ -896,21 +1016,21 @@ def main():
     # Load data
     print("Loading DSpace CSV...")
     dspace_rows = []
-    with open(DSpace_CSV, 'r', encoding='utf-8') as f:
+    with open(DSPACE_CSV, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             dspace_rows.append(row)
-    print(f"✅ Loaded {len(dspace_rows)} records from {DSpace_CSV}")
+    print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
 
     print("Loading Pure JSON...")
-    with open(Pure_JSON, 'r', encoding='utf-8') as f:
+    with open(PURE_JSON, 'r', encoding='utf-8') as f:
         pure_items = json.load(f)
-    print(f"✅ Loaded {len(pure_items)} records from {Pure_JSON}")
+    print(f"✅ Loaded {len(pure_items)} records from {PURE_JSON}")
 
     print("Loading Person Mapping...")
-    with open(Person_Mapping_JSON, 'r', encoding='utf-8') as f:
+    with open(PERSON_MAPPING_JSON, 'r', encoding='utf-8') as f:
         person_mapping = json.load(f)
-    print(f"✅ Loaded {len(person_mapping)} person records from {Person_Mapping_JSON}")
+    print(f"✅ Loaded {len(person_mapping)} person records from {PERSON_MAPPING_JSON}")
 
     # Prepare logs
     log_entries = []
@@ -1017,20 +1137,26 @@ def main():
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
                 new_record = create_new_record_from_dspace(row, person_mapping)
-                log_entry["success"] = True
-                log_entry["pure_type"] = new_record.get("type", {}).get("uri", "")
+                
+                # Skip record if no contributors were matched
+                if new_record is None:
+                    log_entry["success"] = False
+                    log_entry["error"] = "No matched contributors"
+                else:
+                    log_entry["success"] = True
+                    log_entry["pure_type"] = new_record.get("type", {}).get("uri", "")
 
-                # Save to unmatched folder
-                type_key = get_pure_type_key(log_entry["pure_type"])
-                filename = f"{type_key}_{TODAY}.json"
-                filepath = os.path.join(UNMATCHED_DIR, filename)
-                existing = []
-                if os.path.exists(filepath):
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        existing = json.load(f)
-                existing.append(new_record)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(existing, f, indent=2, ensure_ascii=False)
+                    # Save to unmatched folder
+                    type_key = get_pure_type_key(log_entry["pure_type"])
+                    filename = f"{type_key}_{TODAY}.json"
+                    filepath = os.path.join(UNMATCHED_DIR, filename)
+                    existing = []
+                    if os.path.exists(filepath):
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            existing = json.load(f)
+                    existing.append(new_record)
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(existing, f, indent=2, ensure_ascii=False)
             except Exception as e:
                 log_entry["success"] = False
                 log_entry["error"] = str(e)
