@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-DSPACE_CSV = "./matching_test/dspace_test_100.csv"
+DSPACE_CSV = "./matching_test/dspace_test_sample.csv"
 PURE_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
 PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all.json"
 OUTPUT_DIR = "./matching_test/test_output"
@@ -83,6 +83,38 @@ class LoggerOutput:
 def normalize(s):
     return s.strip().lower() if s else ""
 
+def escape_special_chars(text):
+    """Replace special characters with HTML entity codes"""
+    if not text:
+        return text
+    
+    # Mapping of special characters to HTML entities
+    replacements = {
+        '<': '&lt;',
+        '>': '&gt;',
+        '&': '&amp;',
+        '"': '&quot;',
+        "'": '&apos;',
+        '¢': '&cent;',
+        '£': '&pound;',
+        '¥': '&yen;',
+        '€': '&euro;',
+        '©': '&copy;',
+        '®': '&reg;'
+    }
+    
+    result = text
+    # Replace & first to avoid double-encoding other entities
+    if '&' in result and not result.startswith('&'):
+        result = result.replace('&', '&amp;')
+    
+    # Replace other characters
+    for char, entity in replacements.items():
+        if char != '&':  # Skip & since we already handled it
+            result = result.replace(char, entity)
+    
+    return result
+
 def extract_uuid(uuid_entry):
     return uuid_entry["uuid"] if isinstance(uuid_entry, dict) else uuid_entry
 
@@ -128,7 +160,6 @@ def type_requires_peer_review(type_discriminator):
     """Check if a research output type requires the peerReview field"""
     types_without_peer_review = {
         "WorkingPaper",
-        "NonTextual", 
         "ContributionToPeriodical",
         "Thesis",
         "Memorandum"
@@ -153,14 +184,17 @@ def add_type_specific_fields(record, dspace_row):
     if type_requires_peer_review(type_disc):
         record["peerReview"] = get_default_peer_review_status(type_disc)
         
-    if type_disc == "ContributionToJournal":
+    if type_disc == "ContributionToJournal" or type_disc == "ContributionToPeriodical":
         record["journalAssociation"] = {
-            "title": ""
+                "journal": {
+                    "systemName": "Journal",
+                    "uuid": "f0da45fc-fec1-42f5-80a9-c1446ccce300"  # Placeholder UUID for TEST JOURNAL (UAT)
+                    }
         }
         
     if type_disc == "ContributionToBookAnthology":
         record["hostPublicationTitle"] = {
-            "value": ""
+            "value": "-"
         }
     
     return record
@@ -569,12 +603,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     # --- 5. Abstract (dc.description.abstract) > fill if blank ---
     abstract = dspace_row.get("dc.description.abstract", "").strip()
     if abstract and not pure_record.get("abstract", {}).get("en_GB", "").strip():
-        pure_record["abstract"] = {"en_GB": abstract}
+        pure_record["abstract"] = {"en_GB": escape_special_chars(abstract)}
 
     # --- 6. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
     if sponsorship and not pure_record.get("fundingText", {}).get("en_GB", "").strip():
-        pure_record["fundingText"] = {"en_GB": sponsorship}
+        pure_record["fundingText"] = {"en_GB": escape_special_chars(sponsorship)}
 
     # --- 7. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
@@ -666,7 +700,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     # --- 12. Title (dc.title) > fill if blank ---
     title = dspace_row.get("dc.title", "").strip()
     if title and not pure_record.get("title", {}).get("value", "").strip():
-        pure_record["title"] = {"value": title}
+        pure_record["title"] = {"value": escape_special_chars(title)}
 
     log_entry["success"] = success and not errors
     if errors:
@@ -675,9 +709,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
 def create_new_record_from_dspace(dspace_row, person_mapping):
     """Create new Pure record from DSpace row"""
+    # Escape special characters in title first
+    escaped_title = escape_special_chars(dspace_row.get("dc.title", "").strip())
+    
     record = {
         "version": None,  # Will be set by API
-        "title": {"value": dspace_row.get("dc.title", "").strip()},
+        "title": {"value": escaped_title},
         "type": {
             "uri": ""
         },
@@ -765,7 +802,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     # Set abstract
     abstract = dspace_row.get("dc.description.abstract", "").strip()
     if abstract:
-        record["abstract"] = {"en_GB": abstract}
+        record["abstract"] = {"en_GB": escape_special_chars(abstract)}
 
     # Set language
     lang = dspace_row.get("dc.language.iso", "").strip()
@@ -785,7 +822,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     # Set title
     title = dspace_row.get("dc.title", "").strip()
     if title:
-        record["title"] = {"value": title}
+        record["title"] = {"value": escape_special_chars(title)}
 
     # Set contributors
     dspace_authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
