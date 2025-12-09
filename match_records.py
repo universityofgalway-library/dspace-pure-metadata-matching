@@ -88,19 +88,11 @@ def escape_special_chars(text):
     if not text:
         return text
     
-    # Mapping of special characters to HTML entities
+    # Mapping of reserved HTML characters
     replacements = {
         '<': '&lt;',
         '>': '&gt;',
-        '&': '&amp;',
-        '"': '&quot;',
-        "'": '&apos;',
-        '¢': '&cent;',
-        '£': '&pound;',
-        '¥': '&yen;',
-        '€': '&euro;',
-        '©': '&copy;',
-        '®': '&reg;'
+        '&': '&amp;'
     }
     
     result = text
