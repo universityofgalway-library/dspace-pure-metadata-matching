@@ -83,6 +83,10 @@ class LoggerOutput:
 def normalize(s):
     return s.strip().lower() if s else ""
 
+def has_text_in_any_language(obj, key, languages=["en_GB", "en_IE", "en_US"]):
+    """Check if object has non-empty text in any of the given languages"""
+    return any(obj.get(key, {}).get(lang, "").strip() for lang in languages)
+
 def escape_special_chars(text):
     """Replace special characters with HTML entity codes"""
     if not text:
@@ -395,7 +399,7 @@ def build_link(url, alias="", description=""):
     return {
         "url": url,
         "alias": alias,
-        "description": {"en_GB": description}
+        "description": {"en_IE": description}
         }
 
 def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry):
@@ -578,7 +582,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             pure_record["publicationStatuses"] = [{
                 "publicationStatus": {
                     "uri": "/dk/atira/pure/researchoutput/status/published",
-                    "term": {"en_GB": "Published"}
+                    "term": {"en_IE": "Published"}
                 },
                 "publicationDate": {
                     "year": year,
@@ -594,13 +598,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
     # --- 5. Abstract (dc.description.abstract) > fill if blank ---
     abstract = dspace_row.get("dc.description.abstract", "").strip()
-    if abstract and not pure_record.get("abstract", {}).get("en_GB", "").strip():
-        pure_record["abstract"] = {"en_GB": escape_special_chars(abstract)}
+    if abstract and not has_text_in_any_language(pure_record, "abstract"):
+        pure_record["abstract"] = {"en_IE": escape_special_chars(abstract)}
 
     # --- 6. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
-    if sponsorship and not pure_record.get("fundingText", {}).get("en_GB", "").strip():
-        pure_record["fundingText"] = {"en_GB": escape_special_chars(sponsorship)}
+    if sponsorship and not has_text_in_any_language(pure_record, "fundingText"):
+        pure_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
 
     # --- 7. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
@@ -794,7 +798,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     # Set abstract
     abstract = dspace_row.get("dc.description.abstract", "").strip()
     if abstract:
-        record["abstract"] = {"en_GB": escape_special_chars(abstract)}
+        record["abstract"] = {"en_IE": escape_special_chars(abstract)}
 
     # Set language
     lang = dspace_row.get("dc.language.iso", "").strip()
