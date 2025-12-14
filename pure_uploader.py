@@ -99,7 +99,7 @@ def log_record(mode, data_type, response_data, log_dir):
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(existing_records, f, indent=2, ensure_ascii=False)
 
-def save_failed_records(failed_records, source_path, mode):
+def save_failed_records(failed_records, source_path, data_type, mode):
     """
     Save all failed records to a single JSON file in the source directory.
     """
@@ -114,7 +114,7 @@ def save_failed_records(failed_records, source_path, mode):
     else:
         output_dir = os.path.dirname(source_path)
     
-    output_filename = f"failed_records_{mode}_{timestamp}.json"
+    output_filename = f"failed_records_{data_type}_{mode}_{timestamp}.json"
     output_path = os.path.join(output_dir, output_filename)
     
     # Write failed records to file
@@ -207,7 +207,7 @@ def process_folder(folder_path, data_type, session, error_log, log_dir):
     
     # Save failed records if any
     if all_failed_records:
-        failed_path = save_failed_records(all_failed_records, folder_path, mode)
+        failed_path = save_failed_records(all_failed_records, folder_path, data_type, mode)
         if failed_path:
             print(f"\n⚠️ {len(all_failed_records)} failed records saved to: {failed_path}")
     
@@ -218,7 +218,7 @@ def process_single_file(path, mode, data_type, session, error_log, log_dir):
     
     # Save failed records if any
     if failed_records:
-        failed_path = save_failed_records(failed_records, path, mode)
+        failed_path = save_failed_records(failed_records, path, data_type, mode)
         if failed_path:
             print(f"\n⚠️ {len(failed_records)} failed records saved to: {failed_path}")
     

@@ -710,17 +710,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             if existing_year != 0 and existing_year != year:
                 errors.append(f"Publication year conflict: Pure={existing_year}, DSpace={year}")
 
-    # --- 4. Abstract (dc.description.abstract) > fill if blank ---
-    abstract = dspace_row.get("dc.description.abstract", "").strip()
-    if abstract and not has_text_in_any_language(pure_record, "abstract"):
-        pure_record["abstract"] = {"en_IE": escape_special_chars(abstract)}
-
-    # --- 5. Sponsorship (dc.description.sponsorship) > fill if blank ---
+    # --- 4. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
     if sponsorship and not has_text_in_any_language(pure_record, "fundingText"):
         pure_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
 
-    # --- 6. Publisher DOI (dc.identifier.doi) > add if blank ---
+    # --- 5. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     if publisher_doi:
         publisher_doi = normalize_doi(publisher_doi)
@@ -736,7 +731,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 pure_record["electronicVersions"] = []
             pure_record["electronicVersions"].append(ev)
 
- # --- 7. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
+ # --- 6. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
     embargo_date = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
 
@@ -766,7 +761,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             "type": "CC_BY_NC_ND"
         }
     
-    # --- 8. Repository DOI & Handle (dc.identifier.uri) > always add ---
+    # --- 7. Repository DOI & Handle (dc.identifier.uri) > always add ---
     else:
         uri_str = dspace_row.get("dc.identifier.uri", "").strip()
         if uri_str:
@@ -802,21 +797,30 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 pure_record["links"].append(link)
 
 
-    # --- 9. Language (dc.language.iso) > fill if blank ---
+    # --- 8. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
     if lang and not pure_record.get("language", {}).get("uri", ""):
         lang_map = {
-            "eng": "en_GB",
+            "eng": "en_IE",
             "fre": "fr_FR",
             "ger": "de_DE",
             "spa": "es_ES",
-            "gle": "ga_IE"
+            "gle": "ga"
             # Add more as needed
         }
-        lang_code = lang_map.get(lang.lower(), "en_GB")
+        lang_code = lang_map.get(lang.lower(), "en_IE")
         pure_record["language"] = {
             "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
+
+    # --- 9. Abstract (dc.description.abstract) > fill if blank ---
+    abstract = dspace_row.get("dc.description.abstract", "").strip()
+    if abstract and not has_text_in_any_language(pure_record, "abstract"):
+        if lang_code == "ga":
+            # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
+            pure_record["abstract"] = {"en_IE": escape_special_chars(abstract), "ga": escape_special_chars(abstract)}
+        else:
+            pure_record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
     # --- 10. Publisher (dc.publisher) > fill if blank ---
     # publisher = dspace_row.get("dc.publisher", "").strip()
@@ -955,25 +959,29 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             }
         }]
 
-    # Set abstract
-    abstract = dspace_row.get("dc.description.abstract", "").strip()
-    if abstract:
-        record["abstract"] = {"en_IE": escape_special_chars(abstract)}
-
     # Set language
     lang = dspace_row.get("dc.language.iso", "").strip()
     if lang:
         lang_map = {
-            "eng": "en_GB",
+            "eng": "en_IE",
             "fre": "fr_FR",
             "ger": "de_DE",
             "spa": "es_ES",
-            "gle": "ga_IE"
+            "gle": "ga"
         }
-        lang_code = lang_map.get(lang.lower(), "en_GB")
+        lang_code = lang_map.get(lang.lower(), "en_IE")
         record["language"] = {
             "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
+
+    # Set abstract
+    abstract = dspace_row.get("dc.description.abstract", "").strip()
+    if abstract:
+        if lang_code == "ga":
+            # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
+            record["abstract"] = {"en_IE": escape_special_chars(abstract), "ga": escape_special_chars(abstract)}
+        else:
+            record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
     # Set title
     title = dspace_row.get("dc.title", "").strip()
