@@ -1344,7 +1344,7 @@ def main():
         # Extract handles from URI
         handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
         if handles:
-            log_entry["handle"] = f"http://hdl.handle.net/{handles[0]}"  # Use first handle
+            log_entry["handle"] = handles[0]  # Use first handle
 
         # Extract repository DOI from dc.identifier.uri
         repo_dois = extract_dois_from_uri(row.get("dc.identifier.uri", ""))

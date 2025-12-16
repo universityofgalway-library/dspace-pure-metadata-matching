@@ -63,6 +63,24 @@ def extract_name_from_response(response_data, data_type):
     
     return ""
 
+def extract_handle_from_links(response_data):
+    """
+    Extract handle URL from links array in API response.
+    Looks for URL containing 'hdl.handle.net'.
+    Returns empty string if not found.
+    """
+    links = response_data.get("links", [])
+    if not isinstance(links, list):
+        return ""
+    
+    for link in links:
+        if isinstance(link, dict):
+            url = link.get("url", "")
+            if "hdl.handle.net" in url:
+                return url
+    
+    return ""
+
 def log_record(mode, data_type, response_data, log_dir):
     """
     Log created or updated record to appropriate JSON file.
@@ -74,13 +92,21 @@ def log_record(mode, data_type, response_data, log_dir):
     uuid = response_data.get("uuid", "")
     modified_date = response_data.get("modifiedDate", "")
     name = extract_name_from_response(response_data, data_type)
+    portal_url = response_data.get("portalUrl", "")
+    handle = extract_handle_from_links(response_data)
+    created_by = response_data.get("createdBy", "")
+    modified_by = response_data.get("modifiedBy", "")
     
     # Create record entry
     record_entry = {
         "type": data_type,
-        "name": name,
+        "name": name.strip(),
         "uuid": uuid,
-        "modifiedDate": modified_date
+        "modifiedDate": modified_date,
+        "portalUrl": portal_url.strip(),
+        "handle": handle.strip(),
+        "createdBy": created_by,
+        "modifiedBy": modified_by
     }
     
     # Load existing log or create new list
