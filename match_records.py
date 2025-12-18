@@ -6,6 +6,7 @@ import json
 import requests
 from datetime import date
 from collections import defaultdict
+from itertools import product
 from tqdm import tqdm
 from dotenv import load_dotenv
 
@@ -17,7 +18,7 @@ load_dotenv()
 
 DSPACE_CSV = "./matching_test/dspace_test_sample.csv"
 PURE_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/updated_merged_authors_all.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/merged_authors_all_20251215.json"
 OUTPUT_DIR = "./matching_test/test_output"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -27,6 +28,15 @@ BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+SYSTEM_FIELDS_TO_EXCLUDE = {
+    "createdBy",
+    "createdDate",
+    "modifiedBy",
+    "modifiedDate",
+    "prettyUrlIdentifiers",
+    "version",
+}
 
 if not API_KEY:
     print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
@@ -84,8 +94,28 @@ class LoggerOutput:
 
 # --- HELPER FUNCTIONS ---
 
+def strip_system_fields(record):
+    """Return a shallow copy of record without system fields."""
+    return {
+        k: v
+        for k, v in record.items()
+        if k not in SYSTEM_FIELDS_TO_EXCLUDE
+    }
+
 def normalize(s):
     return s.strip().lower() if s else ""
+
+def map_language(lang):
+    lang_map = {
+        "eng": "en_IE",
+        "fre": "fr_FR",
+        "ger": "de_DE",
+        "spa": "es_ES",
+        "gle": "ga"
+        # Add more as needed
+    }
+    lang_code = lang_map.get(lang.lower(), "en_IE")
+    return lang_code
 
 def has_text_in_any_language(obj, key, languages=["en_GB", "en_IE", "en_US"]):
     """Check if object has non-empty text in any of the given languages"""
@@ -488,7 +518,7 @@ def build_link(url, alias="", description=""):
         "description": {"en_IE": description}
         }
 
-def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry):
+def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry, before_update_records):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -496,9 +526,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     success = True
     errors = []
 
+    # Start with only the UUID - required for updates
+    updated_record = {
+        "uuid": pure_record.get("uuid")
+    }
+
     pure_type = pure_record.get("typeDiscriminator", "")
 
-    # --- 1. Authors (dc.contributor.author) > overwrite with mapped list from DSpace, but don't overwrite existing authors
+    # --- 1. Authors (dc.contributor.author) > add new mapped authors from DSpace
     dspace_authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
     mapped_contributors = []
     unmatched_authors = []
@@ -518,8 +553,26 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         name = contrib.get("name", {}) or {}
         first = name.get("firstName", "") or ""
         last = name.get("lastName", "") or ""
-        if first.strip() and last.strip():
-            existing_author_keys.add((normalize(first), normalize(last)))
+        all_first_names = [first] if first else []
+        all_last_names = [last] if last else []
+
+        # Add alternatives from 'names' array
+        for name_entry in contrib.get("names", []):
+            name_obj = name_entry.get("name", {})
+            if first := name_obj.get("firstName", ""):
+                all_first_names.append(first)
+            if last := name_obj.get("lastName", ""):
+                all_last_names.append(last)
+
+        # Generate (first_name, surname)
+        normal_order = list(product(all_first_names, all_last_names))
+        # Generate (surname, first_name)
+        reverse_order = list(product(all_last_names, all_first_names))
+        # Combine both
+        all_combinations = normal_order + reverse_order
+
+        for pair in all_combinations:
+            existing_author_keys.add((normalize(pair[0].strip()), normalize(pair[1].strip())))
 
         # Extract UUID (internal or external)
         if "person" in contrib:
@@ -577,7 +630,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 contributor = {
                     "typeDiscriminator": "InternalContributorAssociation",
                     "hidden": False,
-                    "correspondingAuthor": False, 
                     "name": {
                         "firstName": first,
                         "lastName": last
@@ -598,6 +650,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                             "uuid": org_uuid
                         }
                         for org_uuid in matched_person["internalOrganizations"]
+                    ]
+                if "externalOrganizations" in matched_person:
+                    contributor["externalOrganizations"] = [
+                        {
+                            "systemName": "ExternalOrganization",
+                            "uuid": org_uuid
+                        }
+                        for org_uuid in matched_person["externalOrganizations"]
                     ]
                 mapped_contributors.append(contributor)
 
@@ -627,28 +687,44 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                         }
                         for org_uuid in matched_person["externalOrganizations"]
                     ]
+                if "internalOrganizations" in matched_person:
+                    contributor["organizations"] = [
+                        {
+                            "systemName": "Organization",
+                            "uuid": org_uuid
+                        }
+                        for org_uuid in matched_person["internalOrganizations"]
+                    ]
                 mapped_contributors.append(contributor)
         else:
             print(f"      ⚠️ No matches found — adding to unmatched")
             unmatched_authors.append(author_name)
 
     # Add new contributors to existing ones (don't overwrite)
+    # Only add contributors field if there are new contributors to add
     if mapped_contributors:
-        if "contributors" not in pure_record:
-            pure_record["contributors"] = []
-        pure_record["contributors"].extend(mapped_contributors)
+        # Combine existing + new contributors
+        all_contributors = existing_contributors + mapped_contributors
+        updated_record["contributors"] = all_contributors
     
-    # Collect ALL organizations from ALL contributors (existing + new)
+    # FIX: Collect ALL organizations from ALL contributors (existing + new)
     all_internal_org_uuids = set()
     all_external_org_uuids = set()
     
-    for contributor in pure_record.get("contributors", []):
+    # Combine existing + new contributors for organization collection
+    all_contributors_for_orgs = existing_contributors + mapped_contributors
+    
+    for contributor in all_contributors_for_orgs:
+        if not contributor:  # Skip None or empty contributors
+            continue
+            
         # Collect internal organizations
         if "organizations" in contributor:
             for org in contributor["organizations"]:
                 org_uuid = org.get("uuid")
                 if org_uuid:
                     all_internal_org_uuids.add(org_uuid)
+        
         # Collect external organizations
         if "externalOrganizations" in contributor:
             for org in contributor["externalOrganizations"]:
@@ -658,7 +734,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     
     # Update top-level organizations with unique internal orgs
     if all_internal_org_uuids:
-        pure_record["organizations"] = [
+        updated_record["organizations"] = [
             {
                 "systemName": "Organization",
                 "uuid": org_uuid
@@ -668,14 +744,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     
     # Update top-level externalOrganizations with unique external orgs
     if all_external_org_uuids:
-        pure_record["externalOrganizations"] = [
+        updated_record["externalOrganizations"] = [
             {
                 "systemName": "ExternalOrganization",
                 "uuid": org_uuid
             }
             for org_uuid in all_external_org_uuids
         ]
-
 
     # --- 2. Funder (dc.contributor.funder) > fill if blank ---
     # TODO: Implement funder lookup and mapping
@@ -693,7 +768,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         # Only set if not already set or if year conflicts
         pub_status = pure_record.get("publicationStatuses", [])
         if not pub_status:
-            pure_record["publicationStatuses"] = [{
+            updated_record["publicationStatuses"] = [{
                 "publicationStatus": {
                     "uri": "/dk/atira/pure/researchoutput/status/published",
                     "term": {"en_IE": "Published"}
@@ -713,36 +788,39 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     # --- 4. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
     if sponsorship and not has_text_in_any_language(pure_record, "fundingText"):
-        pure_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
+        updated_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
 
-    # --- 5. Publisher DOI (dc.identifier.doi) > add if blank ---
+    # --- 5. Electronic Versions (DOIs + embargo + rights + access) ---
+    existing_evs = pure_record.get("electronicVersions", [])
+    updated_evs = list(existing_evs)  # Start with existing versions
+    existing_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_evs]
+
+    # --- 5a. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     if publisher_doi:
         publisher_doi = normalize_doi(publisher_doi)
         # Check if already present
-        existing_dois = [ev.get("doi", "") for ev in pure_record.get("electronicVersions", [])]
-        if not any(publisher_doi in normalize_doi(doi) for doi in existing_dois):
+        if not any(publisher_doi in doi for doi in existing_dois):
             # Add as new electronic version
             ev = build_electronic_version(
                 doi=publisher_doi,
                 version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion",
             )
-            if "electronicVersions" not in pure_record:
-                pure_record["electronicVersions"] = []
-            pure_record["electronicVersions"].append(ev)
+            if ev:
+                updated_evs.append(ev)
 
- # --- 6. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
+    # --- 5b. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
     embargo_date = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
-
     embargo_active = bool(embargo_date and embargo_date > TODAY)
-    pure_record.setdefault("electronicVersions", [])
 
     repo_ev = None
-    for ev in pure_record["electronicVersions"]:
+    repo_ev_index = None
+    for i, ev in enumerate(updated_evs):
         doi = normalize_doi(ev.get("doi", ""))
         if doi.startswith("https://doi.org/10.13025"):
             repo_ev = ev
+            repo_ev_index = i
             break
 
     if repo_ev:
@@ -760,8 +838,10 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         repo_ev["license"] = {
             "type": "CC_BY_NC_ND"
         }
-    
-    # --- 7. Repository DOI & Handle (dc.identifier.uri) > always add ---
+
+        updated_evs[repo_ev_index] = repo_ev
+
+    # --- 5c. Repository DOI & Handle (dc.identifier.uri) > always add ---
     else:
         uri_str = dspace_row.get("dc.identifier.uri", "").strip()
         if uri_str:
@@ -770,7 +850,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
             # Add repository DOI as electronic version (if starts with 10.13025)
             for doi in dois:
-                if doi.startswith("https://doi.org/10.13025"):
+                if doi.startswith("https://doi.org/10.13025") and doi not in existing_dois:
                     access_type = "EMBARGOED" if embargo_active else "OPEN"
 
                     ev = build_electronic_version(
@@ -784,87 +864,88 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                         ev["embargoPeriod"] = {"endDate": embargo_date}
 
                     if ev:  # Check if not None
-                        if "electronicVersions" not in pure_record:
-                            pure_record["electronicVersions"] = []
-                        pure_record["electronicVersions"].append(ev)
+                        updated_evs.append(ev)
                         break  # only one repo DOI expected
 
             # Add handles to Links
-            for handle in handles:
-                link = build_link(handle, alias="Handle", description="Repository Handle")
-                if "links" not in pure_record:
-                    pure_record["links"] = []
-                pure_record["links"].append(link)
+            if handles:
+                existing_links = pure_record.get("links", [])
+                existing_link_urls = {normalize_handle(link.get("url", "")) for link in existing_links}
+                
+                new_links = []
+                for handle in handles:
+                    normalized_handle = normalize_handle(handle)
+                    if normalized_handle not in existing_link_urls:
+                        link = build_link(handle, alias="Handle", description="Repository Handle")
+                        new_links.append(link)
+                
+                if new_links:
+                    updated_record["links"] = existing_links + new_links
+
+    # --- 5d. Rights (dc.rights.uri) > overwrite for repo version ---
+    rights = dspace_row.get("dc.rights", "").strip()
+    if rights:
+        # Look for repo electronic version in updated list
+        for ev in updated_evs:
+            doi = normalize_doi(ev.get("doi", ""))
+            if doi and doi.startswith("https://doi.org/10.13025"):
+                # Map rights to license type
+                license_map = {
+                    "CC BY-NC-ND": "CC_BY_NC_ND",
+                    "CC BY": "CC_BY",
+                    "CC BY-SA": "CC_BY_SA",
+                    "CC BY-NC": "CC_BY_NC",
+                    "CC BY-NC-SA": "CC_BY_NC_SA",
+                    "Public Domain": "PUBLIC_DOMAIN",
+                    "All rights reserved": "ALL_RIGHTS_RESERVED"
+                }
+                license_type = license_map.get(rights, "CC_BY_NC_ND")
+                ev["licenseType"] = {
+                    "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
+                }
+                break
+
+    # --- 5e.  Remove any handles from electronic versions and update the record ---
+    updated_evs = [ev for ev in updated_evs if not ev.get("handle")]
+    if updated_evs != existing_evs:  # Only add if changed
+        updated_record["electronicVersions"] = updated_evs      
 
 
-    # --- 8. Language (dc.language.iso) > fill if blank ---
+    # --- 6. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
+    lang_code = map_language(lang)
     if lang and not pure_record.get("language", {}).get("uri", ""):
-        lang_map = {
-            "eng": "en_IE",
-            "fre": "fr_FR",
-            "ger": "de_DE",
-            "spa": "es_ES",
-            "gle": "ga"
-            # Add more as needed
-        }
-        lang_code = lang_map.get(lang.lower(), "en_IE")
-        pure_record["language"] = {
+        updated_record["language"] = {
             "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
 
-    # --- 9. Abstract (dc.description.abstract) > fill if blank ---
+    # --- 7. Abstract (dc.description.abstract) > fill if blank ---
     abstract = dspace_row.get("dc.description.abstract", "").strip()
     if abstract and not has_text_in_any_language(pure_record, "abstract"):
         if lang_code == "ga":
             # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
-            pure_record["abstract"] = {"en_IE": escape_special_chars(abstract), "ga": escape_special_chars(abstract)}
+            updated_record["abstract"] = {"en_IE": escape_special_chars(abstract), "ga": escape_special_chars(abstract)}
         else:
-            pure_record["abstract"] = {lang_code: escape_special_chars(abstract)}
+            updated_record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
-    # --- 10. Publisher (dc.publisher) > fill if blank ---
+    # --- 8. Publisher (dc.publisher) > fill if blank ---
     # publisher = dspace_row.get("dc.publisher", "").strip()
     #TODO: Implement publisher lookup and mapping
 
-    # --- 11. Rights (dc.rights.uri) > overwrite for repo version ---
-    rights = dspace_row.get("dc.rights", "").strip()
-    if rights:
-        # Look for repo electronic version
-        repo_ev = None
-        for ev in pure_record.get("electronicVersions", []):
-            doi = normalize_doi(ev.get("doi", ""))
-            if doi and doi.startswith("https://doi.org/10.13025"):
-                repo_ev = ev
-                break
-        if repo_ev:
-            # Map rights to license type
-            license_map = {
-                "CC BY-NC-ND": "CC_BY_NC_ND",
-                "CC BY": "CC_BY",
-                "CC BY-SA": "CC_BY_SA",
-                "CC BY-NC": "CC_BY_NC",
-                "CC BY-NC-SA": "CC_BY_NC_SA",
-                "Public Domain": "PUBLIC_DOMAIN",
-                "All rights reserved": "ALL_RIGHTS_RESERVED"
-            }
-            license_type = license_map.get(rights, "CC_BY_NC_ND")
-            repo_ev["licenseType"] = {
-                "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-            }
 
-    # --- 12. Title (dc.title) > fill if blank ---
+    # --- 9. Title (dc.title) > fill if blank ---
     title = dspace_row.get("dc.title", "").strip()
     if title and not pure_record.get("title", {}).get("value", "").strip():
-        pure_record["title"] = {"value": escape_special_chars(title)}
-
-    # --- 13. Remove Handles from electronic versions ---
-    pure_record["electronicVersions"] = [ev for ev in pure_record["electronicVersions"] if not ev.get("handle")]
+        updated_record["title"] = {"value": escape_special_chars(title)}
 
     # Write log entry
     log_entry["success"] = success and not errors
     if errors:
         log_entry["error"] = "; ".join(errors)
-    return pure_record, success
+
+    before_update_records.append(strip_system_fields(pure_record))
+
+    return updated_record, success
 
 
 def create_new_record_from_dspace(dspace_row, person_mapping):
@@ -961,15 +1042,8 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
 
     # Set language
     lang = dspace_row.get("dc.language.iso", "").strip()
+    lang_code = map_language(lang)
     if lang:
-        lang_map = {
-            "eng": "en_IE",
-            "fre": "fr_FR",
-            "ger": "de_DE",
-            "spa": "es_ES",
-            "gle": "ga"
-        }
-        lang_code = lang_map.get(lang.lower(), "en_IE")
         record["language"] = {
             "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
@@ -1116,6 +1190,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
                     # Capture first internal contributor's first organization
                     if i == 0 and j == 0 and first_internal_org_uuid is None:
                         first_internal_org_uuid = org_uuid
+        
         # Collect from external organizations
         if "externalOrganizations" in contributor:
             for org in contributor["externalOrganizations"]:
@@ -1123,7 +1198,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
                 if org_uuid:
                     all_external_org_uuids.add(org_uuid)
     
-    # Set top-level organizations with unique internal orgs (including default University of Galway)
+    # Set top-level organizations with unique internal orgs
     if all_internal_org_uuids:
         record["organizations"] = [
             {
@@ -1204,7 +1279,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     # Set repository DOI & Handle
     embargo_date = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
-    embargo_active = bool(embargo_date and embargo_date > TODAY)
+    embargo_active = bool(embargo_date and embargo_date > TODAY) or bool(embargo_desc and embargo_desc > TODAY)
 
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
     if uri_str:
@@ -1294,6 +1369,7 @@ def main():
     # Prepare logs
     log_entries = []
     error_log = []
+    before_update_records = []
 
     # Group Pure records by identifiers for fast lookup
     pure_by_doi = defaultdict(list)
@@ -1431,7 +1507,7 @@ def main():
             log_entry["matchType"] = match_type
 
             try:
-                updated_record, success = update_record_from_dspace(record, row, person_mapping, log_entry)
+                updated_record, success = update_record_from_dspace(record, row, person_mapping, log_entry, before_update_records)
                 log_entry["success"] = success
                 if success:
                     # Save to matched folder
@@ -1499,6 +1575,10 @@ def main():
     with open(error_log_path, 'w', encoding='utf-8') as f:
         for err in error_log:
             f.write(err + "\n")
+
+    before_update_path = os.path.join(LOG_DIR, f"matched_records_before_updates_{TODAY}.json")
+    with open(before_update_path, "w", encoding="utf-8") as f:
+        json.dump(before_update_records, f, indent=2, ensure_ascii=False)
 
     print(f"\n✅ Done! {len(log_entries)} records processed.")
     print(f"   Matched: {sum(1 for e in log_entries if e['matched'])}")

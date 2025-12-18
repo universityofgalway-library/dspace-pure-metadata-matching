@@ -2,12 +2,15 @@
 
 import os
 import sys
+import csv
 import json
 import argparse
 import requests
 from tqdm import tqdm
 from datetime import datetime
 from dotenv import load_dotenv
+
+TODAY = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
 def extract_localized_value(field, field_name="value"):
     """
@@ -23,11 +26,11 @@ def extract_localized_value(field, field_name="value"):
     if isinstance(field, str):
         return field
     
-    # Format 3: {"value": "some title"}
+    # Format 2: {"value": "some title"}
     if isinstance(field, dict) and field_name in field:
         return field[field_name]
     
-    # Format 2: {"en_IE": "some name"}
+    # Format 3: {"en_IE": "some name"}
     if isinstance(field, dict):
         # Try language codes in order of preference
         for lang_code in ["en_IE", "en_GB", "en_US"]:
@@ -81,33 +84,41 @@ def extract_handle_from_links(response_data):
     
     return ""
 
-def log_record(mode, data_type, response_data, log_dir):
+def log_record(mode, data_type, response_data, log_dir, is_test):
     """
     Log created or updated record to appropriate JSON file.
     """
-    log_filename = "created_records.json" if mode == "create" else "updated_records.json"
+    log_filename = f"created_records_{TODAY}.json" if mode == "create" else f"updated_records_{TODAY}.json"
     log_path = os.path.join(log_dir, log_filename)
     
     # Extract required fields
     uuid = response_data.get("uuid", "")
     modified_date = response_data.get("modifiedDate", "")
+    created_date = response_data.get("createdDate", "")
     name = extract_name_from_response(response_data, data_type)
     portal_url = response_data.get("portalUrl", "")
     handle = extract_handle_from_links(response_data)
     created_by = response_data.get("createdBy", "")
     modified_by = response_data.get("modifiedBy", "")
-    
+
     # Create record entry
     record_entry = {
         "type": data_type,
-        "name": name.strip(),
+        "name": name,
         "uuid": uuid,
+        "createdDate": created_date,
         "modifiedDate": modified_date,
-        "portalUrl": portal_url.strip(),
-        "handle": handle.strip(),
         "createdBy": created_by,
-        "modifiedBy": modified_by
+        "modifiedBy": modified_by,
+        "portalUrl": portal_url,
+        "handle": handle,
+        "success": True  
     }
+    
+    # Add portalUrlPROD only in test mode for UPDATE operations
+    # (created records don't exist in production yet)
+    if is_test and mode == "update":
+        record_entry["portalUrlPROD"] = f"https://research.universityofgalway.ie/en/publications/{uuid}"
     
     # Load existing log or create new list
     existing_records = []
@@ -132,15 +143,11 @@ def save_failed_records(failed_records, source_path, data_type, mode):
     if not failed_records:
         return None
     
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    
     # Determine output directory
-    if os.path.isdir(source_path):
-        output_dir = source_path
-    else:
-        output_dir = os.path.dirname(source_path)
+    source_dir = os.path.dirname(source_path)
+    output_dir = os.path.abspath(source_dir)
     
-    output_filename = f"failed_records_{data_type}_{mode}_{timestamp}.json"
+    output_filename = f"failed_records_{data_type}_{mode}_{TODAY}.json"
     output_path = os.path.join(output_dir, output_filename)
     
     # Write failed records to file
@@ -149,25 +156,26 @@ def save_failed_records(failed_records, source_path, data_type, mode):
     
     return output_path
 
-def process_file(path, mode, data_type, session, error_log, log_dir):
+def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
     """
     mode: 'create' or 'update'
     data_type: the data type to upload (e.g., 'research-outputs', 'persons')
     For update: expects the top-level dict to contain 'uuid' key (string).
-    Returns: (success_bool, results_list, failed_records_list)
+    Returns: (success_count, results_list, failed_records_list)
     """
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception as e:
         error_log.append(f"Failed to read {path}: {e}")
-        return False, f"read_error: {e}", []
+        return 0, [f"read_error: {e}"], []
 
     # Data can be a list of records or a single record. Normalize to list.
     records = data if isinstance(data, list) else [data]
 
     results = []
     failed_records = []
+    success_count = 0  # FIX: Track successful records, not files
     
     for rec in records:
         try:
@@ -190,7 +198,8 @@ def process_file(path, mode, data_type, session, error_log, log_dir):
                 # Log the successful create/update
                 try:
                     response_data = resp.json()
-                    log_record(mode, data_type, response_data, log_dir)
+                    log_record(mode, data_type, response_data, log_dir, is_test)
+                    success_count += 1  # FIX: Increment for each successful record
                 except Exception as e:
                     error_log.append(f"Failed to log record from {path}: {e}")
                 
@@ -205,12 +214,11 @@ def process_file(path, mode, data_type, session, error_log, log_dir):
             results.append((path, False, str(e)))
             failed_records.append(rec)
 
-    # return overall success if all succeeded
-    all_ok = all(r[1] for r in results)
-    return all_ok, results, failed_records
+    # FIX: Return success_count instead of boolean
+    return success_count, results, failed_records
 
 
-def process_folder(folder_path, data_type, session, error_log, log_dir):
+def process_folder(folder_path, data_type, session, error_log, log_dir, is_test):
     # For folder mode, determine mode by folder name: matched -> update, unmatched -> create
     mode = "update" if os.path.basename(folder_path).lower().startswith("matched") else "create"
     json_files = []
@@ -219,16 +227,14 @@ def process_folder(folder_path, data_type, session, error_log, log_dir):
             if fn.lower().endswith(".json"):
                 json_files.append(os.path.join(root, fn))
     
-    successes = 0
-    failures = 0
+    total_successes = 0  # FIX: Track total successful records
+    total_failures = 0
     all_failed_records = []
     
     for path in tqdm(json_files, desc=f"Uploading ({mode})", unit="file"):
-        ok, results, failed_records = process_file(path, mode, data_type, session, error_log, log_dir)
-        if ok:
-            successes += 1
-        else:
-            failures += 1
+        success_count, results, failed_records = process_file(path, mode, data_type, session, error_log, log_dir, is_test)
+        total_successes += success_count  # FIX: Add up successful records
+        total_failures += len(failed_records)
         all_failed_records.extend(failed_records)
     
     # Save failed records if any
@@ -237,10 +243,10 @@ def process_folder(folder_path, data_type, session, error_log, log_dir):
         if failed_path:
             print(f"\n⚠️ {len(all_failed_records)} failed records saved to: {failed_path}")
     
-    return successes, failures, len(json_files)
+    return total_successes, total_failures, len(json_files)
 
-def process_single_file(path, mode, data_type, session, error_log, log_dir):
-    ok, results, failed_records = process_file(path, mode, data_type, session, error_log, log_dir)
+def process_single_file(path, mode, data_type, session, error_log, log_dir, is_test):
+    success_count, results, failed_records = process_file(path, mode, data_type, session, error_log, log_dir, is_test)
     
     # Save failed records if any
     if failed_records:
@@ -248,7 +254,66 @@ def process_single_file(path, mode, data_type, session, error_log, log_dir):
         if failed_path:
             print(f"\n⚠️ {len(failed_records)} failed records saved to: {failed_path}")
     
-    return ok, results
+    return success_count, results
+
+
+def create_csv(log_dir, mode):
+    """
+    Create CSVs from created and updated records.
+    """
+    if mode == 'create':
+        created_log = os.path.join(log_dir, f"created_records_{TODAY}.json")
+        # Process created records
+        if os.path.exists(created_log):
+            try:
+                with open(created_log, 'r', encoding='utf-8') as f:
+                    created_records = json.load(f)
+                    if created_records:
+                        csv_path = os.path.join(log_dir, f"created_records_{TODAY}.csv")
+                        rows_written = write_records_to_csv(created_records, csv_path)
+                        print(f"📊 Created records CSV: {csv_path} ({rows_written} rows)")
+            except Exception as e:
+                print(f"Warning: Could not create CSV from created_records.json: {e}")
+    
+    elif mode == 'update':
+        updated_log = os.path.join(log_dir, f"updated_records_{TODAY}.json")
+        # Process updated records
+        if os.path.exists(updated_log):
+            try:
+                with open(updated_log, 'r', encoding='utf-8') as f:
+                    updated_records = json.load(f)
+                    if updated_records:
+                        csv_path = os.path.join(log_dir, f"updated_records_{TODAY}.csv")
+                        rows_written = write_records_to_csv(updated_records, csv_path)
+                        print(f"📊 Updated records CSV: {csv_path} ({rows_written} rows)")
+            except Exception as e:
+                print(f"Warning: Could not create CSV from updated_records.json: {e}")
+
+def write_records_to_csv(records, csv_path):
+    """
+    Write records to CSV with specified columns.
+    Returns number of rows written.
+    """
+    if not records:
+        return 0
+    
+    # Ensure records is a list
+    records_list = records if isinstance(records, list) else [records]
+    
+    columns = ["name", "handle", "portalUrl", "portalUrlPROD"]
+    
+    rows_written = 0
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+        writer.writeheader()
+        for record in records_list:
+            if record.get("success", True):  # Default to True if not present
+                # Create a row with only the specified columns
+                row = {col: record.get(col, "") for col in columns}
+                writer.writerow(row)
+                rows_written += 1
+    
+    return rows_written
 
 
 if __name__ == "__main__":
@@ -289,8 +354,11 @@ if __name__ == "__main__":
         if not os.path.isdir(args.folder):
             print(f"Folder not found: {args.folder}")
             sys.exit(1)
-        successes, failures, total = process_folder(args.folder, args.data, session, error_log, LOG_DIR)
-        print(f"Done. {successes}/{total} files succeeded, {failures} failed.")
+        # FIX: Get mode from folder name
+        mode = "update" if os.path.basename(args.folder).lower().startswith("matched") else "create"
+        successes, failures, total_files = process_folder(args.folder, args.data, session, error_log, LOG_DIR, args.test)
+        print(f"\n✅ Done. {successes} records succeeded, {failures} failed across {total_files} files.")
+        success_count = successes  # FIX: This is now counting records, not files
     elif args.file:
         if not os.path.isfile(args.file):
             print(f"File not found: {args.file}")
@@ -298,9 +366,10 @@ if __name__ == "__main__":
         if not args.mode:
             print("For single file uploads please set --mode create|update")
             sys.exit(1)
-        ok, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR)
-        print("Single file results:")
-        print(results)
+        mode = args.mode
+        success_count, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR, args.test)
+        print(f"\n✅ Single file results: {success_count} records succeeded")
+        print(f"Details: {results}")
     else:
         print("Please specify --folder or --file")
         sys.exit(1)
@@ -310,21 +379,10 @@ if __name__ == "__main__":
         with open(ERROR_LOG_PATH, 'w', encoding='utf-8') as f:
             for line in error_log:
                 f.write(line + "\n")
-        print(f"Errors logged to {ERROR_LOG_PATH}")
+        print(f"⚠️ Errors logged to {ERROR_LOG_PATH}")
     else:
-        print("No errors logged")
+        print("✅ No errors logged")
     
-    # Print summary of logged records
-    created_log = os.path.join(LOG_DIR, "created_records.json")
-    updated_log = os.path.join(LOG_DIR, "updated_records.json")
-
-    if args.folder:
-        success_count = successes
-    else:
-        # For single file, count successful results
-        success_count = sum(1 for r in results if r[1] is True) if isinstance(results, list) else (1 if ok else 0)
-    
-    if args.mode == 'create':
-        print(f"\n✅ {success_count} records created and logged to {created_log}")
-    elif args.mode == 'update':
-        print(f"\n✅ {success_count} records updated and logged to {updated_log}")
+    # Create CSVs from logs
+    create_csv(LOG_DIR, mode)
+    print(f"\n✅ {success_count} records {mode}d and logged")
