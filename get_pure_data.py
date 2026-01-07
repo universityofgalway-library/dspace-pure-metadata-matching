@@ -8,6 +8,19 @@ from tqdm import tqdm
 
 TODAY = date.today().isoformat()
 
+# Define all available data types
+ALL_DATA_TYPES = [
+    "research-outputs",
+    "persons",
+    "external-persons",
+    "journals",
+    "events",
+    "awards",
+    "organizations",
+    "external-organizations",
+    "publishers"
+]
+
 def fetch_all(data_type, api_key="", test=True):
     """
     Fetch all data from the Elsevier Pure API, handling pagination.
@@ -107,7 +120,34 @@ def save_research_outputs_by_type(items, output_dir, filename_prefix):
             json.dump(type_items, f, indent=2, ensure_ascii=False)
         print(f"📄 Saved {len(type_items)} items of type '{type_key}' to: {filepath}")
 
-    print("🎉 Done!")
+def fetch_and_save_data_type(data_type, api_key, test, output_dir, split_by_type, filename_prefix=None):
+    """
+    Fetch and save a single data type.
+    """
+    # Determine filename prefix
+    if not filename_prefix:
+        filename_prefix = f"pure_test_{data_type}"
+
+    try:
+        # Fetch all data
+        all_data = fetch_all(data_type, api_key=api_key, test=test)
+        
+        # Save data
+        if data_type == "research-outputs" and split_by_type:
+            # Split research outputs by type
+            save_research_outputs_by_type(all_data, output_dir, filename_prefix)
+        else:
+            # Save all in one file
+            filepath = os.path.join(output_dir, f"{filename_prefix}_{TODAY}.json")
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(all_data, f, indent=2, ensure_ascii=False)
+            print(f"📄 Saved {len(all_data)} items to: {filepath}")
+        
+        return True
+
+    except Exception as e:
+        print(f"❌ Error fetching {data_type}: {e}")
+        return False
 
 
 if __name__ == "__main__":
@@ -129,15 +169,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--data", 
-        required=True,
-        choices=["research-outputs", "persons", "external-persons", "journals", 
-                 "events", "awards", "organizations", "external-organizations", "publishers"], 
-        help="What data to get from Pure"
+        default="all",
+        choices=["all"] + ALL_DATA_TYPES,
+        help="What data to get from Pure (default: all)"
     )
     parser.add_argument(
         "--output-dir",
-        default="./pure_data",
-        help="Output directory for saved files (default: ./pure_data)"
+        default="./pure_entities",
+        help="Output directory for saved files (default: ./pure_entities)"
     )
     parser.add_argument(
         "--split-by-type",
@@ -146,7 +185,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--filename-prefix",
-        help="Custom filename prefix (default: pure_test_<data_type>)"
+        help="Custom filename prefix (only used when fetching a single data type)"
     )
     
     args = parser.parse_args()
@@ -154,26 +193,40 @@ if __name__ == "__main__":
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Determine filename prefix
-    if args.filename_prefix:
-        filename_prefix = args.filename_prefix
+    # Determine which data types to fetch
+    if args.data == "all":
+        data_types_to_fetch = ALL_DATA_TYPES
+        print(f"🔄 Fetching all data types: {', '.join(ALL_DATA_TYPES)}\n")
     else:
-        filename_prefix = f"pure_test_{args.data}"
+        data_types_to_fetch = [args.data]
 
-    try:
-        # Fetch all data
-        all_data = fetch_all(args.data, api_key=API_KEY, test=args.test)
+    # Fetch and save each data type
+    successful = 0
+    failed = 0
+
+    for data_type in data_types_to_fetch:
+        print(f"\n{'='*60}")
+        print(f"Processing: {data_type}")
+        print(f"{'='*60}")
         
-        # Save data
-        if args.data == "research-outputs" and args.split_by_type:
-            # Split research outputs by type
-            save_research_outputs_by_type(all_data, args.output_dir, filename_prefix)
+        success = fetch_and_save_data_type(
+            data_type=data_type,
+            api_key=API_KEY,
+            test=args.test,
+            output_dir=args.output_dir,
+            split_by_type=args.split_by_type,
+            filename_prefix=args.filename_prefix
+        )
+        
+        if success:
+            successful += 1
         else:
-            # Save all in one file
-            filepath = os.path.join(args.output_dir, f"{filename_prefix}_{TODAY}.json")
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(all_data, f, indent=2, ensure_ascii=False)
-            print(f"📄 Saved {len(all_data)} items to: {filepath}")
+            failed += 1
 
-    except Exception as e:
-        print(f"❌ Error: {e}")
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"📊 Summary:")
+    print(f"   ✅ Successful: {successful}")
+    print(f"   ❌ Failed: {failed}")
+    print(f"   📁 Output directory: {args.output_dir}")
+    print(f"{'='*60}")
