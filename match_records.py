@@ -536,15 +536,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
     # --- 1. Authors (dc.contributor.author) > add new mapped authors from DSpace
     dspace_authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
-    mapped_contributors = []
-    unmatched_authors = []
-
+    
     # Get existing contributors from Pure record (if any)
     existing_contributors = pure_record.get("contributors", [])
 
     # Create a set of existing author names (first+last) and UUIDs for fast lookup
     existing_author_keys = set()
     existing_uuids = set()
+    existing_by_uuid = {}  # Map UUID to contributor object
+    existing_by_name = {}  # Map (first, last) to contributor object
 
     for contrib in existing_contributors:
         if not contrib:  # Skip None or empty contributors
@@ -573,7 +573,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         all_combinations = normal_order + reverse_order
 
         for pair in all_combinations:
-            existing_author_keys.add((normalize(pair[0].strip()), normalize(pair[1].strip())))
+            name_key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
+            existing_author_keys.add(name_key)
+            existing_by_name[name_key] = contrib
 
         # Extract UUID (internal or external)
         if "person" in contrib:
@@ -582,17 +584,23 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 uuid = person_obj.get("uuid")
                 if uuid:
                     existing_uuids.add(uuid)
+                    existing_by_uuid[uuid] = contrib
         elif "externalPerson" in contrib:
             ext_person_obj = contrib["externalPerson"]
             if ext_person_obj:
                 uuid = ext_person_obj.get("uuid")
                 if uuid:
                     existing_uuids.add(uuid)
+                    existing_by_uuid[uuid] = contrib
 
+    # Process DSpace authors in order and build final contributors list
+    final_contributors = []
+    unmatched_authors = []
 
     for author_name in dspace_authors:
         print(f"  ➤ Checking match for: '{author_name}'")
         matches = find_person_match(author_name, person_mapping)
+        
         if matches:
             print(f"    ✅ Found {len(matches)} matches")
             matched_person = resolve_author_duplicate(matches)
@@ -618,103 +626,105 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             elif has_valid_external:
                 uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
             
-            # Check if this author already exists (by UUID or name)
+            # Check if this author already exists
             first = matched_person.get("firstName", "")
             last = matched_person.get("lastName", "")
             name_key = (normalize(first), normalize(last))
             
-            if name_key in existing_author_keys or uuid_value in existing_uuids:
-                print(f"      ℹ️ Author already exists in record, skipping: {first} {last}")
-                continue
-                
-            if has_valid_internal:
-                contributor = {
-                    "typeDiscriminator": "InternalContributorAssociation",
-                    "hidden": False,
-                    "name": {
-                        "firstName": first,
-                        "lastName": last
-                    },
-                    "role": {
-                        "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
-                        "term": {"en_IE": "Author"}
-                    },
-                    "person": {
-                        "systemName": "Person",
-                        "uuid": uuid_value
+            # If contributor already exists, use existing one (preserves DSpace order)
+            if uuid_value in existing_by_uuid:
+                print(f"      ℹ️ Author already exists (by UUID), using existing: {first} {last}")
+                final_contributors.append(existing_by_uuid[uuid_value])
+            elif name_key in existing_by_name:
+                print(f"      ℹ️ Author already exists (by name), using existing: {first} {last}")
+                final_contributors.append(existing_by_name[name_key])
+            else:
+                # Create new contributor
+                if has_valid_internal:
+                    contributor = {
+                        "typeDiscriminator": "InternalContributorAssociation",
+                        "hidden": False,
+                        "name": {
+                            "firstName": first,
+                            "lastName": last
+                        },
+                        "role": {
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
+                            "term": {"en_IE": "Author"}
+                        },
+                        "person": {
+                            "systemName": "Person",
+                            "uuid": uuid_value
+                        }
                     }
-                }
-                if "internalOrganizations" in matched_person:
-                    contributor["organizations"] = [
-                        {
-                            "systemName": "Organization",
-                            "uuid": org_uuid
-                        }
-                        for org_uuid in matched_person["internalOrganizations"]
-                    ]
-                if "externalOrganizations" in matched_person:
-                    contributor["externalOrganizations"] = [
-                        {
-                            "systemName": "ExternalOrganization",
-                            "uuid": org_uuid
-                        }
-                        for org_uuid in matched_person["externalOrganizations"]
-                    ]
-                mapped_contributors.append(contributor)
+                    if "internalOrganizations" in matched_person:
+                        contributor["organizations"] = [
+                            {
+                                "systemName": "Organization",
+                                "uuid": org_uuid
+                            }
+                            for org_uuid in matched_person["internalOrganizations"]
+                        ]
+                    if "externalOrganizations" in matched_person:
+                        contributor["externalOrganizations"] = [
+                            {
+                                "systemName": "ExternalOrganization",
+                                "uuid": org_uuid
+                            }
+                            for org_uuid in matched_person["externalOrganizations"]
+                        ]
+                    final_contributors.append(contributor)
 
-            elif has_valid_external:
-                contributor = {
-                    "typeDiscriminator": "ExternalContributorAssociation",
-                    "hidden": False,
-                    "correspondingAuthor": False, 
-                    "name": {
-                        "firstName": first,
-                        "lastName": last
-                    },
-                    "role": {
-                        "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
-                        "term": {"en_IE": "Author"}
-                    },
-                    "externalPerson": {
-                        "systemName": "ExternalPerson",
-                        "uuid": uuid_value
+                elif has_valid_external:
+                    contributor = {
+                        "typeDiscriminator": "ExternalContributorAssociation",
+                        "hidden": False,
+                        "correspondingAuthor": False, 
+                        "name": {
+                            "firstName": first,
+                            "lastName": last
+                        },
+                        "role": {
+                            "uri": f"/dk/atira/pure/researchoutput/roles/{pure_type.lower()}/author",
+                            "term": {"en_IE": "Author"}
+                        },
+                        "externalPerson": {
+                            "systemName": "ExternalPerson",
+                            "uuid": uuid_value
+                        }
                     }
-                }
-                if "externalOrganizations" in matched_person:
-                    contributor["externalOrganizations"] = [
-                        {
-                            "systemName": "ExternalOrganization",
-                            "uuid": org_uuid
-                        }
-                        for org_uuid in matched_person["externalOrganizations"]
-                    ]
-                if "internalOrganizations" in matched_person:
-                    contributor["organizations"] = [
-                        {
-                            "systemName": "Organization",
-                            "uuid": org_uuid
-                        }
-                        for org_uuid in matched_person["internalOrganizations"]
-                    ]
-                mapped_contributors.append(contributor)
+                    if "externalOrganizations" in matched_person:
+                        contributor["externalOrganizations"] = [
+                            {
+                                "systemName": "ExternalOrganization",
+                                "uuid": org_uuid
+                            }
+                            for org_uuid in matched_person["externalOrganizations"]
+                        ]
+                    if "internalOrganizations" in matched_person:
+                        contributor["organizations"] = [
+                            {
+                                "systemName": "Organization",
+                                "uuid": org_uuid
+                            }
+                            for org_uuid in matched_person["internalOrganizations"]
+                        ]
+                    final_contributors.append(contributor)
         else:
             print(f"      ⚠️ No matches found — adding to unmatched")
             unmatched_authors.append(author_name)
 
-    # Add new contributors to existing ones (don't overwrite)
-    # Only add contributors field if there are new contributors to add
-    if mapped_contributors:
-        # Combine existing + new contributors
-        all_contributors = existing_contributors + mapped_contributors
-        updated_record["contributors"] = all_contributors
+    # Only update contributors if we have any
+    if final_contributors:
+        updated_record["contributors"] = final_contributors
     
     # --- 1a. Collect ALL organizations from ALL contributors (existing + new) ---
     all_internal_org_uuids = set()
     all_external_org_uuids = set()
     
-    # Combine existing + new contributors for organization collection
-    all_contributors_for_orgs = existing_contributors + mapped_contributors
-    
+    # Collect organizations from final contributors list (already in correct order)
+    all_contributors_for_orgs = final_contributors
+        
     for contributor in all_contributors_for_orgs:
         if not contributor:  # Skip None or empty contributors
             continue
