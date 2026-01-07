@@ -16,10 +16,11 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-DSPACE_CSV = "./matching_test/dspace_test_sample.csv"
+# DSPACE_CSV = "./matching_test/dspace_test_sample.csv"
+DSPACE_CSV = 'metadata_dspace_test_02-12-2025.csv'
 PURE_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
 PERSON_MAPPING_JSON = "./matching_test/matched_authors/merged_authors_all_20251215.json"
-OUTPUT_DIR = "./matching_test/test_output"
+OUTPUT_DIR = "./matching_test/output"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -707,7 +708,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         all_contributors = existing_contributors + mapped_contributors
         updated_record["contributors"] = all_contributors
     
-    # FIX: Collect ALL organizations from ALL contributors (existing + new)
+    # --- 1a. Collect ALL organizations from ALL contributors (existing + new) ---
     all_internal_org_uuids = set()
     all_external_org_uuids = set()
     
@@ -752,6 +753,25 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             for org_uuid in all_external_org_uuids
         ]
 
+    # --- 1b. Remove author keyword group if all DSpace authors are now matched ---
+    if dspace_authors and not unmatched_authors:
+        # All authors from DSpace are matched, remove the author keyword group
+        existing_keyword_groups = pure_record.get("keywordGroups", [])
+        if existing_keyword_groups:
+            # Filter out the authors keyword group
+            filtered_groups = [
+                kg for kg in existing_keyword_groups
+                if kg.get("logicalName") != "/dk/atira/pure/authors"
+            ]
+            # Only update if we actually removed something
+            if len(filtered_groups) < len(existing_keyword_groups):
+                if filtered_groups:
+                    # Keep other keyword groups
+                    updated_record["keywordGroups"] = filtered_groups
+                else:
+                    # Remove keywordGroups entirely if empty
+                    updated_record["keywordGroups"] = []
+    
     # --- 2. Funder (dc.contributor.funder) > fill if blank ---
     # TODO: Implement funder lookup and mapping
 
@@ -937,6 +957,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     title = dspace_row.get("dc.title", "").strip()
     if title and not pure_record.get("title", {}).get("value", "").strip():
         updated_record["title"] = {"value": escape_special_chars(title)}
+
 
     # Write log entry
     log_entry["success"] = success and not errors
