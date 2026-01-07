@@ -822,65 +822,70 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
     # --- 5. Electronic Versions (DOIs + embargo + rights + access) ---
     existing_evs = pure_record.get("electronicVersions", [])
-    updated_evs = list(existing_evs)  # Start with existing versions
-    existing_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_evs]
+
+    # Separate existing EVs into repository and publisher DOIs
+    existing_repo_evs = []
+    existing_publisher_evs = []
+    existing_other_evs = []
+    
+    for ev in existing_evs:
+        doi = normalize_doi(ev.get("doi", ""))
+        if doi.startswith("https://doi.org/10.13025"):
+            existing_repo_evs.append(ev)
+        elif doi and doi.startswith("https://doi.org/"):
+            existing_publisher_evs.append(ev)
+        else:
+            existing_other_evs.append(ev)
+    
+    existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
+    existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
 
     # --- 5a. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
+    new_publisher_ev = None
     if publisher_doi:
         publisher_doi = normalize_doi(publisher_doi)
         # Check if already present
-        if not any(publisher_doi in doi for doi in existing_dois):
+        if publisher_doi not in existing_publisher_dois:
             # Add as new electronic version
             ev = build_electronic_version(
                 doi=publisher_doi,
                 version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion",
             )
             if ev:
-                updated_evs.append(ev)
+                new_publisher_ev = ev
 
     # --- 5b. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
     embargo_date = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
     embargo_active = bool(embargo_date and embargo_date > TODAY)
 
-    repo_ev = None
-    repo_ev_index = None
-    for i, ev in enumerate(updated_evs):
-        doi = normalize_doi(ev.get("doi", ""))
-        if doi.startswith("https://doi.org/10.13025"):
-            repo_ev = ev
-            repo_ev_index = i
-            break
+    repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
     if repo_ev:
-        # Overwrite embargo if repo version exists and embargo info present
+        # Update existing repo version
         if embargo_date or embargo_desc:
             repo_ev["embargoPeriod"] = {"endDate": embargo_date}
-
             if embargo_active:
-                repo_ev["accessType"] = "EMBARGOED"
+                repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
 
         # Always enforce version type + license
         repo_ev["versionType"] = {
             "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
         }
-        repo_ev["license"] = {
-            "type": "CC_BY_NC_ND"
+        repo_ev["licenseType"] = {
+            "uri": "/dk/atira/pure/core/document/licenses/cc_by_nc_nd"
         }
-
-        updated_evs[repo_ev_index] = repo_ev
 
     # --- 5c. Repository DOI & Handle (dc.identifier.uri) > always add ---
     else:
         uri_str = dspace_row.get("dc.identifier.uri", "").strip()
         if uri_str:
-            handles = extract_handles_from_uri(uri_str)
             dois = extract_dois_from_uri(uri_str)
 
             # Add repository DOI as electronic version (if starts with 10.13025)
             for doi in dois:
-                if doi.startswith("https://doi.org/10.13025") and doi not in existing_dois:
+                if doi.startswith("https://doi.org/10.13025") and doi not in existing_repo_dois:
                     access_type = "EMBARGOED" if embargo_active else "OPEN"
 
                     ev = build_electronic_version(
@@ -890,56 +895,76 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                         license_type="CC_BY_NC_ND"
                     )
 
-                    if embargo_active:
+                    if embargo_active and ev:
                         ev["embargoPeriod"] = {"endDate": embargo_date}
 
-                    if ev:  # Check if not None
-                        updated_evs.append(ev)
+                    if ev:
+                        repo_ev = ev
                         break  # only one repo DOI expected
 
-            # Add handles to Links
-            if handles:
-                existing_links = pure_record.get("links", [])
-                existing_link_urls = {normalize_handle(link.get("url", "")) for link in existing_links}
-                
-                new_links = []
-                for handle in handles:
-                    normalized_handle = normalize_handle(handle)
-                    if normalized_handle not in existing_link_urls:
-                        link = build_link(handle, alias="Handle", description="Repository Handle")
-                        new_links.append(link)
-                
-                if new_links:
-                    updated_record["links"] = existing_links + new_links
 
     # --- 5d. Rights (dc.rights.uri) > overwrite for repo version ---
     rights = dspace_row.get("dc.rights", "").strip()
-    if rights:
-        # Look for repo electronic version in updated list
-        for ev in updated_evs:
-            doi = normalize_doi(ev.get("doi", ""))
-            if doi and doi.startswith("https://doi.org/10.13025"):
-                # Map rights to license type
-                license_map = {
-                    "CC BY-NC-ND": "CC_BY_NC_ND",
-                    "CC BY": "CC_BY",
-                    "CC BY-SA": "CC_BY_SA",
-                    "CC BY-NC": "CC_BY_NC",
-                    "CC BY-NC-SA": "CC_BY_NC_SA",
-                    "Public Domain": "PUBLIC_DOMAIN",
-                    "All rights reserved": "ALL_RIGHTS_RESERVED"
-                }
-                license_type = license_map.get(rights, "CC_BY_NC_ND")
-                ev["licenseType"] = {
-                    "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-                }
-                break
+    if rights and repo_ev:
+        # Map rights to license type
+        license_map = {
+            "CC BY-NC-ND": "CC_BY_NC_ND",
+            "CC BY": "CC_BY",
+            "CC BY-SA": "CC_BY_SA",
+            "CC BY-NC": "CC_BY_NC",
+            "CC BY-NC-SA": "CC_BY_NC_SA",
+            "Public Domain": "PUBLIC_DOMAIN",
+            "All rights reserved": "ALL_RIGHTS_RESERVED"
+        }
+        license_type = license_map.get(rights, "CC_BY_NC_ND")
+        repo_ev["licenseType"] = {
+            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
+        }
 
-    # --- 5e.  Remove any handles from electronic versions and update the record ---
-    updated_evs = [ev for ev in updated_evs if not ev.get("handle")]
-    if updated_evs != existing_evs:  # Only add if changed
-        updated_record["electronicVersions"] = updated_evs      
+    # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others ---
+    final_evs = []
+    
+    # Add repository DOI first (if exists)
+    if repo_ev:
+        # Remove handle field if present
+        if "handle" in repo_ev:
+            del repo_ev["handle"]
+        final_evs.append(repo_ev)
+    
+    # Add publisher DOIs second
+    for ev in existing_publisher_evs:
+        if "handle" not in ev:
+            final_evs.append(ev)
+    
+    if new_publisher_ev:
+        final_evs.append(new_publisher_ev)
+    
+    # Add other electronic versions last
+    for ev in existing_other_evs:
+        if "handle" not in ev:
+            final_evs.append(ev)
+    
+    # Only update if changed
+    if final_evs != existing_evs:
+        updated_record["electronicVersions"] = final_evs
 
+    # --- 5f. Add Handles as links ---
+    uri_str = dspace_row.get("dc.identifier.uri", "").strip()
+    if uri_str:
+        handles = extract_handles_from_uri(uri_str)
+        if handles:
+            existing_links = pure_record.get("links", [])
+            existing_link_urls = {normalize_handle(link.get("url", "")) for link in existing_links}
+            
+            new_links = []
+            for handle in handles:
+                normalized_handle = normalize_handle(handle)
+                if normalized_handle not in existing_link_urls:
+                    link = build_link(handle, alias="Handle", description="Repository Handle")
+                    new_links.append(link)
+            
+            if new_links:
+                updated_record["links"] = existing_links + new_links
 
     # --- 6. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
@@ -1300,23 +1325,19 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
         print(f"✅ Added {len(unmatched_authors)} unmatched authors to keywordGroups")    
 
 
-    # Set DOI
-    publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
-    if publisher_doi:
-        publisher_doi = normalize_doi(publisher_doi)
-        ev = build_electronic_version(publisher_doi, "/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion")
-        record["electronicVersions"] = [ev]
-
-    # Set repository DOI & Handle
+    # Set DOIs and Handles - Repository DOI first, then Publisher DOI
+    electronic_versions = []
+    
+    # First, add repository DOI if exists
     embargo_date = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
     embargo_active = bool(embargo_date and embargo_date > TODAY) or bool(embargo_desc and embargo_desc > TODAY)
 
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
     if uri_str:
-        handles = extract_handles_from_uri(uri_str)
         dois = extract_dois_from_uri(uri_str)
-
+        
+        # Add repository DOI first
         for doi in dois:
             doi = normalize_doi(doi)
             if doi.startswith("https://doi.org/10.13025"):
@@ -1329,14 +1350,48 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
                     license_type="CC_BY_NC_ND"
                 )
 
-                if embargo_active:
+                if embargo_active and ev:
                     ev["embargoPeriod"] = {"endDate": embargo_date}
-                if ev:  # Check if not None
-                    if "electronicVersions" not in record:
-                        record["electronicVersions"] = []
-                    record["electronicVersions"].append(ev)
-                    break # only one repo DOI expected
+                
+                if ev:
+                    # Apply rights if specified
+                    rights = dspace_row.get("dc.rights", "").strip()
+                    if rights:
+                        license_map = {
+                            "CC BY-NC-ND": "CC_BY_NC_ND",
+                            "CC BY": "CC_BY",
+                            "CC BY-SA": "CC_BY_SA",
+                            "CC BY-NC": "CC_BY_NC",
+                            "CC BY-NC-SA": "CC_BY_NC_SA",
+                            "Public Domain": "PUBLIC_DOMAIN",
+                            "All rights reserved": "ALL_RIGHTS_RESERVED"
+                        }
+                        license_type = license_map.get(rights, "CC_BY_NC_ND")
+                        ev["licenseType"] = {
+                            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
+                        }
+                    
+                    electronic_versions.append(ev)
+                    break  # only one repo DOI expected
+    
+    # Second, add publisher DOI
+    publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
+    if publisher_doi:
+        publisher_doi = normalize_doi(publisher_doi)
+        ev = build_electronic_version(
+            publisher_doi, 
+            "/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion"
+        )
+        if ev:
+            electronic_versions.append(ev)
+    
+    # Set electronic versions on record
+    if electronic_versions:
+        record["electronicVersions"] = electronic_versions
 
+    # Add handles to links
+    if uri_str:
+        handles = extract_handles_from_uri(uri_str)
         for handle in handles:
             link = build_link(handle, alias="Handle", description="Repository Handle")
             if "links" not in record:
