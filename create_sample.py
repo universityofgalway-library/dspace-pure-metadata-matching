@@ -112,8 +112,8 @@ def main():
     )
     parser.add_argument(
         '--input-file',
-        default='dspace_test_metadata_02-12-2025.csv',
-        help='Path to input CSV file (default: dspace_test_metadata_02-12-2025.csv)'
+        default='dspace_test_metadata_2025-12-02.csv',
+        help='Path to input CSV file (default: dspace_test_metadata_2025-12-02.csv)'
     )
     parser.add_argument(
         '--output-file',
@@ -122,8 +122,8 @@ def main():
     )
     parser.add_argument(
         '--authors-json',
-        default='./matching_test/matched_authors/test_authors_all_02-12-2025.json',
-        help='Path to authors JSON file (default: ./matching_test/matched_authors/test_authors_all_02-12-2025.json)'
+        default='./matching_test/matched_authors/test_authors_all_2025-12-02.json',
+        help='Path to authors JSON file (default: ./matching_test/matched_authors/test_authors_all_2025-12-02.json)'
     )
     parser.add_argument(
         '--random-state',

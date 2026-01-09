@@ -7,7 +7,7 @@ from tqdm import tqdm
 from datetime import date 
 
 # --- CONFIGURATION ---
-DSpace_Authors_JSON = "dspace_test_authors_all_02-12-2025.json"
+DSpace_Authors_JSON = "dspace_test_authors_all_2025-12-02.json"
 Pure_Internal_JSON = "./pure_entities/pure_test_persons_2026-01-07.json"
 Pure_External_JSON = "./pure_entities/pure_test_external-persons_2026-01-07.json"
 OUTPUT_DIR = "./matching_test/matched_authors"

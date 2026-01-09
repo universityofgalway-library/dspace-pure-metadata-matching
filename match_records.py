@@ -20,7 +20,7 @@ TODAY = date.today().isoformat()
 
 DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-09.csv"
 PURE_JSON = "./matching_test/research_outputs/pure_test_research_outputs_2026-01-07.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_02-12-2025.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_2025-12-02.json"
 OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
