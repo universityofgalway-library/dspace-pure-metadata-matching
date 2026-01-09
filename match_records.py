@@ -1023,23 +1023,8 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
         },
         "electronicVersions": [],
         "links": [],
-        "organizations": [
-                {
-                "systemName": "Organization",
-                "uuid": "1becab14-37ce-4810-9b95-fc014063bcae",
-                "name": {
-                        "en_IE": "University of Galway"
-                        },
-                "type": {
-                        "uri": "/dk/atira/pure/organisation/organisationtypes/organisation/university",
-                        "term": {
-                            "en_IE": "University"
-                            }
-                        }
-                }
-        ],
         "managingOrganization": {
-            "uuid": "1becab14-37ce-4810-9b95-fc014063bcae",
+            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # Default: Library Repository
             "systemName": "Organization"
             }, 
         "visibility": {
@@ -1263,21 +1248,6 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             }
             for org_uuid in all_internal_org_uuids
         ]
-        # Add default University of Galway if not already present
-        if "1becab14-37ce-4810-9b95-fc014063bcae" not in all_internal_org_uuids:
-            record["organizations"].append({
-                "systemName": "Organization",
-                "uuid": "1becab14-37ce-4810-9b95-fc014063bcae",
-                "name": {
-                    "en_IE": "University of Galway"
-                },
-                "type": {
-                    "uri": "/dk/atira/pure/organisation/organisationtypes/organisation/university",
-                    "term": {
-                        "en_IE": "University"
-                    }
-                }
-            })
     
     # Set top-level externalOrganizations with unique external orgs
     if all_external_org_uuids:
@@ -1298,31 +1268,31 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
         print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
 
     
-    # Only add unmatched authors as keywordGroups if there are actually unmatched authors
-    if unmatched_authors:
-        # Add unmatched authors as keywordGroups 
-        keyword_group = {
-            "typeDiscriminator": "FullKeywordGroup",
-            "logicalName": "/dk/atira/pure/authors",
-            "name": {
-                "en_IE": "Authors (Note for portal: view the doc link for the full list of authors)"
-            },
-            "keywordContainers": [
-                {
-                    "structuredKeyword": {
-                        "uri": "/dk/atira/pure/authors/authors"
-                    },
-                    "freeKeywords": [
-                        {
-                            "locale": "en_IE",
-                            "freeKeywords": unmatched_authors  
-                        }
-                    ]
-                }
-            ]
-        }
-        record["keywordGroups"] = [keyword_group]
-        print(f"✅ Added {len(unmatched_authors)} unmatched authors to keywordGroups")    
+    # # Only add unmatched authors as keywordGroups if there are actually unmatched authors
+    # if unmatched_authors:
+    #     # Add unmatched authors as keywordGroups 
+    #     keyword_group = {
+    #         "typeDiscriminator": "FullKeywordGroup",
+    #         "logicalName": "/dk/atira/pure/authors",
+    #         "name": {
+    #             "en_IE": "Authors (Note for portal: view the doc link for the full list of authors)"
+    #         },
+    #         "keywordContainers": [
+    #             {
+    #                 "structuredKeyword": {
+    #                     "uri": "/dk/atira/pure/authors/authors"
+    #                 },
+    #                 "freeKeywords": [
+    #                     {
+    #                         "locale": "en_IE",
+    #                         "freeKeywords": unmatched_authors  
+    #                     }
+    #                 ]
+    #             }
+    #         ]
+    #     }
+    #     record["keywordGroups"] = [keyword_group]
+    #     print(f"✅ Added {len(unmatched_authors)} unmatched authors to keywordGroups")    
 
 
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
