@@ -16,11 +16,12 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# DSPACE_CSV = "./matching_test/dspace_test_sample.csv"
-DSPACE_CSV = 'metadata_dspace_test_02-12-2025.csv'
-PURE_JSON = "./matching_test/research_outputs/research_outputs_2025-11-20_all.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/merged_authors_all_20251215.json"
-OUTPUT_DIR = "./matching_test/output"
+TODAY = date.today().isoformat()
+
+DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-09.csv"
+PURE_JSON = "./matching_test/research_outputs/pure_test_research_outputs_2026-01-07.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_02-12-2025.json"
+OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -46,8 +47,6 @@ if not API_KEY:
 os.makedirs(MATCHED_DIR, exist_ok=True)
 os.makedirs(UNMATCHED_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
-
-TODAY = date.today().isoformat()
 
 # --- TYPE MAPPING ---
 dspace_pure_subtype_map = {
@@ -830,12 +829,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     
     for ev in existing_evs:
         doi = normalize_doi(ev.get("doi", ""))
-        if doi.startswith("https://doi.org/10.13025"):
-            existing_repo_evs.append(ev)
-        elif doi and doi.startswith("https://doi.org/"):
-            existing_publisher_evs.append(ev)
-        else:
-            existing_other_evs.append(ev)
+        if "hdl.handle.net" not in doi:
+            if doi.startswith("https://doi.org/10.13025"):
+                existing_repo_evs.append(ev)
+            elif doi and doi.startswith("https://doi.org/"):
+                existing_publisher_evs.append(ev)
+            else:
+                existing_other_evs.append(ev)
     
     existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
     existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
@@ -926,45 +926,68 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     
     # Add repository DOI first (if exists)
     if repo_ev:
-        # Remove handle field if present
-        if "handle" in repo_ev:
-            del repo_ev["handle"]
+        # Strip https://doi.org/ prefix from DOI
+        if "doi" in repo_ev and repo_ev["doi"].startswith("https://doi.org/"):
+            repo_ev["doi"] = repo_ev["doi"].replace("https://doi.org/", "")
         final_evs.append(repo_ev)
     
     # Add publisher DOIs second
     for ev in existing_publisher_evs:
-        if "handle" not in ev:
-            final_evs.append(ev)
+        # Strip https://doi.org/ prefix from DOI
+        if "doi" in ev and ev["doi"].startswith("https://doi.org/"):
+            ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        final_evs.append(ev)
     
     if new_publisher_ev:
+        # Strip https://doi.org/ prefix from DOI
+        if "doi" in new_publisher_ev and new_publisher_ev["doi"].startswith("https://doi.org/"):
+            new_publisher_ev["doi"] = new_publisher_ev["doi"].replace("https://doi.org/", "")
         final_evs.append(new_publisher_ev)
     
     # Add other electronic versions last
     for ev in existing_other_evs:
-        if "handle" not in ev:
-            final_evs.append(ev)
-    
+        # Strip https://doi.org/ prefix from DOI if present
+        if "doi" in ev and isinstance(ev["doi"], str) and ev["doi"].startswith("https://doi.org/"):
+            ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        final_evs.append(ev)
+
     # Only update if changed
     if final_evs != existing_evs:
         updated_record["electronicVersions"] = final_evs
 
-    # --- 5f. Add Handles as links ---
+    # --- 5f. Add Handles as links and remove DOI links ---
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
+    existing_links = pure_record.get("links", [])
+
+    # Filter out DOI links from existing links
+    filtered_links = []
+    for link in existing_links:
+        url = link.get("url", "")
+        # Keep the link if it's NOT a DOI link
+        if not "doi.org" in url:
+            filtered_links.append(link)
+    
+    # Add new handle links
     if uri_str:
         handles = extract_handles_from_uri(uri_str)
         if handles:
-            existing_links = pure_record.get("links", [])
-            existing_link_urls = {normalize_handle(link.get("url", "")) for link in existing_links}
-            
-            new_links = []
+            existing_handle_urls = {normalize_handle(link.get("url", "")) for link in filtered_links}
+            new_handle_links = []
             for handle in handles:
                 normalized_handle = normalize_handle(handle)
-                if normalized_handle not in existing_link_urls:
+                if normalized_handle not in existing_handle_urls:
                     link = build_link(handle, alias="Handle", description="Repository Handle")
-                    new_links.append(link)
-            
-            if new_links:
-                updated_record["links"] = existing_links + new_links
+                    new_handle_links.append(link)
+
+    if new_handle_links:
+        new_handle_links.extend(filtered_links)
+        updated_links = new_handle_links
+    else:
+        updated_links = filtered_links
+    
+    # Update links only if changed
+    if updated_links != existing_links:
+        updated_record["links"] = updated_links
 
     # --- 6. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
