@@ -288,27 +288,44 @@ def get_organizations_from_pure_person(person, is_internal=True):
     """Extract organization UUIDs from Pure person record"""
     orgs = []
     
-    # Define which fields to check based on person type
-    association_types = []
     if is_internal:
+        # For internal persons: extract from various staff/student/visitor associations
         association_types = [
             ("staffOrganizationAssociations", "organization"),
             ("honoraryStaffOrganizationAssociations", "organization"),
             ("studentOrganizationAssociations", "organization"),
             ("visitingScholarOrganizationAssociations", "organization"),
         ]
-    else:
-        association_types = [
-            ("externalPositions", "externalOrganization"),
-            ("contributorAssociations", "externalOrganization"),
-        ]
+        
+        # Extract UUIDs from all configured association types
+        for field_name, org_field in association_types:
+            for assoc in person.get(field_name, []):
+                org = assoc.get(org_field, {})
+                if org.get("uuid"):
+                    orgs.append(org["uuid"])
+        
+        # Also check externalPositions for internal persons (they can have external org affiliations)
+        for ext_pos in person.get("externalPositions", []):
+            ext_org = ext_pos.get("externalOrganization", {})
+            if ext_org.get("uuid"):
+                orgs.append(ext_org["uuid"])
     
-    # Extract UUIDs from all configured association types
-    for field_name, org_field in association_types:
-        for assoc in person.get(field_name, []):
-            org = assoc.get(org_field, {})
-            if org.get("uuid"):
-                orgs.append(org["uuid"])
+    else:
+        # For external persons: organizations are stored directly in externalOrganizations array
+        for ext_org in person.get("externalOrganizations", []):
+            if ext_org.get("uuid"):
+                orgs.append(ext_org["uuid"])
+        
+        # Also check externalPositions and contributorAssociations if they exist
+        for ext_pos in person.get("externalPositions", []):
+            ext_org = ext_pos.get("externalOrganization", {})
+            if ext_org.get("uuid"):
+                orgs.append(ext_org["uuid"])
+        
+        for contrib in person.get("contributorAssociations", []):
+            ext_org = contrib.get("externalOrganization", {})
+            if ext_org.get("uuid"):
+                orgs.append(ext_org["uuid"])
     
     return list(set(orgs))  # Return unique UUIDs
 
