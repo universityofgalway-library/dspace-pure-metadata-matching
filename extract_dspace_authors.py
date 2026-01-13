@@ -8,6 +8,7 @@ def normalize_component(name):
     Normalize a name component into readable 'Title Case' while preserving:
     - initials like P., J.P.
     - O' prefixes
+    - Mc prefixes
     - hyphens
     - particles like 'de', 'van', 'von', 'der'
     """
@@ -34,6 +35,16 @@ def normalize_component(name):
             fixed.append("O'" + p[2:].capitalize())
             continue
 
+        # Handle Mc names: mcgarry → McGarry
+        if p.lower().startswith("mc") and len(p) > 2:
+            fixed.append("Mc" + p[2].upper() + p[3:])
+            continue
+
+        # Handle Mac names: macgarry → MacGarry
+        if p.lower().startswith("mac") and len(p) > 3 and not p.endswith("i"):
+            fixed.append("Mac" + p[3].upper() + p[4:])
+            continue
+
         # Default capitalization
         fixed.append(p.capitalize())
 
@@ -56,6 +67,71 @@ def normalize_name_key(first, last):
     first = " ".join(first.strip().lower().split())
     last = " ".join(last.strip().lower().split())
     return first, last
+
+
+def fix_misplaced_prefix(first, last):
+    """
+    Fix cases where Irish/Scottish surname prefixes are erroneously in the first name.
+    
+    Example: first="Sarah Mc", last="Garrigle" → first="Sarah", last="McGarrigle"
+             first="John O'", last="Brien" → first="John", last="O'Brien"
+             first="Mary Mac", last="Donald" → first="Mary", last="Mac Donald"
+    
+    Prefixes without space after: Mc, O'
+    Prefixes with space after: Mac, Ó, Ní, Nic, Mhic, De, Mac Giolla, Mac Con, Uí, Mac an, Nic an, Ua
+    """
+    if not first or not last:
+        return first, last
+    
+    # Define prefixes: (prefix_pattern, needs_space_after)
+    # Order matters: check longer prefixes first to avoid partial matches
+    prefixes = [
+        ("Mac Giolla", True),   # Longer compound prefixes first
+        ("Mac Con", True),
+        ("Mac an", True),
+        ("Nic an", True),
+        ("Mhic", True),
+        ("Mac", True),
+        ("Nic", True),
+        ("Mc", False),
+        ("O'", False),
+        ("Ó", True),
+        ("Ní", True),
+        ("De", True),
+        ("Uí", True),
+        ("Ua", True),
+    ]
+    
+    first_parts = first.strip().split()
+    
+    # Check if the last word(s) of first name match any prefix
+    for prefix, needs_space in prefixes:
+        prefix_parts = prefix.split()
+        prefix_len = len(prefix_parts)
+        
+        # Check if the last N parts of first name match this prefix (case-insensitive)
+        if len(first_parts) >= prefix_len + 1:  # Need at least one name part before prefix
+            potential_prefix_parts = first_parts[-prefix_len:]
+            potential_prefix = " ".join(potential_prefix_parts)
+            
+            if potential_prefix.lower() == prefix.lower():
+                # Found a match! Split the first name
+                actual_first = " ".join(first_parts[:-prefix_len])
+                
+                # Preserve original capitalization of the prefix from the input
+                prefix_part = potential_prefix
+                
+                # Reconstruct the last name with the prefix
+                # Preserve the original capitalization of 'last' as well
+                if needs_space:
+                    corrected_last = f"{prefix_part} {last}"
+                else:
+                    corrected_last = f"{prefix_part}{last}"
+                
+                return actual_first, corrected_last
+    
+    return first, last
+
 
 def valid_author_name(first, last, strict=True):
     """
@@ -100,6 +176,9 @@ def parse_names(name_field):
             else:
                 first = p
                 last = ""
+        
+        # ✅ Fix misplaced prefixes before adding to names list
+        first, last = fix_misplaced_prefix(first, last)
         names.append((first, last))
 
     return names

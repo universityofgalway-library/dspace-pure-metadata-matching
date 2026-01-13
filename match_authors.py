@@ -55,10 +55,126 @@ def capitalize_after_hyphen(name: str) -> str:
 
     return HYPHEN_CAP_REGEX.sub(repl, name)
 
+def capitalize_irish_surname(surname):
+    """Capitalize Irish surnames with special rules for prefixes.
+    Preserves spacing from the input variant and handles multi-word surnames.
+    
+    Rules:
+    - Mc, O': no space after prefix (by default)
+    - Mac, Nic, Ní, Ua, Uí, Ó: space after prefix (by default)
+    - But if the variant already has a space after the prefix, preserve it
+    - For Ua, Uí, Ní, Ó: if next letter is 'h', keep it lowercase and capitalize next vowel
+    - "an" after Mac/Nic should not be capitalized (e.g., "Mac an tSaoi", "Nic an Fhionnlaoich")
+    - Special longer prefixes: Mac Con, Mac Giolla, Mac an, Nic an (handle before simple Mac/Nic)
+    - For compound surnames with spaces (e.g., "O'Reilly-De brún" or "O'Malley keighran"), capitalize each part
+    """
+    if not surname:
+        return surname
+    
+    # Don't normalize here - keep the original spacing from the variant
+    original = surname.strip()
+    normalized = normalize(original)
+    vowels = set('aeiouáéíóú')
+    
+    # Prefixes that require special capitalization (Irish, European, etc.)
+    # Order matters: longer prefixes first to avoid partial matches
+    # Format: prefix_lower -> (prefix_capitalized, needs_space)
+    all_prefixes = {
+        # Longer Irish prefixes first
+        'mac con': ('Mac Con', True),
+        'mac giolla': ('Mac Giolla', True),
+        'mac an': ('Mac an', True),
+        'nic an': ('Nic an', True),
+        # Single Irish prefixes
+        'mc': ('Mc', False),         # Can vary: space or no space
+        'mac': ('Mac', False),       # Can vary: space or no space
+        'nic': ('Nic', False),       # Can vary: space or no space
+        'ní': ('Ní', True),
+        'ua': ('Ua', True),
+        'uí': ('Uí', True),
+        "o'": ("O'", False),
+        'ó': ('Ó', True),
+        'o': ('O', True),
+        'mhic': ('Mhic', True),
+        'de': ('De', True)
+    }
+    
+    for prefix_lower, (prefix_cap, needs_space) in all_prefixes.items():
+        if normalized.startswith(prefix_lower):
+            # Extract the rest after the prefix, preserving original capitalization
+            rest_original = original[len(prefix_lower):]
+            
+            # Check if there's a space after the prefix in the original
+            has_space_after = rest_original.startswith(' ') if rest_original else False
+            rest = rest_original.lstrip()
+            
+            if not rest:
+                continue
+            
+            # Special handling for "Mac an" and "Nic an" - don't capitalize "an"
+            if prefix_lower in ('mac an', 'nic an'):
+                rest_words = rest.split()
+                if rest_words:
+                    # Capitalize each word after "an"
+                    capitalized_words = [w[0].upper() + w[1:] if len(w) > 1 else w.upper() for w in rest_words]
+                    remaining = ' '.join(capitalized_words)
+                    return f"{prefix_cap} {remaining}"
+            
+            # For Ua, Uí, Ní, Ó: special handling if next letter is 'h'
+            if prefix_lower in ('ua', 'uí', 'ní', 'ó'):
+                # Check only the first part (before any space) for 'h' handling
+                first_part = rest.split()[0] if ' ' in rest else rest
+                remaining_parts = ' '.join(rest.split()[1:]) if ' ' in rest else ''
+                
+                if first_part.startswith('h') and len(first_part) > 1:
+                    # Next letter is 'h', keep it lowercase and capitalize the next vowel
+                    rest_after_h = first_part[1:]
+                    # Find the first vowel and capitalize it
+                    for i, char in enumerate(rest_after_h):
+                        if char.lower() in vowels:
+                            first_part_cap = 'h' + rest_after_h[:i] + rest_after_h[i].upper() + rest_after_h[i+1:]
+                            if remaining_parts:
+                                # Capitalize remaining parts
+                                remaining_caps = ' '.join([p.capitalize() for p in remaining_parts.split()])
+                                return f"{prefix_cap} {first_part_cap} {remaining_caps}"
+                            return f"{prefix_cap} {first_part_cap}"
+                    # No vowel found, just capitalize first letter of rest_after_h
+                    first_part_cap = 'h' + (rest_after_h[0].upper() + rest_after_h[1:] if len(rest_after_h) > 1 else rest_after_h.upper())
+                    if remaining_parts:
+                        remaining_caps = ' '.join([p.capitalize() for p in remaining_parts.split()])
+                        return f"{prefix_cap} {first_part_cap} {remaining_caps}"
+                    return f"{prefix_cap} {first_part_cap}"
+            
+            # Standard capitalization: capitalize first letter of each space-separated part
+            # This handles compound surnames like "O'Reilly-De brún" -> "O'Reilly-De Brún"
+            # or "O'Malley keighran" -> "O'Malley Keighran"
+            if ' ' in rest:
+                parts = rest.split(' ')
+                rest_cap = ' '.join([p[0].upper() + p[1:] if len(p) > 1 else p.upper() for p in parts])
+            else:
+                rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
+            
+            # Determine if we should use space: use the configured default unless the original has a different spacing
+            use_space = needs_space or has_space_after
+            
+            if use_space:
+                return f"{prefix_cap} {rest_cap}"
+            else:
+                return f"{prefix_cap}{rest_cap}"
+    
+    # For non-Irish surnames, capitalize each space-separated part
+    if ' ' in original:
+        parts = original.split(' ')
+        return ' '.join([p.capitalize() for p in parts])
+    
+    return original.capitalize()
+
+
 def get_surname_variants(surname):
     """Generate all variants of a surname with different prefix spacing patterns AND different prefix forms.
     Handles 26+ international prefixes including Irish, European, Arabic, Hebrew.
     For Irish surnames, generates variants across related prefix forms (O/O'/Ó, Mac/Mc, Ua/Uí, Nic/Ní).
+    Preserves multi-word surnames (e.g., "O'Malley Keighran" stays as two words).
     
     Returns dict with prefix info:
     {
@@ -99,12 +215,14 @@ def get_surname_variants(surname):
         prefix_len = len(prefix)
         
         if normalized.startswith(prefix):
-            # Extract the rest of the surname
-            rest_with_space = normalized[prefix_len:]
-            rest_no_space = rest_with_space.replace(" ", "")
+            # Extract the rest of the surname - preserve internal spaces in multi-word surnames
+            rest_with_space = normalized[prefix_len:].lstrip()
+            
+            # Only remove spaces between the prefix and the main part, NOT internal spaces
+            # Example: "o'malley keighran" -> rest should be "malley keighran" (keep the space)
             
             # Only process if there's something after the prefix
-            if not rest_no_space:
+            if not rest_with_space:
                 continue
             
             # For single-letter prefixes (O, U, D, etc.), verify they're actually prefixes
@@ -131,32 +249,49 @@ def get_surname_variants(surname):
                 elif current_prefix in ("ua", "uí", "nic", "ní", "mac", "ó", "o"):
                     current_requires_space = requires_space
                 
+                # For variants, preserve multi-word structure
+                # Extract first word after prefix (for spacing variants) and keep remaining words
+                parts = rest_with_space.split()
+                first_word = parts[0] if parts else ""
+                remaining_words = " ".join(parts[1:]) if len(parts) > 1 else ""
+                
                 # Single-letter prefixes like "o" and "ó" MUST have space to avoid ambiguity
-                # E.g., "O Flynn" should not generate "Oflynn" as a variant
                 if len(current_prefix) == 1 and current_prefix in ("o", "ó"):
                     # Always require space for single-letter Irish prefixes
-                    variants.add(f"{current_prefix} {rest_no_space}")
+                    variants.add(f"{current_prefix} {rest_with_space}")
                 # Mac an and Nic an should ONLY have space variant, no no-space variant
                 elif current_prefix in ("mac an", "nic an"):
-                    variants.add(f"{current_prefix} {rest_no_space}")
+                    variants.add(f"{current_prefix} {rest_with_space}")
                 elif current_requires_space:
-                    # Must have space: generate with and without space
-                    variants.add(f"{current_prefix} {rest_no_space}")
-                    variants.add(f"{current_prefix}{rest_no_space}")
+                    # Must have space: generate with and without space after prefix
+                    # But preserve internal spaces in multi-word surnames
+                    variants.add(f"{current_prefix} {rest_with_space}")
+                    if remaining_words:
+                        variants.add(f"{current_prefix}{first_word} {remaining_words}")
+                    else:
+                        variants.add(f"{current_prefix}{first_word}")
                 else:
-                    # Can vary: generate both with and without space
+                    # Can vary: generate both with and without space after prefix
                     if current_prefix in ("mc", "o'", "d'"):
                         # These prefixes typically don't have space in canonical form
-                        variants.add(f"{current_prefix}{rest_no_space}")
-                        variants.add(f"{current_prefix} {rest_no_space}")
+                        if remaining_words:
+                            variants.add(f"{current_prefix}{first_word} {remaining_words}")
+                            variants.add(f"{current_prefix} {first_word} {remaining_words}")
+                        else:
+                            variants.add(f"{current_prefix}{first_word}")
+                            variants.add(f"{current_prefix} {first_word}")
                     else:
                         # Other prefixes typically have space in canonical form
-                        variants.add(f"{current_prefix} {rest_no_space}")
-                        variants.add(f"{current_prefix}{rest_no_space}")
+                        variants.add(f"{current_prefix} {rest_with_space}")
+                        if remaining_words:
+                            variants.add(f"{current_prefix}{first_word} {remaining_words}")
+                        else:
+                            variants.add(f"{current_prefix}{first_word}")
             
             # Set canonical form (use the original detected prefix form)
+            # Preserve multi-word structure in canonical form
             if canonical is None:
-                canonical = canonical_template.format(rest_no_space)
+                canonical = canonical_template.format(rest_with_space)
             
             break
     
@@ -168,99 +303,6 @@ def get_surname_variants(surname):
         'variants': list(variants),
         'canonical': canonical
     }
-
-
-def capitalize_irish_surname(surname):
-    """Capitalize Irish surnames with special rules for prefixes.
-    Preserves spacing from the input variant.
-    
-    Rules:
-    - Mc, O': no space after prefix (by default)
-    - Mac, Nic, Ní, Ua, Uí, Ó: space after prefix (by default)
-    - But if the variant already has a space after the prefix, preserve it
-    - For Ua, Uí, Ní, Ó: if next letter is 'h', keep it lowercase and capitalize next vowel
-    - "an" after Mac/Nic should not be capitalized (e.g., "Mac an tSaoi", "Nic an Fhionnlaoich")
-    - Special longer prefixes: Mac Con, Mac Giolla, Mac an, Nic an (handle before simple Mac/Nic)
-    """
-    if not surname:
-        return surname
-    
-    # Don't normalize here - keep the original spacing from the variant
-    original = surname.strip()
-    normalized = normalize(original)
-    vowels = set('aeiouáéíóú')
-    
-    # Prefixes that require special capitalization (Irish, European, etc.)
-    # Order matters: longer prefixes first to avoid partial matches
-    # Format: prefix_lower -> (prefix_capitalized, needs_space)
-    all_prefixes = {
-        # Longer Irish prefixes first
-        'mac con': ('Mac Con', True),
-        'mac giolla': ('Mac Giolla', True),
-        'mac an': ('Mac an', True),
-        'nic an': ('Nic an', True),
-        # Single Irish prefixes
-        'mc': ('Mc', False),         # Can vary: space or no space
-        'mac': ('Mac', False),       # Can vary: space or no space
-        'nic': ('Nic', False),       # Can vary: space or no space
-        'ní': ('Ní', True),
-        'ua': ('Ua', True),
-        'uí': ('Uí', True),
-        "o'": ("O'", False),
-        'ó': ('Ó', True),
-        'o': ('O', True),
-        'mhic': ('Mhic', True)
-    }
-    
-    for prefix_lower, (prefix_cap, needs_space) in all_prefixes.items():
-        if normalized.startswith(prefix_lower):
-            # Extract the rest after the prefix
-            rest_original = original[len(prefix_lower):]  # Keep spacing as-is
-            
-            # Check if there's a space after the prefix in the original
-            has_space_after = rest_original.startswith(' ') if rest_original else False
-            rest = rest_original.lstrip()
-            
-            if not rest:
-                continue
-            
-            # Special handling for "Mac an" and "Nic an" - don't capitalize "an"
-            if prefix_lower in ('mac an', 'nic an'):
-                rest_words = rest.split()
-                if rest_words:
-                    # First word after "an" should be capitalized
-                    first_word = rest_words[0]
-                    first_word_cap = first_word[0].upper() + first_word[1:] if len(first_word) > 1 else first_word.upper()
-                    remaining = ' '.join([first_word_cap] + rest_words[1:])
-                    return f"{prefix_cap} {remaining}"
-            
-            # For Ua, Uí, Ní, Ó: special handling if next letter is 'h'
-            if prefix_lower in ('ua', 'uí', 'ní', 'ó'):
-                if rest.startswith('h') and len(rest) > 1:
-                    # Next letter is 'h', keep it lowercase and capitalize the next vowel
-                    rest_after_h = rest[1:]  # Remove 'h'
-                    # Find the first vowel and capitalize it
-                    for i, char in enumerate(rest_after_h):
-                        if char.lower() in vowels:
-                            rest_cap = 'h' + rest_after_h[:i] + rest_after_h[i].upper() + rest_after_h[i+1:]
-                            return f"{prefix_cap} {rest_cap}"
-                    # No vowel found, just capitalize first letter of rest_after_h
-                    rest_cap = 'h' + (rest_after_h[0].upper() + rest_after_h[1:] if len(rest_after_h) > 1 else rest_after_h.upper())
-                    return f"{prefix_cap} {rest_cap}"
-            
-            # Standard capitalization: capitalize first letter, preserve rest as-is
-            rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
-            
-            # Determine if we should use space: use the configured default unless the original has a different spacing
-            use_space = needs_space or has_space_after
-            
-            if use_space:
-                return f"{prefix_cap} {rest_cap}"
-            else:
-                return f"{prefix_cap}{rest_cap}"
-    
-    # For non-Irish surnames, just capitalize normally
-    return original.capitalize()
 
 def normalize_surname_for_output(surname):
     """Normalize surname to canonical pattern for output using get_surname_variants()."""
@@ -293,7 +335,6 @@ def get_organizations_from_pure_person(person, is_internal=True):
         association_types = [
             ("staffOrganizationAssociations", "organization"),
             ("honoraryStaffOrganizationAssociations", "organization"),
-            ("studentOrganizationAssociations", "organization"),
             ("visitingScholarOrganizationAssociations", "organization"),
         ]
         
@@ -478,7 +519,7 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         capitalized_last = capitalize_irish_surname(last)
         for variant in all_surname_variants:
             # Capitalize the variant properly (handles Irish prefixes)
-            capitalized_variant = capitalized_variant = capitalize_after_hyphen(capitalize_irish_surname(variant))
+            capitalized_variant = capitalize_after_hyphen(capitalize_irish_surname(variant))
             # Only add if it's different from the capitalized original
             if capitalized_variant != capitalized_last:
                 # Check if this surname has a Mc, Mac, or Nic prefix AND is NOT "Mac an" or "Nic an"
@@ -487,13 +528,26 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
                 if not is_mac_an_or_nic_an:
                     alternative_lastnames.add(capitalized_variant)
         
-        # ✅ WORKAROUND: If last name starts with Mc, add spacing variant
-        # E.g., "McCrae" -> add "Mc Crae"
+        # ✅ WORKAROUND: If last name starts with Mc, add spacing variant (capitalized properly)
+        # E.g., "McCrae" -> add "Mc Crae" (not "Mc crae")
         if len(last) >= 3 and last[0:2].lower() == 'mc':
             # Extract the part after "Mc"
             rest = last[2:]
-            spacing_variant = f"Mc {rest}"
-            if spacing_variant != capitalized_last and spacing_variant != normalized_last_name:
+            # Capitalize the rest properly (handles compound parts like "Crae")
+            rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
+            spacing_variant = f"Mc {rest_cap}"
+            normalized_last_name_temp = capitalize_after_hyphen(normalize_surname_for_output(last))
+            if spacing_variant != capitalized_last and spacing_variant != normalized_last_name_temp:
+                alternative_lastnames.add(spacing_variant)
+
+        if len(last) >= 4 and last[0:3].lower() == 'mac' and not last.lower().endswith(("i", "j")):
+            # Extract the part after "Mac"
+            rest = last[3:]
+            # Capitalize the rest properly (handles compound parts like "Crae")
+            rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
+            spacing_variant = f"Mac {rest_cap}"
+            normalized_last_name_temp = capitalize_after_hyphen(normalize_surname_for_output(last))
+            if spacing_variant != capitalized_last and spacing_variant != normalized_last_name_temp:
                 alternative_lastnames.add(spacing_variant)
         
         # ✅ Normalize the primary lastName to canonical form
