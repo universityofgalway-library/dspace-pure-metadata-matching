@@ -11,6 +11,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 TODAY = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+TODAY_DATE = datetime.now().strftime('%Y-%m-%d')
 
 def extract_localized_value(field, field_name="value"):
     """
@@ -175,14 +176,20 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
 
     results = []
     failed_records = []
-    success_count = 0  # FIX: Track successful records, not files
+    success_count = 0
     
     for rec in records:
+        # Extract identifiers for error logging
+        record_title = extract_name_from_response(rec, data_type)
+        record_handle = extract_handle_from_links(rec)
+        record_uuid = rec.get("uuid", "N/A")
+        record_id = f"[Title: {record_title}, Handle: {record_handle}, UUID: {record_uuid}]"
+        
         try:
             if mode == "update":
                 uuid = rec.get("uuid")
                 if not uuid:
-                    error_log.append(f"No uuid in record for update: {path}")
+                    error_log.append(f"No uuid in record for update in file {path} - {record_id}")
                     results.append((path, False, "no_uuid"))
                     failed_records.append(rec)
                     continue
@@ -190,6 +197,7 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
             elif mode == "create":
                 resp = session.put(f"{PURE_BASE_URL}/{data_type}", headers=HEADERS, json=rec, timeout=60)
             else:
+                error_log.append(f"Invalid mode '{mode}' for file {path} - {record_id}")
                 results.append((path, False, f"bad_mode:{mode}"))
                 failed_records.append(rec)
                 continue
@@ -199,22 +207,21 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
                 try:
                     response_data = resp.json()
                     log_record(mode, data_type, response_data, log_dir, is_test)
-                    success_count += 1  # FIX: Increment for each successful record
+                    success_count += 1
                 except Exception as e:
-                    error_log.append(f"Failed to log record from {path}: {e}")
+                    error_log.append(f"Failed to log record from {path} - {record_id}: {e}")
                 
                 results.append((path, True, f"{resp.status_code}"))
             else:
                 err_text = f"{resp.status_code} - {resp.text}"
-                error_log.append(f"API error for {path}: {err_text}")
+                error_log.append(f"API error for {path} - {record_id}: {err_text}")
                 results.append((path, False, err_text))
                 failed_records.append(rec)
         except Exception as e:
-            error_log.append(f"Exception when sending {path}: {e}")
+            error_log.append(f"Exception when sending {path} - {record_id}: {e}")
             results.append((path, False, str(e)))
             failed_records.append(rec)
 
-    # FIX: Return success_count instead of boolean
     return success_count, results, failed_records
 
 
@@ -241,7 +248,7 @@ def process_folder(folder_path, data_type, session, error_log, log_dir, is_test)
     if all_failed_records:
         failed_path = save_failed_records(all_failed_records, folder_path, data_type, mode)
         if failed_path:
-            print(f"\n⚠️ {len(all_failed_records)} failed records saved to: {failed_path}")
+            print(f"\n {len(all_failed_records)} failed records saved to: {failed_path}")
     
     return total_successes, total_failures, len(json_files)
 
@@ -252,7 +259,7 @@ def process_single_file(path, mode, data_type, session, error_log, log_dir, is_t
     if failed_records:
         failed_path = save_failed_records(failed_records, path, data_type, mode)
         if failed_path:
-            print(f"\n⚠️ {len(failed_records)} failed records saved to: {failed_path}")
+            print(f"\n {len(failed_records)} failed records saved to: {failed_path}")
     
     return success_count, results
 
@@ -327,13 +334,18 @@ if __name__ == "__main__":
                         "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to get from Pure")
     args = parser.parse_args()
 
-    LOG_DIR = "./matching_test/test_output/logs/uploader_logs"
+    LOG_DIR = f"./matching_test/test_output_{TODAY_DATE}/logs/uploader_logs"
     os.makedirs(LOG_DIR, exist_ok=True)
     ERROR_LOG_PATH = os.path.join(LOG_DIR, f"uploader_errors_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
     # Load environment variables from .env file
     load_dotenv()
-    API_KEY = os.getenv("PURE_API_KEY", "")
+
+    if args.mode == "update":
+        # You need ROOT access API key to update keywords
+        API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
+    else:
+        API_KEY = os.getenv("PURE_API_KEY", "")
 
     if not API_KEY:
         print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
@@ -345,7 +357,7 @@ if __name__ == "__main__":
             "api-key": API_KEY
         }
 
-    # let HEADERS be used in each request call
+    # Let HEADERS be used in each request call
     session = requests.Session()
    
     error_log = []

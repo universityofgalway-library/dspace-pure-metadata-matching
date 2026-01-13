@@ -10,7 +10,7 @@ TODAY = date.today().isoformat()
 
 # Define all available data types
 ALL_DATA_TYPES = [
-    "research-outputs",
+    # "research-outputs",
     "persons",
     "external-persons",
     "journals",
@@ -40,7 +40,7 @@ def fetch_all(data_type, api_key="", test=True):
     # First, get total count to initialize progress bar
     total_count = None
     try:
-        first_url = f"{base_url}{data_type}?offset=0&size=1"
+        first_url = f"{base_url}{data_type}?offset=0&size=1&rendering=all"
         first_response = requests.get(first_url, headers=headers, timeout=30)
         if first_response.status_code == 200:
             total_count = first_response.json().get("count", 0)
@@ -51,7 +51,7 @@ def fetch_all(data_type, api_key="", test=True):
     pbar = tqdm(total=total_count, desc=f"Fetching {data_type}", unit="item", disable=not total_count)
 
     while True:
-        url = f"{base_url}{data_type}?offset={offset}&size={page_size}"
+        url = f"{base_url}{data_type}?offset={offset}&size={page_size}&rendering=all"
 
         try:
             response = requests.get(url, headers=headers, timeout=30)
@@ -155,10 +155,12 @@ if __name__ == "__main__":
     # Load environment variables from .env file
     load_dotenv()
 
-    API_KEY = os.getenv("PURE_API_KEY", "")
+    # You need ROOT access API key to get all data
+    # For a regular user, some metadata fields, e.g. keywords, are not accessible
+    API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
 
     if not API_KEY:
-        print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
+        print("⚠️ WARNING: PURE_ROOT_API_KEY not found in environment variables.")
 
     parser = argparse.ArgumentParser(description="Fetch data from Pure API")
     parser.add_argument(

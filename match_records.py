@@ -18,9 +18,9 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
-DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-09.csv"
-PURE_JSON = "./matching_test/research_outputs/pure_test_research_outputs_2026-01-07.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_2025-12-02.json"
+DSPACE_CSV = "./matching_test/dspace_test_sample_2025-12-18.csv"
+PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-13.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_2026-01-13.json"
 OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -518,6 +518,111 @@ def build_link(url, alias="", description=""):
         "description": {"en_IE": description}
         }
 
+
+def validate_organization(org_uuid, api_key, base_url):
+    """
+    Validate if an organization UUID exists in Pure.
+    Returns True if found, False otherwise.
+    """
+    try:
+        response = requests.get(
+            f"{base_url}organizations/{org_uuid}",
+            headers={
+                "accept": "application/json",
+                "api-key": api_key
+            },
+            timeout=10
+        )
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def validate_and_fix_organizations(contributors, api_key, base_url):
+    """
+    Validate all internal organization UUIDs for contributors.
+    Move invalid internal orgs to externalOrganizations.
+    Returns updated contributors list.
+    """
+    if not api_key:
+        print("  ⚠️ No API key - skipping organization validation")
+        return contributors
+    
+    updated_contributors = []
+    
+    for contributor in contributors:
+        if not contributor:
+            continue
+        
+        # Check internal organizations
+        internal_orgs = contributor.get("organizations", [])
+        if internal_orgs:
+            valid_internal_orgs = []
+            invalid_orgs = []
+            
+            for org in internal_orgs:
+                org_uuid = org.get("uuid")
+                if org_uuid:
+                    if validate_organization(org_uuid, api_key, base_url):
+                        valid_internal_orgs.append(org)
+                    else:
+                        print(f"    ⚠️ Invalid internal org UUID {org_uuid} - moving to external")
+                        invalid_orgs.append({
+                            "systemName": "ExternalOrganization",
+                            "uuid": org_uuid
+                        })
+            
+            # Update organizations
+            if valid_internal_orgs:
+                contributor["organizations"] = valid_internal_orgs
+            else:
+                # Remove organizations key if all were invalid
+                contributor.pop("organizations", None)
+            
+            # Add invalid orgs to externalOrganizations
+            if invalid_orgs:
+                existing_external = contributor.get("externalOrganizations", [])
+                # Avoid duplicates
+                existing_external_uuids = {org.get("uuid") for org in existing_external}
+                for invalid_org in invalid_orgs:
+                    if invalid_org["uuid"] not in existing_external_uuids:
+                        existing_external.append(invalid_org)
+                contributor["externalOrganizations"] = existing_external
+        
+        updated_contributors.append(contributor)
+    
+    return updated_contributors
+
+
+def collect_validated_organizations(contributors):
+    """
+    Collect all validated organizations from contributors.
+    Returns tuple: (internal_org_uuids, external_org_uuids)
+    """
+    internal_org_uuids = set()
+    external_org_uuids = set()
+    
+    for contributor in contributors:
+        if not contributor:
+            continue
+        
+        # Collect internal organizations
+        if "organizations" in contributor:
+            for org in contributor["organizations"]:
+                org_uuid = org.get("uuid")
+                if org_uuid:
+                    internal_org_uuids.add(org_uuid)
+        
+        # Collect external organizations
+        if "externalOrganizations" in contributor:
+            for org in contributor["externalOrganizations"]:
+                org_uuid = org.get("uuid")
+                if org_uuid:
+                    external_org_uuids.add(org_uuid)
+    
+    return list(internal_org_uuids), list(external_org_uuids)
+
+
 def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry, before_update_records):
     """
     Update pure_record with DSpace data according to precedence rules.
@@ -715,34 +820,17 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
 
     # Only update contributors if we have any
     if final_contributors:
+        # Validate and fix organizations
+        print("  🔍 Validating organization UUIDs...")
+        final_contributors = validate_and_fix_organizations(final_contributors, API_KEY, BASE_URL)
         updated_record["contributors"] = final_contributors
     
-    # --- 1a. Collect ALL organizations from ALL contributors (existing + new) ---
-    all_internal_org_uuids = set()
-    all_external_org_uuids = set()
+    # --- 1a. Collect ALL validated organizations from ALL contributors ---
+    all_internal_org_uuids, all_external_org_uuids = collect_validated_organizations(
+        final_contributors if final_contributors else []
+    )
     
-    # Collect organizations from final contributors list (already in correct order)
-    all_contributors_for_orgs = final_contributors
-        
-    for contributor in all_contributors_for_orgs:
-        if not contributor:  # Skip None or empty contributors
-            continue
-            
-        # Collect internal organizations
-        if "organizations" in contributor:
-            for org in contributor["organizations"]:
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    all_internal_org_uuids.add(org_uuid)
-        
-        # Collect external organizations
-        if "externalOrganizations" in contributor:
-            for org in contributor["externalOrganizations"]:
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    all_external_org_uuids.add(org_uuid)
-    
-    # Update top-level organizations with unique internal orgs
+    # Update top-level organizations with unique validated internal orgs
     if all_internal_org_uuids:
         updated_record["organizations"] = [
             {
@@ -763,24 +851,23 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         ]
 
     # --- 1b. Remove author keyword group if all DSpace authors are now matched ---
-    if dspace_authors and not unmatched_authors:
-        # All authors from DSpace are matched, remove the author keyword group
+    if final_contributors:
         existing_keyword_groups = pure_record.get("keywordGroups", [])
         if existing_keyword_groups:
             # Filter out the authors keyword group
+            print("  🗑️ Removing authors keyword group if present...")
             filtered_groups = [
                 kg for kg in existing_keyword_groups
                 if kg.get("logicalName") != "/dk/atira/pure/authors"
             ]
-            # Only update if we actually removed something
-            if len(filtered_groups) < len(existing_keyword_groups):
-                if filtered_groups:
-                    # Keep other keyword groups
-                    updated_record["keywordGroups"] = filtered_groups
-                else:
-                    # Remove keywordGroups entirely if empty
-                    updated_record["keywordGroups"] = []
+            if filtered_groups:
+                # Keep other keyword groups
+                updated_record["keywordGroups"] = filtered_groups
+            else:
+                # Remove keywordGroups entirely if empty
+                updated_record["keywordGroups"] = []
     
+
     # --- 2. Funder (dc.contributor.funder) > fill if blank ---
     # TODO: Implement funder lookup and mapping
 
@@ -790,7 +877,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     if issued:
         # Parse year/month/day
         parts = issued.split("-")
-        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
+        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 2025
         month = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
         day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
 
@@ -1239,30 +1326,22 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
 
     print(f"✅ Added {len(mapped_contributors)} contributors")
     
-    # Collect ALL organizations from ALL contributors
-    all_internal_org_uuids = set()
-    all_external_org_uuids = set()
-    first_internal_org_uuid = None  # Track first internal contributor's first organization
+    # Validate and fix organizations
+    print("  🔍 Validating organization UUIDs...")
+    mapped_contributors = validate_and_fix_organizations(mapped_contributors, API_KEY, BASE_URL)
     
-    for i, contributor in enumerate(mapped_contributors):
-        # Collect from internal organizations
-        if "organizations" in contributor:
-            for j, org in enumerate(contributor["organizations"]):
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    all_internal_org_uuids.add(org_uuid)
-                    # Capture first internal contributor's first organization
-                    if i == 0 and j == 0 and first_internal_org_uuid is None:
-                        first_internal_org_uuid = org_uuid
-        
-        # Collect from external organizations
-        if "externalOrganizations" in contributor:
-            for org in contributor["externalOrganizations"]:
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    all_external_org_uuids.add(org_uuid)
+    # Collect ALL validated organizations from ALL contributors
+    all_internal_org_uuids, all_external_org_uuids = collect_validated_organizations(mapped_contributors)
     
-    # Set top-level organizations with unique internal orgs
+    # Track first internal contributor's first organization for managingOrganization
+    first_internal_org_uuid = None
+    for contributor in mapped_contributors:
+        if "organizations" in contributor and contributor["organizations"]:
+            first_internal_org_uuid = contributor["organizations"][0].get("uuid")
+            if first_internal_org_uuid:
+                break
+    
+    # Set top-level organizations with unique validated internal orgs
     if all_internal_org_uuids:
         record["organizations"] = [
             {
@@ -1282,14 +1361,18 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             for org_uuid in all_external_org_uuids
         ]
     
-    # Set managingOrganization from first internal contributor's first organization
+    # Set managingOrganization from first internal contributor's first validated organization
     if first_internal_org_uuid:
         record["managingOrganization"] = {
             "uuid": first_internal_org_uuid,
             "systemName": "Organization"
         }
         print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
-
+    else:
+        record["managingOrganization"] = {
+            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",  # Default: Library Repository
+            "systemName": "Organization"
+        }
     
     # # Only add unmatched authors as keywordGroups if there are actually unmatched authors
     # if unmatched_authors:

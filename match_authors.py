@@ -8,8 +8,8 @@ from datetime import date
 
 # --- CONFIGURATION ---
 DSpace_Authors_JSON = "dspace_test_authors_all_2025-12-02.json"
-Pure_Internal_JSON = "./pure_entities/pure_test_persons_2026-01-07.json"
-Pure_External_JSON = "./pure_entities/pure_test_external-persons_2026-01-07.json"
+Pure_Internal_JSON = "./pure_entities/pure_test_persons_2026-01-13.json"
+Pure_External_JSON = "./pure_entities/pure_test_external-persons_2026-01-13.json"
 OUTPUT_DIR = "./matching_test/matched_authors"
 HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
 TODAY = date.today().isoformat()
@@ -94,7 +94,7 @@ def capitalize_irish_surname(surname):
         'uí': ('Uí', True),
         "o'": ("O'", False),
         'ó': ('Ó', True),
-        'o': ('O', True),
+        # 'o': ('O', True),
         'mhic': ('Mhic', True),
         'de': ('De', True)
     }
@@ -169,11 +169,70 @@ def capitalize_irish_surname(surname):
     
     return original.capitalize()
 
+def get_firstname_variants(first_name):
+    """
+    Generate variants of a first name:
+    - Full name "John" -> add initials ["J", "J."]
+    - Initial with dot "J." -> add without dot ["J"]
+    - Initials with dots "J. P." -> add variants ["J P", "JP", "J.P.", "J P."]
+    - Initials without dots "J P" -> add with dots ["J. P."]
+    - Initials no space "JP" -> add with space and dots ["J P", "J. P."]
+    """
+    if not first_name:
+        return []
+    
+    variants = set()
+    name = first_name.strip()
+    
+    # Check if it's initials (contains dots or is very short)
+    has_dots = '.' in name
+    has_spaces = ' ' in name
+    is_short = len(name.replace('.', '').replace(' ', '')) <= 3  # Likely initials if ≤3 chars
+    
+    if has_dots or (is_short and len(name) <= 5):
+        words = name.split()
+        variants.add(name.replace('.', '').title())  # Remove dots
+        variants.add(' '.join([w[0].upper() for w in words]))  # Initials no dots, with spaces
+        variants.add(''.join([w[0].upper() for w in words]))  # Initials no dots, no spaces
+        variants.add('.'.join([w[0].upper() for w in words]) + '.')  # Initials with dots, no spaces
+        variants.add('. '.join([w[0].upper() for w in words]) + '.')  # Initials with dots, with spaces            
+    
+    else:
+        # This is a full name - extract initials
+        # Handle hyphenated names like "Mary-Jane" -> "M-J" or "M.-J."
+        if '-' in name:
+            parts = name.split('-')
+            initials = [p[0].upper() for p in parts if p]
+            # Add hyphenated initials
+            variants.add('-'.join(initials))
+            variants.add('-'.join([i + '.' for i in initials]))
+        else:
+            # Simple name
+            parts = name.split()
+            if parts:
+                initials = [p[0].upper() for p in parts]
+        
+        # Add simple initial variants
+        if len(initials) > 0:
+            variants.add(initials[0])  # "J"
+            variants.add(initials[0] + '.')  # "J."
+            
+            # If multiple initials, add combined versions
+            if len(initials) > 1:
+                variants.add(''.join(initials))  # "JP"
+                variants.add(' '.join(initials))  # "J P"
+                variants.add('.'.join(initials) + '.')  # "J.P."
+                variants.add('. '.join(initials) + '.')  # "J. P."
+    
+    # Remove the original name from variants (we'll add it separately)
+    variants.discard(name)
+    
+    return list(variants)
+
 
 def get_surname_variants(surname):
-    """Generate all variants of a surname with different prefix spacing patterns AND different prefix forms.
-    Handles 26+ international prefixes including Irish, European, Arabic, Hebrew.
-    For Irish surnames, generates variants across related prefix forms (O/O'/Ó, Mac/Mc, Ua/Uí, Nic/Ní).
+    """Generate all variants of a surname with different prefix spacing patterns
+    for Irish surnames (O/O'/Ó, Mac/Mc, Ua/Uí, Nic/Ní).
     Preserves multi-word surnames (e.g., "O'Malley Keighran" stays as two words).
     
     Returns dict with prefix info:
@@ -184,6 +243,9 @@ def get_surname_variants(surname):
     """
     if not surname:
         return {'variants': [], 'canonical': ''}
+    
+    # Normalize multiple spaces to single space before processing
+    surname = ' '.join(surname.split())
     
     normalized = normalize(surname)
     variants = set([normalized])  # Use set to auto-deduplicate
@@ -206,8 +268,8 @@ def get_surname_variants(surname):
         ("mc", False, "Mc{0}", []),                   # Canonical without space, variant with space
         # O/O'/Ó variants
         ("o'", False, "O'{0}", ["o"]),               # Can generate O variants
-        ("ó", True, "Ó {0}", ["o"]),                 # Can generate O variants
-        ("o", True, "O {0}", ["o'", "ó"])          # Can generate O' and Ó variants
+        ("ó", True, "Ó {0}", ["o"])                 # Can generate O variants
+        # ("o ", True, "O {0}", ["o'", "ó"])          # Can generate O' and Ó variants
     ]
 
     # Check each prefix (longer ones first to avoid partial matches)
@@ -246,7 +308,7 @@ def get_surname_variants(surname):
                 current_requires_space = requires_space
                 if current_prefix in ("o'", "mc", "d'"):
                     current_requires_space = False
-                elif current_prefix in ("ua", "uí", "nic", "ní", "mac", "ó", "o"):
+                elif current_prefix in ("ua", "uí", "nic", "ní", "mac", "ó"):
                     current_requires_space = requires_space
                 
                 # For variants, preserve multi-word structure
@@ -256,12 +318,20 @@ def get_surname_variants(surname):
                 remaining_words = " ".join(parts[1:]) if len(parts) > 1 else ""
                 
                 # Single-letter prefixes like "o" and "ó" MUST have space to avoid ambiguity
-                if len(current_prefix) == 1 and current_prefix in ("o", "ó"):
+                if len(current_prefix) == 1 and current_prefix in ("ó", "o"):
                     # Always require space for single-letter Irish prefixes
                     variants.add(f"{current_prefix} {rest_with_space}")
                 # Mac an and Nic an should ONLY have space variant, no no-space variant
                 elif current_prefix in ("mac an", "nic an"):
                     variants.add(f"{current_prefix} {rest_with_space}")
+                # O' prefix should ONLY generate spaced variants (O' and O with space)
+                elif current_prefix == "o'":
+                    # Generate O'Name variant (no space after apostrophe)
+                    variants.add(f"{current_prefix}{rest_with_space}")
+                    # Generate O' Name variant (with space after apostrophe)
+                    variants.add(f"{current_prefix} {rest_with_space}")
+                    # Also generate "o " (O with space) variant
+                    variants.add(f"o {rest_with_space}")
                 elif current_requires_space:
                     # Must have space: generate with and without space after prefix
                     # But preserve internal spaces in multi-word surnames
@@ -272,7 +342,7 @@ def get_surname_variants(surname):
                         variants.add(f"{current_prefix}{first_word}")
                 else:
                     # Can vary: generate both with and without space after prefix
-                    if current_prefix in ("mc", "o'", "d'"):
+                    if current_prefix in ("mc", "d'"):
                         # These prefixes typically don't have space in canonical form
                         if remaining_words:
                             variants.add(f"{current_prefix}{first_word} {remaining_words}")
@@ -328,7 +398,8 @@ def normalize_surname_for_output(surname):
 
 def get_organizations_from_pure_person(person, is_internal=True):
     """Extract organization UUIDs from Pure person record"""
-    orgs = []
+    internal_orgs = []
+    external_orgs = []
     
     if is_internal:
         # For internal persons: extract from various staff/student/visitor associations
@@ -342,33 +413,34 @@ def get_organizations_from_pure_person(person, is_internal=True):
         for field_name, org_field in association_types:
             for assoc in person.get(field_name, []):
                 org = assoc.get(org_field, {})
-                if org.get("uuid"):
-                    orgs.append(org["uuid"])
+                if org.get("uuid") and org.get("systemName") == "Organization":
+                    internal_orgs.append(org["uuid"])
         
-        # Also check externalPositions for internal persons (they can have external org affiliations)
+        # Check externalPositions for internal persons (they can have external org affiliations)
         for ext_pos in person.get("externalPositions", []):
             ext_org = ext_pos.get("externalOrganization", {})
-            if ext_org.get("uuid"):
-                orgs.append(ext_org["uuid"])
+            if ext_org.get("uuid") and ext_org.get("systemName") == "ExternalOrganization":
+                external_orgs.append(ext_org["uuid"])
     
     else:
         # For external persons: organizations are stored directly in externalOrganizations array
         for ext_org in person.get("externalOrganizations", []):
             if ext_org.get("uuid"):
-                orgs.append(ext_org["uuid"])
+                external_orgs.append(ext_org["uuid"])
         
         # Also check externalPositions and contributorAssociations if they exist
         for ext_pos in person.get("externalPositions", []):
             ext_org = ext_pos.get("externalOrganization", {})
             if ext_org.get("uuid"):
-                orgs.append(ext_org["uuid"])
+                external_orgs.append(ext_org["uuid"])
         
         for contrib in person.get("contributorAssociations", []):
             ext_org = contrib.get("externalOrganization", {})
             if ext_org.get("uuid"):
-                orgs.append(ext_org["uuid"])
+                external_orgs.append(ext_org["uuid"])
     
-    return list(set(orgs))  # Return unique UUIDs
+    return list(set(internal_orgs)), list(set(external_orgs))  # Return both lists, deduplicated
+
 
 def build_index_persons(person_list, is_internal=True):
     """
@@ -382,7 +454,8 @@ def build_index_persons(person_list, is_internal=True):
     """
     index = {}
     alt_names_by_uuid = {}  # maps uuid → list of (original_first, original_last)
-    orgs_by_uuid = {}      # maps uuid → list of organization UUIDs
+    internal_orgs_by_uuid = {}  # maps uuid → list of internal organization UUIDs
+    external_orgs_by_uuid = {}  # maps uuid → list of external organization UUIDs
     visibility_by_uuid = {}  # maps uuid → visibility key (for ALL internal persons)
 
     for person in person_list:
@@ -445,15 +518,17 @@ def build_index_persons(person_list, is_internal=True):
         if alt_names:
             alt_names_by_uuid[uuid] = list(set(alt_names))  # Deduplicate
 
-        # Store organization UUIDs for this person (deduplicated)
-        orgs = get_organizations_from_pure_person(person, is_internal=is_internal)
-        if orgs:
-            orgs_by_uuid[uuid] = list(set(orgs))  # Ensure uniqueness
+        # Store organization UUIDs for this person (separated by type)
+        int_orgs, ext_orgs = get_organizations_from_pure_person(person, is_internal=is_internal)
+        if int_orgs:
+            internal_orgs_by_uuid[uuid] = int_orgs
+        if ext_orgs:
+            external_orgs_by_uuid[uuid] = ext_orgs
 
-    return index, alt_names_by_uuid, orgs_by_uuid, visibility_by_uuid
+    return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid
 
 
-def enrich_authors(authors, internal_index, external_index, internal_alt_names=None, external_alt_names=None, internal_orgs=None, external_orgs=None, internal_visibility_by_uuid=None, output_option="all"):
+def enrich_authors(authors, internal_index, external_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, output_option="all"):
     """
     Enrich authors with Pure match data.
     output_option: "all", "matched_internal", "matched_external", "unmatched", "matched_all_duplicates", "matched_internal_duplicates", "matched_external_duplicates", "matched_internal_external_duplicates"
@@ -462,8 +537,16 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
     filtered_out_count = 0
 
     for author in tqdm(authors, desc="Matching Authors", unit="author"):
-        first = capitalize_after_hyphen(author.get("firstName", "").strip())
-        last = capitalize_after_hyphen(author.get("lastName", "").strip())
+        first = author.get("firstName", "").strip()
+        last = author.get("lastName", "").strip()
+        
+        # Capitalize first names normally (not using Irish surname rules)
+        if first:
+            first = capitalize_after_hyphen(first.capitalize())
+        
+        # Capitalize last names using Irish surname rules
+        if last:
+            last = capitalize_after_hyphen(last)
 
         # ⚠️ Exclude if either firstName or lastName is empty
         if not first or not last:
@@ -495,7 +578,7 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         internal_matches = list(set(internal_matches))
         external_matches = list(set(external_matches))
 
-        # Extract original alternative names used in matches
+# Extract original alternative names used in matches
         alternative_firstnames = set()
         alternative_lastnames = set()
 
@@ -503,53 +586,80 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         for uuid in internal_matches:
             if internal_alt_names and uuid in internal_alt_names:
                 for orig_first, orig_last in internal_alt_names[uuid]:
-                    alternative_firstnames.add(capitalize_after_hyphen(orig_first))
-                    alternative_lastnames.add(capitalize_after_hyphen(orig_last))
+                    alt_first = capitalize_after_hyphen(orig_first.capitalize())
+                    alt_last = capitalize_after_hyphen(capitalize_irish_surname(orig_last))
+                    # Only add if different from primary name
+                    if alt_first != first:
+                        alternative_firstnames.add(alt_first)
+                    if alt_last != last:
+                        alternative_lastnames.add(alt_last)
 
         # Check external matches
         for uuid in external_matches:
             if external_alt_names and uuid in external_alt_names:
                 for orig_first, orig_last in external_alt_names[uuid]:
-                    alternative_firstnames.add(orig_first)
-                    alternative_lastnames.add(orig_last)
+                    alt_first = capitalize_after_hyphen(orig_first.capitalize())
+                    alt_last = capitalize_after_hyphen(capitalize_irish_surname(orig_last))
+                    # Only add if different from primary name
+                    if alt_first != first:
+                        alternative_firstnames.add(alt_first)
+                    if alt_last != last:
+                        alternative_lastnames.add(alt_last)
+        
+        # ✅ Add first name variants (initials, dots, spaces)
+        first_name_variants = get_firstname_variants(first)
+        for variant in first_name_variants:
+            if variant != first:  # Don't add the original
+                alternative_firstnames.add(variant)
+        
+        # ✅ Normalize the primary lastName to canonical form
+        normalized_last_name = capitalize_after_hyphen(normalize_surname_for_output(last))
         
         # ✅ Add all surname variants to alternative last names with proper capitalization
         all_surname_variants = get_surname_variants(last)['variants']
-        # Get the capitalized form of the original last name to compare against variants
-        capitalized_last = capitalize_irish_surname(last)
         for variant in all_surname_variants:
             # Capitalize the variant properly (handles Irish prefixes)
             capitalized_variant = capitalize_after_hyphen(capitalize_irish_surname(variant))
-            # Only add if it's different from the capitalized original
-            if capitalized_variant != capitalized_last:
+            # Only add if it's different from both the original and the normalized form
+            if capitalized_variant != last and capitalized_variant != normalized_last_name:
                 # Check if this surname has a Mc, Mac, or Nic prefix AND is NOT "Mac an" or "Nic an"
                 normalized_variant_lower = normalize(variant).lower()
                 is_mac_an_or_nic_an = normalized_variant_lower.startswith('mac an ') or normalized_variant_lower.startswith('nic an ')
                 if not is_mac_an_or_nic_an:
                     alternative_lastnames.add(capitalized_variant)
         
+        # ✅ Add no-space variant for "Mac" and "Mc" surnames only (e.g., "Mac Aodha" -> "MacAodha", "Mc Crae" -> "McCrae")
+        if ' ' in last and any(last.lower().startswith(prefix) for prefix in ["mac ", "mc "]):
+            no_space_variant = last.replace(' ', '')
+            no_space_capitalized = capitalize_after_hyphen(capitalize_irish_surname(no_space_variant))
+            if no_space_capitalized != last and no_space_capitalized != normalized_last_name:
+                alternative_lastnames.add(no_space_capitalized)
+        
         # ✅ WORKAROUND: If last name starts with Mc, add spacing variant (capitalized properly)
         # E.g., "McCrae" -> add "Mc Crae" (not "Mc crae")
-        if len(last) >= 3 and last[0:2].lower() == 'mc':
+        if len(last) >= 3 and last[0:2].lower() == 'mc' and ' ' not in last:
             # Extract the part after "Mc"
             rest = last[2:]
             # Capitalize the rest properly (handles compound parts like "Crae")
             rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
             spacing_variant = f"Mc {rest_cap}"
-            normalized_last_name_temp = capitalize_after_hyphen(normalize_surname_for_output(last))
-            if spacing_variant != capitalized_last and spacing_variant != normalized_last_name_temp:
+            if spacing_variant != last and spacing_variant != normalized_last_name:
                 alternative_lastnames.add(spacing_variant)
 
-        if len(last) >= 4 and last[0:3].lower() == 'mac' and not last.lower().endswith(("i", "j")):
+        if len(last) >= 4 and last[0:3].lower() == 'mac' and not last.lower().endswith(("i", "j")) and ' ' not in last:
             # Extract the part after "Mac"
             rest = last[3:]
             # Capitalize the rest properly (handles compound parts like "Crae")
             rest_cap = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
             spacing_variant = f"Mac {rest_cap}"
-            normalized_last_name_temp = capitalize_after_hyphen(normalize_surname_for_output(last))
-            if spacing_variant != capitalized_last and spacing_variant != normalized_last_name_temp:
+            if spacing_variant != last and spacing_variant != normalized_last_name:
                 alternative_lastnames.add(spacing_variant)
         
+        # Remove any alternative that's identical to the canonical lastName or original
+        alternative_lastnames.discard(normalized_last_name)
+        alternative_lastnames.discard(last)
+        alternative_firstnames.discard(first)
+
         # ✅ Normalize the primary lastName to canonical form
         normalized_last_name = capitalize_after_hyphen(normalize_surname_for_output(last))
         
@@ -562,8 +672,13 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         internal_uuids_with_visibility = []  # ✅ List of {uuid, visibility}
 
         for uuid in internal_matches:
-            if internal_orgs and uuid in internal_orgs:
-                internal_organizations.extend(internal_orgs[uuid])
+            # Add internal organizations
+            if internal_internal_orgs and uuid in internal_internal_orgs:
+                internal_organizations.extend(internal_internal_orgs[uuid])
+            # Add external organizations
+            if internal_external_orgs and uuid in internal_external_orgs:
+                external_organizations.extend(internal_external_orgs[uuid])
+            # Add visibility
             if internal_visibility_by_uuid and uuid in internal_visibility_by_uuid:
                 visibility = internal_visibility_by_uuid[uuid]
                 internal_uuids_with_visibility.append({
@@ -571,18 +686,17 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
                     "visibility": visibility
                 })
 
-        # Extract organizations for all matched persons
-        def extract_orgs(match_list, org_dict):
-            """Helper to extract and deduplicate organizations from matches"""
-            return list(set(
-                org_uuid 
-                for uuid in match_list 
-                if org_dict and uuid in org_dict 
-                for org_uuid in org_dict[uuid]
-            ))
-        
-        internal_organizations = extract_orgs(internal_matches, internal_orgs)
-        external_organizations = extract_orgs(external_matches, external_orgs)
+        for uuid in external_matches:
+            # Add internal organizations (rare but possible)
+            if external_internal_orgs and uuid in external_internal_orgs:
+                internal_organizations.extend(external_internal_orgs[uuid])
+            # Add external organizations
+            if external_external_orgs and uuid in external_external_orgs:
+                external_organizations.extend(external_external_orgs[uuid])
+
+        # Deduplicate organizations
+        internal_organizations = list(set(internal_organizations))
+        external_organizations = list(set(external_organizations))
 
         # ✅ Preserve papers as list of {handle, doi} — deduplicate by handle
         papers = author.get("papers", [])
@@ -732,9 +846,10 @@ def main():
     internal_persons = load_json(Pure_Internal_JSON)
     external_persons = load_json(Pure_External_JSON)
 
-    # Build lookup tables + collect alternative names, organizations, and visibility (for internal only)
-    internal_index, internal_alt_names, internal_orgs, internal_visibility_by_uuid = build_index_persons(internal_persons, is_internal=True)
-    external_index, external_alt_names, external_orgs, external_visibility_by_uuid = build_index_persons(external_persons, is_internal=False)
+    # Build lookup tables + collect alternative names, organizations (separated by type), and visibility (for internal only)
+    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid = build_index_persons(internal_persons, is_internal=True)
+    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid = build_index_persons(external_persons, is_internal=False)
+
 
     # Define output options
     output_options = [
@@ -766,11 +881,15 @@ def main():
             external_index,
             internal_alt_names,
             external_alt_names,
-            internal_orgs,
-            external_orgs,
+            internal_internal_orgs,
+            internal_external_orgs,
+            external_internal_orgs,
+            external_external_orgs,
             internal_visibility_by_uuid,  # ✅ Pass visibility map
             output_option=option
         )
+
+
 
         # Build filename: {prefix}_authors_{option}.json
         filename = f"{args.prefix}_{option}_{TODAY}.json"
