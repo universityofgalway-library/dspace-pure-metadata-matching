@@ -18,9 +18,10 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
-DSPACE_CSV = "./matching_test/dspace_test_sample_2025-12-18.csv"
+DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-21.csv"
 PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-13.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_authors_all_2026-01-13.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/updated_merged_authors_20260119.json"
+ORGANIZATION_MAPPING_JSON = "./matching_test/organizations_mapping_2026-01-21.json"
 OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -282,12 +283,32 @@ def add_type_specific_fields(record, dspace_row):
         record["peerReview"] = get_default_peer_review_status(type_disc)
         
     if type_disc == "ContributionToJournal" or type_disc == "ContributionToPeriodical":
-        record["journalAssociation"] = {
+        # Try to get journal UUID from DSpace row
+        journal_uuid = dspace_row.get("journal_uuid", "").strip()
+        
+        if journal_uuid:
+            record["journalAssociation"] = {
                 "journal": {
                     "systemName": "Journal",
-                    "uuid": "f0da45fc-fec1-42f5-80a9-c1446ccce300"  # Placeholder UUID for TEST JOURNAL (UAT)
-                    }
-        }
+                    "uuid": journal_uuid
+                }
+            }
+        else:
+            # record["journalAssociation"] = {
+            #         "journal": {
+            #             "systemName": "Journal",
+            #             "uuid": "f0da45fc-fec1-42f5-80a9-c1446ccce300"  # Placeholder UUID for TEST JOURNAL (UAT)
+            #             }
+            #     }   
+                 
+            # No journal UUID found - change to OtherContribution
+            print(f"    ⚠️ No journal UUID found for {type_disc} - changing to OtherContribution")
+            record["typeDiscriminator"] = "OtherContribution"
+            record["type"]["uri"] = "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other"
+            # Remove peerReview if it was added
+            if "peerReview" in record:
+                del record["peerReview"]
+            return record
         
     if type_disc == "ContributionToBookAnthology":
         record["hostPublicationTitle"] = {
@@ -622,8 +643,93 @@ def collect_validated_organizations(contributors):
     
     return list(internal_org_uuids), list(external_org_uuids)
 
+def resolve_funder_duplicate(matches, api_key, base_url):
+    """
+    Resolve duplicate organization matches for funders.
+    Prefer: 1) internal > external, 2) FREE > CAMPUS > others, 
+    3) most complete record, 4) first match
+    """
+    if not matches:
+        return None
+    
+    def score(org):
+        internal = org.get("internal", False)
+        external = org.get("external", False)
+        
+        # 1. Prefer internal
+        type_score = 2 if internal else (1 if external else 0)
+        
+        # 2. Prefer visibility
+        vis = org.get("visibility", "")
+        if vis == "FREE":
+            vis_score = 3
+        elif vis == "CAMPUS":
+            vis_score = 2
+        elif vis in ["BACKEND", "CONFIDENTIAL"]:
+            vis_score = 1
+        else:
+            vis_score = 0
+        
+        return (type_score, vis_score)
+    
+    sorted_matches = sorted(matches, key=score, reverse=True)
+    return sorted_matches[0]
 
-def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry, before_update_records):
+
+def parse_funders(funder_str):
+    """Parse semicolon-separated funder names from DSpace"""
+    if not funder_str:
+        return []
+    return [f.strip() for f in funder_str.split(";") if f.strip()]
+
+
+def find_funder_match(funder_name, organization_mapping):
+    """Find matching organization by name (case-insensitive exact match)"""
+    normalized_name = normalize(funder_name)
+    matches = []
+    
+    for org in organization_mapping:
+        org_names = org.get("name", [])
+        for org_name in org_names:
+            if normalize(org_name) == normalized_name:
+                matches.append(org)
+
+    return matches
+
+def build_funding_organizations(funder_uuids_with_type):
+    """
+    Build fundingDetails array from list of (uuid, is_internal) tuples.
+    Returns list of funding detail objects (one per funder).
+    """
+    funding_details = []
+    
+    for uuid, is_internal in funder_uuids_with_type:
+        if is_internal:
+            funding_details.append({
+                "fundingOrganizations": [
+                    {
+                        "organizationRef": {
+                            "systemName": "Organization",
+                            "uuid": uuid
+                        }
+                    }
+                ]
+            })
+        else:
+            funding_details.append({
+                "fundingOrganizations": [
+                    {
+                        "externalOrganizationRef": {
+                            "systemName": "ExternalOrganization",
+                            "uuid": uuid
+                        }
+                    }
+                ]
+            })
+    
+    return funding_details
+
+def update_record_from_dspace(pure_record, dspace_row, person_mapping, organization_mapping, log_entry, before_update_records):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -868,16 +974,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
                 updated_record["keywordGroups"] = []
     
 
-    # --- 2. Funder (dc.contributor.funder) > fill if blank ---
-    # TODO: Implement funder lookup and mapping
-
-
-    # --- 3. Publication Date (dc.date.issued) > fill if blank, upgrade only ---
+    # --- 2. Publication Date (dc.date.issued) > fill if blank, upgrade only ---
     issued = dspace_row.get("dc.date.issued", "").strip()
     if issued:
         # Parse year/month/day
         parts = issued.split("-")
-        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 2025
+        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 1970
         month = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
         day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
 
@@ -897,16 +999,73 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
             }]
         else:
             # Check if year differs
-            existing_year = pub_status[0].get("publicationDate", {}).get("year", 0)
-            if existing_year != 0 and existing_year != year:
+            existing_year = pub_status[0].get("publicationDate", {}).get("year", 1970)
+            if existing_year != 1970 and existing_year != year:
                 errors.append(f"Publication year conflict: Pure={existing_year}, DSpace={year}")
 
-    # --- 4. Sponsorship (dc.description.sponsorship) > fill if blank ---
+    # --- 3a. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
     if sponsorship and not has_text_in_any_language(pure_record, "fundingText"):
         updated_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
 
-    # --- 5. Electronic Versions (DOIs + embargo + rights + access) ---
+    # --- 3b. Funder (dc.contributor.funder) > fill if blank, add new funders, don't overwrite ---
+    dspace_funders = parse_funders(dspace_row.get("dc.contributor.funder", ""))
+    
+    if dspace_funders and len(dspace_funders) > 0:
+        print(f"  ➤ Processing {len(dspace_funders)} funders: {dspace_funders}")
+        
+        # Get existing funding details
+        existing_funding_details = pure_record.get("fundingDetails", [])
+        
+        # Collect existing funder UUIDs to avoid duplicates
+        existing_funder_uuids = set()
+        for funding_detail in existing_funding_details:
+            for funding_org in funding_detail.get("fundingOrganizations", []):
+                if "organizationRef" in funding_org:
+                    existing_funder_uuids.add(funding_org["organizationRef"]["uuid"])
+                elif "externalOrganizationRef" in funding_org:
+                    existing_funder_uuids.add(funding_org["externalOrganizationRef"]["uuid"])
+        
+        # Process new funders
+        new_funder_uuids_with_type = []  # List of (uuid, is_internal) tuples
+        
+        for funder_name in dspace_funders:
+            print(f"    ➤ Looking up funder: '{funder_name}'")
+            matches = find_funder_match(funder_name, organization_mapping)
+            
+            if matches:
+                print(f"      ✅ Found {len(matches)} matches")
+                matched_org = resolve_funder_duplicate(matches, API_KEY, BASE_URL)
+                
+                if matched_org:
+                    uuid = matched_org.get("uuid")
+                    is_internal = matched_org.get("internal", False)
+                    
+                    # Check if already exists
+                    if uuid not in existing_funder_uuids:
+                        new_funder_uuids_with_type.append((uuid, is_internal))
+                        existing_funder_uuids.add(uuid)  # Prevent duplicates within new funders
+                        print(f"      ✅ Added funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
+                    else:
+                        print(f"      ℹ️ Funder already exists: {funder_name}")
+            else:
+                print(f"      ⚠️ No match found for funder: {funder_name}")
+        
+        # Add new funders to funding details
+        if new_funder_uuids_with_type:
+            new_funding_details = build_funding_organizations(new_funder_uuids_with_type)
+            
+            if existing_funding_details:
+                # Append new funding details to existing list
+                existing_funding_details.extend(new_funding_details)
+                updated_record["fundingDetails"] = existing_funding_details
+            else:
+                # Create new funding details list
+                updated_record["fundingDetails"] = new_funding_details
+            
+            print(f"    ✅ Added {len(new_funder_uuids_with_type)} new funders to fundingDetails")
+
+    # --- 4. Electronic Versions (DOIs + embargo + rights + access) ---
     existing_evs = pure_record.get("electronicVersions", [])
 
     # Separate existing EVs into repository and publisher DOIs
@@ -1093,16 +1252,10 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
         else:
             updated_record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
-    # --- 8. Publisher (dc.publisher) > fill if blank ---
-    # publisher = dspace_row.get("dc.publisher", "").strip()
-    #TODO: Implement publisher lookup and mapping
-
-
-    # --- 9. Title (dc.title) > fill if blank ---
+    # --- 8. Title (dc.title) > fill if blank ---
     title = dspace_row.get("dc.title", "").strip()
     if title and not pure_record.get("title", {}).get("value", "").strip():
         updated_record["title"] = {"value": escape_special_chars(title)}
-
 
     # Write log entry
     log_entry["success"] = success and not errors
@@ -1114,13 +1267,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, log_entry
     return updated_record, success
 
 
-def create_new_record_from_dspace(dspace_row, person_mapping):
+def create_new_record_from_dspace(dspace_row, person_mapping, organization_mapping):
     """Create new Pure record from DSpace row"""
     # Escape special characters in title first
     escaped_title = escape_special_chars(dspace_row.get("dc.title", "").strip())
     
     record = {
-        "version": None,  # Will be set by API
         "title": {"value": escaped_title},
         "type": {
             "uri": ""
@@ -1129,7 +1281,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
             "uri": "/dk/atira/pure/researchoutput/category/research"
         },
         "language": {
-            "uri": "/dk/atira/pure/core/languages/en_GB"
+            "uri": "/dk/atira/pure/core/languages/en_IE"
         },
         "electronicVersions": [],
         "links": [],
@@ -1177,7 +1329,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     issued = dspace_row.get("dc.date.issued", "").strip()
     if issued:
         parts = issued.split("-")
-        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
+        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 1970
         month = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
         day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
         record["publicationStatuses"] = [{
@@ -1212,6 +1364,41 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
     title = dspace_row.get("dc.title", "").strip()
     if title:
         record["title"] = {"value": escape_special_chars(title)}
+
+    # Set sponsorship
+    sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
+    if sponsorship:
+        record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
+    
+    # Set funders
+    dspace_funders = parse_funders(dspace_row.get("dc.contributor.funder", ""))
+    
+    if dspace_funders and len(dspace_funders) > 0:
+        print(f"  ➤ Processing {len(dspace_funders)} funders: {dspace_funders}")
+        
+        funder_uuids_with_type = []  # List of (uuid, is_internal) tuples
+        
+        for funder_name in dspace_funders:
+            print(f"    ➤ Looking up funder: '{funder_name}'")
+            matches = find_funder_match(funder_name, organization_mapping)
+            
+            if matches:
+                print(f"      ✅ Found {len(matches)} matches")
+                matched_org = resolve_funder_duplicate(matches, API_KEY, BASE_URL)
+                
+                if matched_org:
+                    uuid = matched_org.get("uuid")
+                    is_internal = matched_org.get("internal", False)
+                    funder_uuids_with_type.append((uuid, is_internal))
+                    print(f"      ✅ Added funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
+            else:
+                print(f"      ⚠️ No match found for funder: {funder_name}")
+        
+        # Add funders to record
+        if funder_uuids_with_type:
+            funding_details = build_funding_organizations(funder_uuids_with_type)
+            record["fundingDetails"] = funding_details
+            print(f"    ✅ Added {len(funder_uuids_with_type)} funders to fundingDetails")
 
     # Set contributors
     dspace_authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
@@ -1318,7 +1505,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping):
 
     # Check if we have any contributors - if not, skip this record
     if not mapped_contributors:
-        print(f"❌ No matched contributors found for record {dspace_row.get("dc.title", "")} - skipping")
+        print(f"❌ No matched contributors found for record {dspace_row.get('dc.title', '')} - skipping")
         return None  # Return None to indicate record should be skipped
     
     # Always ensure author info is present
@@ -1528,6 +1715,11 @@ def main():
         person_mapping = json.load(f)
     print(f"✅ Loaded {len(person_mapping)} person records from {PERSON_MAPPING_JSON}")
 
+    print("Loading Organization Mapping...")
+    with open(ORGANIZATION_MAPPING_JSON, 'r', encoding='utf-8') as f:
+        organization_mapping = json.load(f)
+    print(f"✅ Loaded {len(organization_mapping)} organization records from {ORGANIZATION_MAPPING_JSON}")
+
     # Prepare logs
     log_entries = []
     error_log = []
@@ -1669,7 +1861,7 @@ def main():
             log_entry["matchType"] = match_type
 
             try:
-                updated_record, success = update_record_from_dspace(record, row, person_mapping, log_entry, before_update_records)
+                updated_record, success = update_record_from_dspace(record, row, person_mapping, organization_mapping, log_entry, before_update_records)
                 log_entry["success"] = success
                 if success:
                     # Save to matched folder
@@ -1692,7 +1884,7 @@ def main():
         else:
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
-                new_record = create_new_record_from_dspace(row, person_mapping)
+                new_record = create_new_record_from_dspace(row, person_mapping, organization_mapping)
                 
                 # Skip record if no contributors were matched
                 if new_record is None:
