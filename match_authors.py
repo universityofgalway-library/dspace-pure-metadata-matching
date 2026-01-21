@@ -542,7 +542,8 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         
         # Capitalize first names normally (not using Irish surname rules)
         if first:
-            first = capitalize_after_hyphen(first.capitalize())
+            parts = first.split()
+            first = ' '.join([capitalize_after_hyphen(p.capitalize()) for p in parts])
         
         # Capitalize last names using Irish surname rules
         if last:
