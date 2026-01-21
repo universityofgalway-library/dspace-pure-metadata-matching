@@ -92,6 +92,23 @@ def publication_is_valid(row, author_lookup):
 
     return True
 
+def has_non_empty_fields(row, required_fields):
+    """
+    Check if all required fields in the row are non-empty.
+    A field is considered empty if it's None, NaN, empty string, or whitespace only.
+    """
+    if not required_fields:
+        return True
+    
+    for field in required_fields:
+        if field not in row.index:
+            return False
+        value = row[field]
+        # Check if value is null, NaN, or empty/whitespace string
+        if pd.isna(value) or (isinstance(value, str) and not value.strip()):
+            return False
+    return True
+
 def add_date_suffix(filepath, date_str):
     """
     Add date suffix before file extension.
@@ -108,28 +125,52 @@ def add_date_suffix(filepath, date_str):
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        description='Sample CSV records by document type with author validation'
+        description='Sample CSV records by document type with optional author validation'
     )
     parser.add_argument(
         '--input-file',
-        default='dspace_test_metadata_2025-12-02.csv',
-        help='Path to input CSV file (default: dspace_test_metadata_2025-12-02.csv)'
+        default='./matching_test/enriched_dspace_test_all_2026-01-21.csv',
+        help='Path to input CSV file (default: ./matching_test/enriched_dspace_test_all_2026-01-21.csv)'
     )
     parser.add_argument(
         '--output-file',
-        default='./matching_test/dspace_test_sample.csv',
+        default=f'./matching_test/dspace_test_sample_{TODAY}.csv',
         help='Path to output CSV file (default: ./matching_test/dspace_test_sample.csv)'
     )
     parser.add_argument(
         '--authors-json',
-        default='./matching_test/matched_authors/test_authors_all_2025-12-02.json',
-        help='Path to authors JSON file (default: ./matching_test/matched_authors/test_authors_all_2025-12-02.json)'
+        default='./matching_test/matched_authors/updated_merged_authors_20260119.json',
+        help='Path to authors JSON file (default: ./matching_test/matched_authors/updated_merged_authors_20260119.json)'
     )
     parser.add_argument(
         '--random-state',
         default=42,
         type=int,
         help='Random state for sampling the dataset (default: 42)'
+    )
+    parser.add_argument(
+        '--filter-authors',
+        action='store_true',
+        default=True,
+        help='Filter to only include records with existing authors (default: True)'
+    )
+    parser.add_argument(
+        '--no-filter-authors',
+        action='store_false',
+        dest='filter_authors',
+        help='Do not filter by existing authors, create sample regardless of authors'
+    )
+    parser.add_argument(
+        '--required-fields',
+        nargs='*',
+        default=[],
+        help='List of field names that must be non-empty (e.g., --required-fields dc.title dc.date.issued)'
+    )
+    parser.add_argument(
+        '--sample-size',
+        type=int,
+        default=5,
+        help='Number of records to sample per document type (default: 5)'
     )
     
     args = parser.parse_args()
@@ -139,28 +180,31 @@ def main():
     
     print(f"Input file: {args.input_file}")
     print(f"Output file: {output_file}")
-    print(f"Authors JSON: {args.authors_json}\n")
+    print(f"Authors JSON: {args.authors_json}")
+    print(f"Filter existing authors: {args.filter_authors}")
+    print(f"Required non-empty fields: {args.required_fields if args.required_fields else 'None'}")
+    print(f"Sample size per type: {args.sample_size}\n")
     
-    # Load authors from JSON file
-    with open(args.authors_json, encoding="utf-8") as f:
-        json_authors = json.load(f)
-
-    # Build lookup: (first, last) -> is_valid_author (has internal OR external UUIDs)
+    # Load authors from JSON file only if filtering is enabled
     author_lookup = {}
+    if args.filter_authors:
+        with open(args.authors_json, encoding="utf-8") as f:
+            json_authors = json.load(f)
 
-    for author in json_authors:
-        # Author is valid only if they have at least one internal UUID OR at least one external UUID
-        has_internal = bool(author.get("internal"))
-        has_external = bool(author.get("external"))
-        is_valid = has_internal or has_external
-        
-        for name_pair in json_author_name_pairs(author):
-            # Only add to lookup if this is a valid author
-            if is_valid:
-                author_lookup[name_pair] = True
-            # If already marked as valid, keep it valid (don't overwrite True with False)
-            elif name_pair not in author_lookup:
-                author_lookup[name_pair] = False
+        # Build lookup: (first, last) -> is_valid_author (has internal OR external UUIDs)
+        for author in json_authors:
+            # Author is valid only if they have at least one internal UUID OR at least one external UUID
+            has_internal = bool(author.get("internal"))
+            has_external = bool(author.get("external"))
+            is_valid = has_internal or has_external
+            
+            for name_pair in json_author_name_pairs(author):
+                # Only add to lookup if this is a valid author
+                if is_valid:
+                    author_lookup[name_pair] = True
+                # If already marked as valid, keep it valid (don't overwrite True with False)
+                elif name_pair not in author_lookup:
+                    author_lookup[name_pair] = False
 
     # Read the CSV file
     df = pd.read_csv(args.input_file, encoding="utf-8", sep=',')
@@ -172,24 +216,65 @@ def main():
     if 'dc.contributor.author' not in df.columns:
         raise ValueError("Column 'dc.contributor.author' not found in the CSV file")
 
-    # Filter publications based on author validity
-    df_filtered = df[df.apply(lambda row: publication_is_valid(row, author_lookup), axis=1)]
+    # Validate that required fields exist in the dataframe
+    if args.required_fields:
+        missing_fields = [f for f in args.required_fields if f not in df.columns]
+        if missing_fields:
+            raise ValueError(f"Required fields not found in CSV: {missing_fields}")
+
+    # Filter publications based on author validity (only if filtering is enabled)
+    if args.filter_authors:
+        df_filtered = df[df.apply(lambda row: publication_is_valid(row, author_lookup), axis=1)]
+        print(f"Filtered dataset: {len(df_filtered)} records with existing authors")
+    else:
+        df_filtered = df
+        print(f"Using full dataset: {len(df_filtered)} records (no author filtering)")
 
     # Create an empty list to store sampled dataframes
     sampled_dfs = []
 
-    # Sample up to 5 records for each document type
+    # Sample up to the specified number of records for each document type
     for doc_type in doc_types:
         # Filter records of this type
         type_df = df_filtered[df_filtered['dc.type'] == doc_type]
         
-        # Sample up to 5 records (or all if less than 5)
-        sample_size = min(5, len(type_df))
+        if len(type_df) == 0:
+            continue
         
-        if sample_size > 0:
+        # If required fields are specified, prioritize records with those fields
+        if args.required_fields:
+            # Get records with all required fields non-empty
+            priority_df = type_df[type_df.apply(lambda row: has_non_empty_fields(row, args.required_fields), axis=1)]
+            priority_count = len(priority_df)
+            
+            if priority_count >= args.sample_size:
+                # Enough priority records, sample from them
+                sampled = priority_df.sample(n=args.sample_size, random_state=args.random_state)
+                print(f"{doc_type}: sampled {args.sample_size} records (all with required fields)")
+            else:
+                # Not enough priority records, take all priority records and fill with random
+                remaining_needed = args.sample_size - priority_count
+                
+                # Get records that don't have all required fields
+                non_priority_df = type_df[~type_df.apply(lambda row: has_non_empty_fields(row, args.required_fields), axis=1)]
+                
+                # Sample from non-priority records
+                additional_count = min(remaining_needed, len(non_priority_df))
+                
+                if additional_count > 0:
+                    additional_sampled = non_priority_df.sample(n=additional_count, random_state=args.random_state)
+                    sampled = pd.concat([priority_df, additional_sampled], ignore_index=True)
+                    print(f"{doc_type}: sampled {len(sampled)} records ({priority_count} with required fields, {additional_count} without)")
+                else:
+                    sampled = priority_df
+                    print(f"{doc_type}: sampled {len(sampled)} records ({priority_count} with required fields, none available without)")
+        else:
+            # No required fields, sample normally
+            sample_size = min(args.sample_size, len(type_df))
             sampled = type_df.sample(n=sample_size, random_state=args.random_state)
-            sampled_dfs.append(sampled)
             print(f"{doc_type}: sampled {sample_size} records")
+        
+        sampled_dfs.append(sampled)
 
     # Combine all sampled dataframes
     if sampled_dfs:
