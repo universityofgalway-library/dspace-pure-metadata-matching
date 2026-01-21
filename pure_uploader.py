@@ -55,10 +55,19 @@ def extract_name_from_response(response_data, data_type):
         last_name = name_obj.get("lastName", "")
         return f"{first_name} {last_name}".strip()
     
-    # For research-outputs, journals, events: use "title"
-    if data_type in ["research-outputs", "journals", "events"]:
+    # For research-outputs, events: use "title"
+    if data_type in ["research-outputs", "events"]:
         title = response_data.get("title")
         return extract_localized_value(title, "value")
+    
+    # For journals: use "title"
+    if data_type in ["journals"]:
+        titles = response_data.get("titles", [])
+        if len(titles) > 0:
+            title = titles[0].get("title", "") 
+        else: 
+            title = ""
+        return title
     
     # For organizations, external-organizations, publishers: use "name"
     if data_type in ["organizations", "external-organizations", "publishers"]:
@@ -97,8 +106,6 @@ def log_record(mode, data_type, response_data, log_dir, is_test):
     modified_date = response_data.get("modifiedDate", "")
     created_date = response_data.get("createdDate", "")
     name = extract_name_from_response(response_data, data_type)
-    portal_url = response_data.get("portalUrl", "")
-    handle = extract_handle_from_links(response_data)
     created_by = response_data.get("createdBy", "")
     modified_by = response_data.get("modifiedBy", "")
 
@@ -111,15 +118,20 @@ def log_record(mode, data_type, response_data, log_dir, is_test):
         "modifiedDate": modified_date,
         "createdBy": created_by,
         "modifiedBy": modified_by,
-        "portalUrl": portal_url,
-        "handle": handle,
         "success": True  
     }
     
-    # Add portalUrlPROD only in test mode for UPDATE operations
-    # (created records don't exist in production yet)
-    if is_test and mode == "update":
-        record_entry["portalUrlPROD"] = f"https://research.universityofgalway.ie/en/publications/{uuid}"
+    # Add research-outputs specific fields
+    if data_type == "research-outputs":
+        portal_url = response_data.get("portalUrl", "")
+        handle = extract_handle_from_links(response_data)
+        record_entry["portalUrl"] = portal_url
+        record_entry["handle"] = handle
+        
+        # Add portalUrlPROD only in test mode for UPDATE operations
+        # (created records don't exist in production yet)
+        if is_test and mode == "update":
+            record_entry["portalUrlPROD"] = f"https://research.universityofgalway.ie/en/publications/{uuid}"
     
     # Load existing log or create new list
     existing_records = []
@@ -178,7 +190,10 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
     failed_records = []
     success_count = 0
     
-    for rec in records:
+    # Add progress bar for records within the file
+    record_pbar = tqdm(records, desc=f"  Processing records", unit="rec", leave=False)
+    
+    for rec in record_pbar:
         # Extract identifiers for error logging
         record_title = extract_name_from_response(rec, data_type)
         record_handle = extract_handle_from_links(rec)
@@ -221,7 +236,8 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
             error_log.append(f"Exception when sending {path} - {record_id}: {e}")
             results.append((path, False, str(e)))
             failed_records.append(rec)
-
+    
+    record_pbar.close()
     return success_count, results, failed_records
 
 
@@ -234,13 +250,14 @@ def process_folder(folder_path, data_type, session, error_log, log_dir, is_test)
             if fn.lower().endswith(".json"):
                 json_files.append(os.path.join(root, fn))
     
-    total_successes = 0  # FIX: Track total successful records
+    total_successes = 0
     total_failures = 0
     all_failed_records = []
     
-    for path in tqdm(json_files, desc=f"Uploading ({mode})", unit="file"):
+    # Progress bar for files
+    for path in tqdm(json_files, desc=f"Uploading files ({mode})", unit="file"):
         success_count, results, failed_records = process_file(path, mode, data_type, session, error_log, log_dir, is_test)
-        total_successes += success_count  # FIX: Add up successful records
+        total_successes += success_count
         total_failures += len(failed_records)
         all_failed_records.extend(failed_records)
     
@@ -248,7 +265,7 @@ def process_folder(folder_path, data_type, session, error_log, log_dir, is_test)
     if all_failed_records:
         failed_path = save_failed_records(all_failed_records, folder_path, data_type, mode)
         if failed_path:
-            print(f"\n {len(all_failed_records)} failed records saved to: {failed_path}")
+            print(f"\n⚠️ {len(all_failed_records)} failed records saved to: {failed_path}")
     
     return total_successes, total_failures, len(json_files)
 
@@ -259,7 +276,7 @@ def process_single_file(path, mode, data_type, session, error_log, log_dir, is_t
     if failed_records:
         failed_path = save_failed_records(failed_records, path, data_type, mode)
         if failed_path:
-            print(f"\n {len(failed_records)} failed records saved to: {failed_path}")
+            print(f"\n⚠️ {len(failed_records)} failed records saved to: {failed_path}")
     
     return success_count, results
 
@@ -366,11 +383,10 @@ if __name__ == "__main__":
         if not os.path.isdir(args.folder):
             print(f"Folder not found: {args.folder}")
             sys.exit(1)
-        # FIX: Get mode from folder name
         mode = "update" if os.path.basename(args.folder).lower().startswith("matched") else "create"
         successes, failures, total_files = process_folder(args.folder, args.data, session, error_log, LOG_DIR, args.test)
         print(f"\n✅ Done. {successes} records succeeded, {failures} failed across {total_files} files.")
-        success_count = successes  # FIX: This is now counting records, not files
+        success_count = successes
     elif args.file:
         if not os.path.isfile(args.file):
             print(f"File not found: {args.file}")
@@ -395,6 +411,8 @@ if __name__ == "__main__":
     else:
         print("✅ No errors logged")
     
-    # Create CSVs from logs
-    create_csv(LOG_DIR, mode)
+    # Create CSVs from logs only for research-outputs
+    if args.data == "research-outputs":
+        create_csv(LOG_DIR, mode)
+    
     print(f"\n✅ {success_count} records {mode}d and logged")

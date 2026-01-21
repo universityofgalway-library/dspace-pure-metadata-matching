@@ -3,9 +3,10 @@
 import os
 import re
 import csv
+import sys
 import json
 import argparse
-from datetime import date
+from datetime import date, datetime
 from collections import defaultdict
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -18,7 +19,8 @@ load_dotenv()
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
 
-TODAY = date.today().isoformat()
+TODAY_DATE = date.today().isoformat()
+TODAY = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
 # --- TYPE MAPPING ---
 dspace_pure_subtype_map = {
@@ -178,9 +180,26 @@ def parse_author_names(author_str):
     return authors
 
 
+class TeeOutput:
+    """Class to duplicate output to both stdout and a log file"""
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'w', encoding='utf-8')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract unmatched DSpace records with metadata"
+        description="Extract matched and unmatched DSpace records with metadata"
     )
     parser.add_argument(
         "--dspace-csv",
@@ -193,14 +212,14 @@ def main():
         help="Path to Pure JSON file with research outputs"
     )
     parser.add_argument(
-        "--output",
+        "--output-dir",
         required=True,
-        help="Output file path (without extension). JSON and/or CSV will be created based on --format"
+        help="Base output directory where 'matched' and 'unmatched' folders will be created"
     )
     parser.add_argument(
         "--type-filter",
         choices=list(set(get_pure_type_key(uri) for uri in dspace_pure_subtype_map.values())),
-        help="Filter by Pure subtype (e.g., 'contributiontojournal'). If not specified, all unmatched records are saved."
+        help="Filter by Pure subtype (e.g., 'contributiontojournal'). If specified, creates a single CSV for that type only."
     )
     parser.add_argument(
         "--title-threshold",
@@ -208,204 +227,208 @@ def main():
         default=0.9,
         help="Title similarity threshold (0-1), default 0.9"
     )
-    parser.add_argument(
-        "--format",
-        choices=["json", "csv", "both"],
-        default="both",
-        help="Output format: 'json', 'csv', or 'both' (default: both)"
-    )
     
     args = parser.parse_args()
-
-    # Load DSpace CSV
-    print(f"Loading DSpace CSV from {args.dspace_csv}...")
-    dspace_rows = []
-    dspace_fieldnames = []
-    with open(args.dspace_csv, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        dspace_fieldnames = reader.fieldnames  # Store original CSV headers
-        for row in reader:
-            dspace_rows.append(row)
-    print(f"✅ Loaded {len(dspace_rows)} DSpace records")
-
-    # Load Pure JSON
-    print(f"Loading Pure JSON from {args.pure_json}...")
-    with open(args.pure_json, 'r', encoding='utf-8') as f:
-        pure_items = json.load(f)
-    print(f"✅ Loaded {len(pure_items)} Pure records")
-
-    # Index Pure records by identifiers
-    print("Indexing Pure records...")
-    pure_by_doi = defaultdict(list)
-    pure_by_handle = defaultdict(list)
-    pure_by_repo_doi = defaultdict(list)
-    pure_by_title = defaultdict(list)
-
-    for item in pure_items:
-        # Index by DOI
-        for ev in item.get("electronicVersions", []):
-            doi = ev.get("doi", "")
-            if doi:
-                if "10.13025" in doi:
-                    pure_by_repo_doi[normalize_doi(doi)].append(item)
-                elif "hdl.handle.net" in doi:
-                    pure_by_handle[normalize_handle(doi)].append(item)
-                else:
-                    pure_by_doi[normalize_doi(doi)].append(item)
-
-        # Index by links (handles)
-        for link in item.get("links", []):
-            url = link.get("url", "")
-            if url and "hdl.handle.net" in url:
-                pure_by_handle[normalize_handle(url)].append(item)
-        
-        # Index by title
-        title = item.get("title", {}).get("value", "")
-        if title:
-            pure_by_title[normalize(title)].append(item)
-
-    # Find unmatched records
-    print(f"\nMatching DSpace records against Pure...")
-    unmatched_records = []
-    unmatched_dspace_rows = []  # Store original DSpace rows for CSV output
     
-    for row in tqdm(dspace_rows, desc="Processing", unit="record"):
-        # Get DSpace type
-        dspace_type = row.get("dc.type", "").strip().lower()
-        pure_type_uri = dspace_pure_subtype_map.get(dspace_type, "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other")
-        type_key = get_pure_type_key(pure_type_uri)
-        
-        # Apply type filter if specified
-        if args.type_filter and type_key != args.type_filter:
-            continue
+    # Set up logging
+    os.makedirs(args.output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(args.output_dir, f"record_sorting_log_{timestamp}.txt")
+    tee = TeeOutput(log_file)
+    sys.stdout = tee
+    
+    try:
+        # Load DSpace CSV
+        print(f"Loading DSpace CSV from {args.dspace_csv}...")
+        dspace_rows = []
+        dspace_fieldnames = []
+        with open(args.dspace_csv, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            dspace_fieldnames = reader.fieldnames
+            for row in reader:
+                dspace_rows.append(row)
+        print(f"✅ Loaded {len(dspace_rows)} DSpace records")
 
-        matched_records = []
+        # Load Pure JSON
+        print(f"Loading Pure JSON from {args.pure_json}...")
+        with open(args.pure_json, 'r', encoding='utf-8') as f:
+            pure_items = json.load(f)
+        print(f"✅ Loaded {len(pure_items)} Pure records")
 
-        # Try to match by Publisher DOI
-        publisher_doi = row.get("dc.identifier.doi", "").strip()
-        if publisher_doi:
-            normalized_doi = normalize_doi(publisher_doi)
-            if normalized_doi in pure_by_doi:
-                matched_records.extend(pure_by_doi[normalized_doi])
+        # Index Pure records by identifiers
+        print("Indexing Pure records...")
+        pure_by_doi = defaultdict(list)
+        pure_by_handle = defaultdict(list)
+        pure_by_repo_doi = defaultdict(list)
+        pure_by_title = defaultdict(list)
 
-        # Try to match by Repository DOI
-        if not matched_records:
-            repo_dois = extract_dois_from_uri(row.get("dc.identifier.uri", ""))
-            for repo_doi in repo_dois:
-                normalized_repo_doi = normalize_doi(repo_doi)
-                if normalized_repo_doi in pure_by_repo_doi:
-                    matched_records.extend(pure_by_repo_doi[normalized_repo_doi])
-                    break
+        for item in pure_items:
+            # Index by DOI
+            for ev in item.get("electronicVersions", []):
+                doi = ev.get("doi", "")
+                if doi:
+                    if "10.13025" in doi:
+                        pure_by_repo_doi[normalize_doi(doi)].append(item)
+                    elif "hdl.handle.net" in doi:
+                        pure_by_handle[normalize_handle(doi)].append(item)
+                    else:
+                        pure_by_doi[normalize_doi(doi)].append(item)
 
-        # Try to match by Handle
-        if not matched_records:
-            handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
-            for handle in handles:
-                normalized_handle = normalize_handle(handle)
-                if normalized_handle in pure_by_handle:
-                    matched_records.extend(pure_by_handle[normalized_handle])
-                    break
-
-        # Try to match by Title
-        if not matched_records:
-            title = row.get("dc.title", "").strip()
+            # Index by links (handles)
+            for link in item.get("links", []):
+                url = link.get("url", "")
+                if url and "hdl.handle.net" in url:
+                    pure_by_handle[normalize_handle(url)].append(item)
+            
+            # Index by title
+            title = item.get("title", {}).get("value", "")
             if title:
-                normalized_title = normalize(title)
-                # Try exact match
-                if normalized_title in pure_by_title:
-                    matched_records.extend(pure_by_title[normalized_title])
-                else:
-                    # Try similarity matching
-                    best_match = None
-                    best_similarity = 0
-                    for pure_item in pure_items:
-                        pure_title = pure_item.get("title", {}).get("value", "")
-                        if pure_title:
-                            pure_subtitle = pure_item.get("subTitle", {}).get("value", "")
-                            if pure_subtitle:
-                                pure_title += f": {pure_subtitle}"
-                            similarity, is_match = calculate_title_similarity(
-                                title, pure_title, args.title_threshold
-                            )
-                            if is_match and similarity > best_similarity:
-                                best_match = pure_item
-                                best_similarity = similarity
-                    
-                    if best_match:
-                        matched_records = [best_match]
+                pure_by_title[normalize(title)].append(item)
 
-        # If no match found, extract metadata
-        if not matched_records:
-            # Store original DSpace row for CSV export
-            unmatched_dspace_rows.append(row)
+        # Find matched and unmatched records
+        print(f"\nMatching DSpace records against Pure...")
+        
+        # Group records by type
+        matched_by_type = defaultdict(list)
+        unmatched_by_type = defaultdict(list)
+        
+        for row in tqdm(dspace_rows, desc="Processing", unit="record"):
+            # Get DSpace type
+            dspace_type = row.get("dc.type", "").strip().lower()
+            pure_type_uri = dspace_pure_subtype_map.get(dspace_type, "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other")
+            type_key = get_pure_type_key(pure_type_uri)
             
-            # Extract repository DOI
-            repo_dois = extract_dois_from_uri(row.get("dc.identifier.uri", ""))
-            repo_doi = None
-            for doi in repo_dois:
-                if doi.startswith("https://doi.org/10.13025"):
-                    repo_doi = doi
-                    break
-            
-            # Extract handle
-            handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
-            handle = handles[0] if handles else None
-            
-            # Extract authors
-            authors = parse_author_names(row.get("dc.contributor.author", ""))
-            
-            # Build record
-            unmatched_record = {
-                "dspaceType": dspace_type,
-                "pureSubtype": type_key,
-                "title": row.get("dc.title", "").strip(),
-                "publisherDOI": normalize_doi(publisher_doi) if publisher_doi else None,
-                "repositoryDOI": repo_doi,
-                "handle": handle,
-                "publisher": row.get("dc.publisher", "").strip() or None,
-                "authors": authors
-            }
-            
-            unmatched_records.append(unmatched_record)
+            # Apply type filter if specified
+            if args.type_filter and type_key != args.type_filter:
+                continue
 
-    # Save results
-    print(f"\n✅ Found {len(unmatched_records)} unmatched records")
-    
-    if unmatched_records:
-        output_dir = os.path.dirname(args.output)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Remove extension from output path if present
-        output_base = os.path.splitext(args.output)[0]
-        
-        # Save JSON
-        if args.format in ["json", "both"]:
-            json_path = f"{output_base}_{TODAY}.json"
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(unmatched_records, f, indent=2, ensure_ascii=False)
-            print(f"📄 JSON saved to: {json_path}")
-        
-        # Save CSV in original DSpace format
-        if args.format in ["csv", "both"]:
-            csv_path = f"{output_base}_{TODAY}.csv"
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=dspace_fieldnames)
-                writer.writeheader()
-                writer.writerows(unmatched_dspace_rows)
-            print(f"📄 CSV saved to: {csv_path}")
-        
-        # Print summary statistics
-        type_counts = defaultdict(int)
-        for record in unmatched_records:
-            type_counts[record["pureSubtype"]] += 1
-        
-        print("\n📊 Unmatched records by type:")
-        for type_key, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"   {type_key}: {count}")
-    else:
-        print("No unmatched records found.")
+            matched_records = []
 
+            # Try to match by Publisher DOI
+            publisher_doi = row.get("dc.identifier.doi", "").strip()
+            if publisher_doi:
+                normalized_doi = normalize_doi(publisher_doi)
+                if normalized_doi in pure_by_doi:
+                    matched_records.extend(pure_by_doi[normalized_doi])
+
+            # Try to match by Repository DOI
+            if not matched_records:
+                repo_dois = extract_dois_from_uri(row.get("dc.identifier.uri", ""))
+                for repo_doi in repo_dois:
+                    normalized_repo_doi = normalize_doi(repo_doi)
+                    if normalized_repo_doi in pure_by_repo_doi:
+                        matched_records.extend(pure_by_repo_doi[normalized_repo_doi])
+                        break
+
+            # Try to match by Handle
+            if not matched_records:
+                handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+                for handle in handles:
+                    normalized_handle = normalize_handle(handle)
+                    if normalized_handle in pure_by_handle:
+                        matched_records.extend(pure_by_handle[normalized_handle])
+                        break
+
+            # Try to match by Title
+            if not matched_records:
+                title = row.get("dc.title", "").strip()
+                if title:
+                    normalized_title = normalize(title)
+                    # Try exact match
+                    if normalized_title in pure_by_title:
+                        matched_records.extend(pure_by_title[normalized_title])
+                    else:
+                        # Try similarity matching
+                        best_match = None
+                        best_similarity = 0
+                        for pure_item in pure_items:
+                            pure_title = pure_item.get("title", {}).get("value", "")
+                            if pure_title:
+                                pure_subtitle = pure_item.get("subTitle", {}).get("value", "")
+                                if pure_subtitle:
+                                    pure_title += f": {pure_subtitle}"
+                                similarity, is_match = calculate_title_similarity(
+                                    title, pure_title, args.title_threshold
+                                )
+                                if is_match and similarity > best_similarity:
+                                    best_match = pure_item
+                                    best_similarity = similarity
+                        
+                        if best_match:
+                            matched_records = [best_match]
+
+            # Categorize as matched or unmatched
+            if matched_records:
+                matched_by_type[type_key].append(row)
+            else:
+                unmatched_by_type[type_key].append(row)
+
+        # Save results
+        total_matched = sum(len(rows) for rows in matched_by_type.values())
+        total_unmatched = sum(len(rows) for rows in unmatched_by_type.values())
+        
+        print(f"\n✅ Found {total_matched} matched records")
+        print(f"✅ Found {total_unmatched} unmatched records")
+        
+        # If type filter is specified, save single CSV
+        if args.type_filter:
+            output_file = os.path.join(args.output_dir, f"{args.type_filter}_{TODAY}.csv")
+            os.makedirs(args.output_dir, exist_ok=True)
+            
+            rows_to_save = unmatched_by_type.get(args.type_filter, [])
+            if rows_to_save:
+                with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=dspace_fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows_to_save)
+                print(f"\n📄 Filtered CSV saved to: {output_file}")
+                print(f"   Records: {len(rows_to_save)}")
+            else:
+                print(f"\n⚠️ No unmatched records found for type: {args.type_filter}")
+        
+        else:
+            # Save matched records by type
+            matched_dir = os.path.join(args.output_dir, "matched")
+            os.makedirs(matched_dir, exist_ok=True)
+            
+            print("\n📁 Saving matched records by type:")
+            for type_key, rows in sorted(matched_by_type.items()):
+                if rows:
+                    output_file = os.path.join(matched_dir, f"{type_key}_{TODAY}.csv")
+                    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.DictWriter(f, fieldnames=dspace_fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    print(f"   {type_key}: {len(rows)} records → {output_file}")
+            
+            # Save unmatched records by type
+            unmatched_dir = os.path.join(args.output_dir, "unmatched")
+            os.makedirs(unmatched_dir, exist_ok=True)
+            
+            print("\n📁 Saving unmatched records by type:")
+            for type_key, rows in sorted(unmatched_by_type.items()):
+                if rows:
+                    output_file = os.path.join(unmatched_dir, f"{type_key}_{TODAY}.csv")
+                    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.DictWriter(f, fieldnames=dspace_fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    print(f"   {type_key}: {len(rows)} records → {output_file}")
+            
+            # Print summary statistics
+            print("\n📊 Summary by type:")
+            all_types = set(matched_by_type.keys()) | set(unmatched_by_type.keys())
+            for type_key in sorted(all_types):
+                matched_count = len(matched_by_type.get(type_key, []))
+                unmatched_count = len(unmatched_by_type.get(type_key, []))
+                total = matched_count + unmatched_count
+                match_pct = (matched_count / total * 100) if total > 0 else 0
+                print(f"   {type_key}: {matched_count}/{total} matched ({match_pct:.1f}%)")
+        print(f"\n📝 Log saved to: {log_file}")
+    finally:
+        # Restore stdout and close log file
+        sys.stdout = tee.terminal
+        tee.close()
 
 if __name__ == "__main__":
     main()
