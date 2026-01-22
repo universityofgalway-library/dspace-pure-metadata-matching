@@ -19,8 +19,8 @@ load_dotenv()
 TODAY = date.today().isoformat()
 
 DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-21.csv"
-PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-13.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/updated_merged_authors_20260119.json"
+PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-22.json"
+PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_merged_authors_20260122.json"
 ORGANIZATION_MAPPING_JSON = "./matching_test/organizations_mapping_2026-01-21.json"
 OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
@@ -31,6 +31,15 @@ BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+EXTERNAL_ORGS_TO_IGNORE = [
+    "c3dd2704-6c2e-4b9c-861d-6c9959c9a612", # University of Galway
+    "4f1dc9e7-a654-4b84-8704-efeab9d69875", # University of Galway
+    "688759fc-d6e2-41a2-aef7-49fb5d228634", # Univbersity of Galway
+    "8f6fd722-2dc6-4cd1-8568-e232088b8f24", # NUI Galway
+    "d43008f7-0efa-41ce-9a28-c4aba2a335c5", # NUI Galway
+    "d40f2787-74f3-4b63-8151-89abc1919538" # NUI Galway
+]
 
 SYSTEM_FIELDS_TO_EXCLUDE = {
     "createdBy",
@@ -881,7 +890,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                                 "systemName": "ExternalOrganization",
                                 "uuid": org_uuid
                             }
-                            for org_uuid in matched_person["externalOrganizations"]
+                            for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
                         ]
                     final_contributors.append(contributor)
 
@@ -909,7 +918,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                                 "systemName": "ExternalOrganization",
                                 "uuid": org_uuid
                             }
-                            for org_uuid in matched_person["externalOrganizations"]
+                            for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
                         ]
                     if "internalOrganizations" in matched_person:
                         contributor["organizations"] = [
@@ -1463,7 +1472,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
                                 "systemName": "ExternalOrganization",
                                 "uuid": org_uuid
                             }
-                            for org_uuid in matched_person["externalOrganizations"]
+                            for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
                         ]
                     mapped_contributors.append(contributor)
                     print(f"      ✅ Added as InternalContributor: {matched_person.get('firstName')} {matched_person.get('lastName')}")
@@ -1495,7 +1504,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
                                 "systemName": "ExternalOrganization",
                                 "uuid": org_uuid
                             }
-                            for org_uuid in matched_person["externalOrganizations"]
+                            for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
                         ]
                 mapped_contributors.append(contributor)
                 print(f"      ✅ Added as ExternalContributor: {matched_person.get('firstName')} {matched_person.get('lastName')}")
