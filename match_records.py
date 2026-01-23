@@ -1283,6 +1283,11 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         if dspace_subtitle:
             updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
+    # --- 9. Set workflow step ---
+    updated_record["workflow"] = {
+        "step": "approved"
+    }
+
     # Write log entry
     log_entry["success"] = success and not errors
     if errors:
@@ -1319,7 +1324,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
             "key": "FREE"
         },
         "workflow": {
-            "step": "forApproval"
+            "step": "approved"
         },
         "typeDiscriminator": "OtherContribution"
     }
@@ -1945,7 +1950,7 @@ def main():
                     # Save to unmatched folder
                     type_key = get_pure_type_key(log_entry["pureType"])
                     filename = f"{type_key}_{TODAY}.json"
-                    filepath = os.path.join(OUTPUT_DIR, filename)
+                    filepath = os.path.join(UNMATCHED_DIR, filename)
                     existing = []
                     if os.path.exists(filepath):
                         with open(filepath, 'r', encoding='utf-8') as f:
