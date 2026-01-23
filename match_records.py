@@ -18,14 +18,15 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
-DSPACE_CSV = "./matching_test/dspace_test_sample_2026-01-21.csv"
-PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-22.json"
+DSPACE_CSV = "./matching_test/enriched_dspace_test_all_2026-01-21.csv"
+PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-23.json"
 PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_merged_authors_20260122.json"
 ORGANIZATION_MAPPING_JSON = "./matching_test/organizations_mapping_2026-01-21.json"
 OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+NO_AUTHOR_CSV = os.path.join(OUTPUT_DIR, f"no_author_records_{TODAY}.csv")
 API_KEY = os.getenv("PURE_API_KEY", "")
 BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
@@ -49,6 +50,15 @@ SYSTEM_FIELDS_TO_EXCLUDE = {
     "prettyUrlIdentifiers",
     "version",
 }
+
+LANG_MAP = {
+        "eng": "en_IE",
+        "fre": "fr_FR",
+        "ger": "de_DE",
+        "spa": "es_ES",
+        "gle": "ga"
+        # Add more as needed
+    }
 
 if not API_KEY:
     print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
@@ -115,19 +125,12 @@ def strip_system_fields(record):
 def normalize(s):
     return s.strip().lower() if s else ""
 
-def map_language(lang):
-    lang_map = {
-        "eng": "en_IE",
-        "fre": "fr_FR",
-        "ger": "de_DE",
-        "spa": "es_ES",
-        "gle": "ga"
-        # Add more as needed
-    }
+def map_language(lang, lang_map=LANG_MAP):
+
     lang_code = lang_map.get(lang.lower(), "en_IE")
     return lang_code
 
-def has_text_in_any_language(obj, key, languages=["en_GB", "en_IE", "en_US"]):
+def has_text_in_any_language(obj, key, languages=LANG_MAP.values()):
     """Check if object has non-empty text in any of the given languages"""
     return any(obj.get(key, {}).get(lang, "").strip() for lang in languages)
 
@@ -1262,9 +1265,23 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
             updated_record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
     # --- 8. Title (dc.title) > fill if blank ---
-    title = dspace_row.get("dc.title", "").strip()
-    if title and not pure_record.get("title", {}).get("value", "").strip():
-        updated_record["title"] = {"value": escape_special_chars(title)}
+    dspace_title = dspace_row.get("dc.title", "").strip()
+    dspace_subtitle = dspace_row.get("dc.title.subtitle", "").strip()
+    
+    # Combine title and subtitle if both exist
+    combined_dspace_title = dspace_title
+    if dspace_subtitle:
+        combined_dspace_title = f"{dspace_title} {dspace_subtitle}"
+    
+    # Check if Pure record has any title content
+    pure_title = pure_record.get("title", {}).get("value", "").strip()
+    pure_subtitle = pure_record.get("subTitle", {}).get("value", "").strip()
+    
+    # Only update if Pure has no meaningful title
+    if combined_dspace_title and not pure_title:
+        updated_record["title"] = {"value": escape_special_chars(dspace_title)}
+        if dspace_subtitle:
+            updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
     # Write log entry
     log_entry["success"] = success and not errors
@@ -1369,10 +1386,15 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
         else:
             record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
-    # Set title
-    title = dspace_row.get("dc.title", "").strip()
-    if title:
-        record["title"] = {"value": escape_special_chars(title)}
+    # Set title and subtitle
+    dspace_title = dspace_row.get("dc.title", "").strip()
+    dspace_subtitle = dspace_row.get("dc.title.subtitle", "").strip()
+    
+    if dspace_title:
+        record["title"] = {"value": escape_special_chars(dspace_title)}
+    
+    if dspace_subtitle:
+        record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
     # Set sponsorship
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
@@ -1733,6 +1755,7 @@ def main():
     log_entries = []
     error_log = []
     before_update_records = []
+    no_author_records = [] 
 
     # Group Pure records by identifiers for fast lookup
     pure_by_doi = defaultdict(list)
@@ -1759,10 +1782,16 @@ def main():
             if url and "hdl.handle.net" in url:
                 pure_by_handle[normalize_handle(url)].append(item)
         
-        # Index by title
-        title = item.get("title", {}).get("value", "")
+        # Index by combined title (title + subtitle)
+        title = item.get("title", {}).get("value", "").strip()
+        subtitle = item.get("subTitle", {}).get("value", "").strip()
         if title:
+            # Index by title alone
             pure_by_title[normalize(title)].append(item)
+            # Also index by combined title if subtitle exists
+            if subtitle:
+                combined_title = f"{title} {subtitle}"
+                pure_by_title[normalize(combined_title)].append(item)
 
     # Process each DSpace row with tqdm progress bar
     print(f"Processing {len(dspace_rows)} DSpace records...")
@@ -1819,9 +1848,16 @@ def main():
 
         # 4. Try to match by Title Similarity (as fallback)
         if not matched_records:
-            title = row.get("dc.title", "").strip()
-            if title:
-                normalized_title = normalize(title)
+            dspace_title = row.get("dc.title", "").strip()
+            dspace_subtitle = row.get("dc.title.subtitle", "").strip()
+            
+            # Combine DSpace title and subtitle
+            combined_dspace_title = dspace_title
+            if dspace_subtitle:
+                combined_dspace_title = f"{dspace_title} {dspace_subtitle}"
+            
+            if combined_dspace_title:
+                normalized_title = normalize(combined_dspace_title)
                 # First try exact match
                 if normalized_title in pure_by_title:
                     matched_records.extend(pure_by_title[normalized_title])
@@ -1831,13 +1867,16 @@ def main():
                     best_match = None
                     best_similarity = 0
                     for pure_item in pure_items:
-                        pure_title = pure_item.get("title", {}).get("value", "")
+                        pure_title = pure_item.get("title", {}).get("value", "").strip()
                         if pure_title:
-                            pure_subtitle = pure_item.get("subTitle", {}).get("value", "")
+                            pure_subtitle = pure_item.get("subTitle", {}).get("value", "").strip()
+                            # Combine Pure title and subtitle
+                            combined_pure_title = pure_title
                             if pure_subtitle:
-                                pure_title += f": {pure_subtitle}"
+                                combined_pure_title = f"{pure_title} {pure_subtitle}"
+                            
                             similarity, is_match = calculate_title_similarity(
-                                title, pure_title, TITLE_SIMILARITY_THRESHOLD
+                                combined_dspace_title, combined_pure_title, TITLE_SIMILARITY_THRESHOLD
                             )
                             if is_match and similarity > best_similarity:
                                 best_match = pure_item
@@ -1906,7 +1945,7 @@ def main():
                     # Save to unmatched folder
                     type_key = get_pure_type_key(log_entry["pureType"])
                     filename = f"{type_key}_{TODAY}.json"
-                    filepath = os.path.join(UNMATCHED_DIR, filename)
+                    filepath = os.path.join(OUTPUT_DIR, filename)
                     existing = []
                     if os.path.exists(filepath):
                         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1928,25 +1967,34 @@ def main():
     with open(log_json_path, 'w', encoding='utf-8') as f:
         json.dump(log_entries, f, indent=2, ensure_ascii=False)
 
-    # log_csv_path = os.path.join(LOG_DIR, f"status_log_{TODAY}.csv")
-    # with open(log_csv_path, 'w', newline='', encoding='utf-8') as f:
-    #     writer = csv.DictWriter(f, fieldnames=log_entries[0].keys())
-    #     writer.writeheader()
-    #     writer.writerows(log_entries)
+    if len(error_log) > 0:
+        error_log_path = os.path.join(LOG_DIR, f"error_log_{TODAY}.log")
+        with open(error_log_path, 'w', encoding='utf-8') as f:
+            for err in error_log:
+                f.write(err + "\n")
 
-    error_log_path = os.path.join(LOG_DIR, f"error_log_{TODAY}.log")
-    with open(error_log_path, 'w', encoding='utf-8') as f:
-        for err in error_log:
-            f.write(err + "\n")
+    if len(before_update_records) > 0:
+        before_update_path = os.path.join(OUTPUT_DIR, f"matched_records_before_updates_{TODAY}.json")
+        with open(before_update_path, "w", encoding="utf-8") as f:
+            json.dump(before_update_records, f, indent=2, ensure_ascii=False)
 
-    before_update_path = os.path.join(LOG_DIR, f"matched_records_before_updates_{TODAY}.json")
-    with open(before_update_path, "w", encoding="utf-8") as f:
-        json.dump(before_update_records, f, indent=2, ensure_ascii=False)
+    # Write no-author records CSV
+    if no_author_records:
+        print(f"\n📝 Writing {len(no_author_records)} records with no matched authors to CSV...")
+        with open(NO_AUTHOR_CSV, 'w', newline='', encoding='utf-8') as f:
+            if no_author_records:
+                # Get fieldnames from first record
+                fieldnames = no_author_records[0].keys()
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(no_author_records)
+        print(f"✅ No-author records saved to: {NO_AUTHOR_CSV}")
 
     print(f"\n✅ Done! {len(log_entries)} records processed.")
     print(f"   Matched: {sum(1 for e in log_entries if e['matched'])}")
     print(f"   Unmatched: {sum(1 for e in log_entries if not e['matched'])}")
     print(f"   Success: {sum(1 for e in log_entries if e['success'])}")
+    print(f"   No matched authors: {len(no_author_records)}")
     print(f"   Errors: {len(error_log)}")
     print(f"   Logs saved to: {LOG_DIR}")
     
