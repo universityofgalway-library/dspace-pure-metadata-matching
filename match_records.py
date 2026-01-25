@@ -375,9 +375,9 @@ def build_contributor(matched_person, role, pure_type_key):
     # Map role to URI - use pure_type_key for dynamic type
     role_uri_map = {
         "author": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/author",
-        "editor": "/dk/atira/pure/researchoutput/roles/bookanthology/editor",
-        "translator": "/dk/atira/pure/researchoutput/roles/bookanthology/translator",
-        "illustrator": "/dk/atira/pure/researchoutput/roles/bookanthology/illustrator"
+        "editor": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/editor",
+        "translator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/translator",
+        "illustrator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/illustrator"
     }
     
     role_term_map = {
@@ -869,6 +869,66 @@ def build_funding_organizations(funder_uuids_with_type):
     
     return funding_details
 
+def parse_date(date_string):
+    """
+    Parse date string with multiple formats and separators.
+    Handles: yyyy-mm-dd, dd-mm-yyyy, yyyy/mm/dd, dd/mm/yyyy
+    Returns: (year, month, day) tuple
+    """
+    if not date_string:
+        return (1970, 1, 1)
+    
+    # Try different separators
+    parts = None
+    separator = None
+    for sep in ['-', '/']:
+        if sep in date_string:
+            parts = date_string.split(sep)
+            separator = sep
+            break
+    
+    if not parts or len(parts) < 3:
+        # Handle year-only format
+        if date_string.isdigit() and len(date_string) == 4:
+            return (int(date_string), 1, 1)
+        return (1970, 1, 1)
+    
+    # Extract numeric parts
+    try:
+        part1 = int(parts[0]) if parts[0].isdigit() else 1970
+        part2 = int(parts[1]) if parts[1].isdigit() else 1
+        part3 = int(parts[2]) if parts[2].isdigit() else 1
+    except (ValueError, IndexError):
+        return (1970, 1, 1)
+    
+    # Determine format based on first part
+    # If first part > 31, it's likely yyyy-mm-dd
+    # If first part <= 31 and third part > 31, it's likely dd-mm-yyyy
+    if part1 > 31:
+        # yyyy-mm-dd or yyyy/mm/dd
+        year = part1
+        month = part2 if 1 <= part2 <= 12 else 1
+        day = part3 if 1 <= part3 <= 31 else 1
+    elif part3 > 31:
+        # dd-mm-yyyy or dd/mm/yyyy
+        day = part1 if 1 <= part1 <= 31 else 1
+        month = part2 if 1 <= part2 <= 12 else 1
+        year = part3
+    else:
+        # Ambiguous - default to yyyy-mm-dd if first part could be a year
+        if part1 > 12:
+            # Likely dd-mm-yyyy (day > 12)
+            day = part1 if 1 <= part1 <= 31 else 1
+            month = part2 if 1 <= part2 <= 12 else 1
+            year = part3
+        else:
+            # Default to yyyy-mm-dd
+            year = part1
+            month = part2 if 1 <= part2 <= 12 else 1
+            day = part3 if 1 <= part3 <= 31 else 1
+    
+    return (year, month, day)
+
 def update_record_from_dspace(pure_record, dspace_row, person_mapping, organization_mapping, log_entry, before_update_records):
     """
     Update pure_record with DSpace data according to precedence rules.
@@ -1051,13 +1111,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     # --- 2. Publication Date (dc.date.issued) > fill if blank, upgrade only ---
     issued = dspace_row.get("dc.date.issued", "").strip()
     if issued:
-        # Parse year/month/day
-        parts = issued.split("-")
-        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 1970
-        month = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
-        day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
-
-        # Only set if not already set or if year conflicts
+        year, month, day = parse_date(issued)
+        
+        # Only set if not already set
         pub_status = pure_record.get("publicationStatuses", [])
         if not pub_status:
             updated_record["publicationStatuses"] = [{
@@ -1071,11 +1127,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                     "day": day
                 }
             }]
-        else:
-            # Check if year differs
-            existing_year = pub_status[0].get("publicationDate", {}).get("year", 1970)
-            if existing_year != 1970 and existing_year != year:
-                errors.append(f"Publication year conflict: Pure={existing_year}, DSpace={year}")
+
+    # --- 3. Funding Details (sponsorship + funders) ---
 
     # --- 3a. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
@@ -1176,8 +1229,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                 new_publisher_ev = ev
 
     # --- 5b. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
-    embargo_date = dspace_row.get("dc.date.embargo", "").strip()
+    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
+    
+    # Parse embargo date using same function as publication date
+    embargo_date = None
+    if embargo_date_str:
+        year, month, day = parse_date(embargo_date_str)
+        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
+    
     embargo_active = bool(embargo_date and embargo_date > TODAY)
 
     repo_ev = existing_repo_evs[0] if existing_repo_evs else None
@@ -1421,10 +1481,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
     # Set publication date
     issued = dspace_row.get("dc.date.issued", "").strip()
     if issued:
-        parts = issued.split("-")
-        year = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 1970
-        month = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
-        day = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
+        year, month, day = parse_date(issued)
         record["publicationStatuses"] = [{
             "publicationStatus": {
                 "uri": "/dk/atira/pure/researchoutput/status/published"
@@ -1597,13 +1654,19 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
             "systemName": "Organization"
         }
     
-
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
     electronic_versions = []
     
     # First, add repository DOI if exists
-    embargo_date = dspace_row.get("dc.date.embargo", "").strip()
+    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
     embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
+    
+    # Parse embargo date using same function as publication date
+    embargo_date = None
+    if embargo_date_str:
+        year, month, day = parse_date(embargo_date_str)
+        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
+    
     embargo_active = bool(embargo_date and embargo_date > TODAY) or bool(embargo_desc and embargo_desc > TODAY)
 
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
@@ -1623,7 +1686,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
                     license_type="CC_BY_NC_ND"
                 )
 
-                if embargo_active and ev:
+                if embargo_active and ev and embargo_date:
                     ev["embargoPeriod"] = {"endDate": embargo_date}
                 
                 if ev:
@@ -1701,6 +1764,8 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
 # --- MAIN FUNCTION ---
 
 def main():
+    import time
+    start_time = time.time()
     
     processing_log_path = os.path.join(LOG_DIR, f"processing_log_{TODAY}.log")
     logger = LoggerOutput(processing_log_path)
@@ -1787,6 +1852,22 @@ def main():
             "error": None,
             "matches": []
         }
+
+        # Check if ALL contributor fields are empty
+        has_any_contributors = any([
+            row.get("dc.contributor.author", "").strip(),
+            row.get("dc.contributor.editor", "").strip(),
+            row.get("dc.contributor.translator", "").strip(),
+            row.get("dc.contributor.illustrator", "").strip()
+        ])
+
+        if not has_any_contributors:
+            log_entry["success"] = False
+            log_entry["error"] = "No contributors found in any contributor field"
+            log_entry["handle"] = extract_handles_from_uri(row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(row.get("dc.identifier.uri", "")) else None
+            log_entries.append(log_entry)
+            print(f"⚠️ Skipping record - no contributors found: {row.get('dc.title', '')[:50]}...")
+            continue
 
         # Extract handles from URI
         handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
@@ -1969,13 +2050,28 @@ def main():
                 writer.writerows(no_author_records)
         print(f"✅ No-author records saved to: {NO_AUTHOR_CSV}")
 
+    # Calculate elapsed time
+    elapsed_time = time.time() - start_time
+    hours = int(elapsed_time // 3600)
+    minutes = int((elapsed_time % 3600) // 60)
+    seconds = int(elapsed_time % 60)
+    
+    # Count results
+    matched_count = sum(1 for e in log_entries if e['matched'])
+    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') != "No contributors found in any contributor field")
+    success_count = sum(1 for e in log_entries if e['success'])
+    no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
+    error_count = len(error_log)
+    
     print(f"\n✅ Done! {len(log_entries)} records processed.")
-    print(f"   Matched: {sum(1 for e in log_entries if e['matched'])}")
-    print(f"   Unmatched: {sum(1 for e in log_entries if not e['matched'])}")
-    print(f"   Success: {sum(1 for e in log_entries if e['success'])}")
+    print(f"   Matched: {matched_count}")
+    print(f"   Unmatched: {unmatched_count}")
+    print(f"   Success: {success_count}")
+    print(f"   No contributors: {no_contributors_count}")
     print(f"   No matched authors: {len(no_author_records)}")
-    print(f"   Errors: {len(error_log)}")
+    print(f"   Errors: {error_count}")
     print(f"   Logs saved to: {LOG_DIR}")
+    print(f"\n⏱️  Total time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     logger.close()
     sys.stdout = logger.terminal
