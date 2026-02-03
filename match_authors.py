@@ -7,12 +7,13 @@ from tqdm import tqdm
 from datetime import date 
 
 # --- CONFIGURATION ---
-DSpace_Authors_JSON = "./matching_test/temp.json"
-Pure_Internal_JSON = "./pure_entities/pure_test_persons_2026-01-13.json"
-Pure_External_JSON = "./pure_entities/pure_test_external-persons_2026-01-22.json"
-OUTPUT_DIR = "./matching_test/matched_authors"
-HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
 TODAY = date.today().isoformat()
+
+DSpace_Authors_JSON = "./matching_test/dspace_test_authors_2026-02-03.json"
+Pure_Internal_JSON = "./pure_entities/pure_test_persons_2026-02-03.json"
+Pure_External_JSON = "./pure_entities/pure_test_external-persons_2026-02-03.json"
+OUTPUT_DIR = f"./matching_test/matched_authors/{TODAY}"
+HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -400,6 +401,7 @@ def get_organizations_from_pure_person(person, is_internal=True):
     """Extract organization UUIDs from Pure person record"""
     internal_orgs = []
     external_orgs = []
+    primary_internal_org = ""
     
     if is_internal:
         # For internal persons: extract from various staff/student/visitor associations
@@ -407,6 +409,7 @@ def get_organizations_from_pure_person(person, is_internal=True):
             ("staffOrganizationAssociations", "organization"),
             ("honoraryStaffOrganizationAssociations", "organization"),
             ("visitingScholarOrganizationAssociations", "organization"),
+            ("studentOrganizationAssociations", "organization")
         ]
         
         # Extract UUIDs from all configured association types
@@ -415,6 +418,10 @@ def get_organizations_from_pure_person(person, is_internal=True):
                 org = assoc.get(org_field, {})
                 if org.get("uuid") and org.get("systemName") == "Organization":
                     internal_orgs.append(org["uuid"])
+                    
+                    # Check for primary association
+                    if assoc.get("primaryAssociation") == True and not primary_internal_org:
+                        primary_internal_org = org["uuid"]
         
         # Check externalPositions for internal persons (they can have external org affiliations)
         for ext_pos in person.get("externalPositions", []):
@@ -439,7 +446,7 @@ def get_organizations_from_pure_person(person, is_internal=True):
             if ext_org.get("uuid"):
                 external_orgs.append(ext_org["uuid"])
     
-    return list(set(internal_orgs)), list(set(external_orgs))  # Return both lists, deduplicated
+    return list(set(internal_orgs)), list(set(external_orgs)), primary_internal_org  # Return both lists, deduplicated, + primary association
 
 
 def build_index_persons(person_list, is_internal=True):
@@ -456,6 +463,7 @@ def build_index_persons(person_list, is_internal=True):
     alt_names_by_uuid = {}  # maps uuid → list of (original_first, original_last)
     internal_orgs_by_uuid = {}  # maps uuid → list of internal organization UUIDs
     external_orgs_by_uuid = {}  # maps uuid → list of external organization UUIDs
+    primary_internal_org_by_uuid = {}  # maps uuid → primary internal organization UUID
     visibility_by_uuid = {}  # maps uuid → visibility key (for ALL internal persons)
 
     for person in person_list:
@@ -463,7 +471,7 @@ def build_index_persons(person_list, is_internal=True):
         if not uuid:
             continue
 
-        # ✅ Always store visibility for internal persons — even if not FREE
+        # Always store visibility for internal persons — even if not FREE
         if is_internal:
             visibility = person.get("visibility", {})
             vis_key = visibility.get("key", "")  # e.g., "FREE", "CAMPUS", etc.
@@ -519,16 +527,18 @@ def build_index_persons(person_list, is_internal=True):
             alt_names_by_uuid[uuid] = list(set(alt_names))  # Deduplicate
 
         # Store organization UUIDs for this person (separated by type)
-        int_orgs, ext_orgs = get_organizations_from_pure_person(person, is_internal=is_internal)
+        int_orgs, ext_orgs, primary_int_org = get_organizations_from_pure_person(person, is_internal=is_internal) 
         if int_orgs:
             internal_orgs_by_uuid[uuid] = int_orgs
         if ext_orgs:
             external_orgs_by_uuid[uuid] = ext_orgs
+        if primary_int_org:  # ✅ New: store primary internal org
+            primary_internal_org_by_uuid[uuid] = primary_int_org
 
-    return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid
+    return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid, primary_internal_org_by_uuid  
 
 
-def enrich_authors(authors, internal_index, external_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, output_option="all"):
+def enrich_authors(authors, internal_index, external_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, internal_primary_org_by_uuid=None, external_primary_org_by_uuid=None, output_option="all"):  # ✅ Added primary org parameters
     """
     Enrich authors with Pure match data.
     output_option: "all", "matched_internal", "matched_external", "unmatched", "matched_all_duplicates", "matched_internal_duplicates", "matched_external_duplicates", "matched_internal_external_duplicates"
@@ -579,7 +589,7 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         internal_matches = list(set(internal_matches))
         external_matches = list(set(external_matches))
 
-# Extract original alternative names used in matches
+        # Extract original alternative names used in matches
         alternative_firstnames = set()
         alternative_lastnames = set()
 
@@ -671,6 +681,7 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
         internal_organizations = []
         external_organizations = []
         internal_uuids_with_visibility = []  # ✅ List of {uuid, visibility}
+        primary_internal_organisation = ""  # ✅ New: primary internal organization UUID
 
         for uuid in internal_matches:
             # Add internal organizations
@@ -686,6 +697,9 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
                     "uuid": uuid,
                     "visibility": visibility
                 })
+            # ✅ Get primary internal organization (only set if not already set - first match wins)
+            if not primary_internal_organisation and internal_primary_org_by_uuid and uuid in internal_primary_org_by_uuid:
+                primary_internal_organisation = internal_primary_org_by_uuid[uuid]
 
         for uuid in external_matches:
             # Add internal organizations (rare but possible)
@@ -728,6 +742,7 @@ def enrich_authors(authors, internal_index, external_index, internal_alt_names=N
             "externalUUIDs": external_matches,
             "internalOrganizations": internal_organizations,
             "externalOrganizations": external_organizations,
+            "primaryInternalOrganisation": primary_internal_organisation, 
             "alternativeFirstName": list(alternative_firstnames),
             "alternativeLastName": list(alternative_lastnames)
         }
@@ -848,8 +863,8 @@ def main():
     external_persons = load_json(Pure_External_JSON)
 
     # Build lookup tables + collect alternative names, organizations (separated by type), and visibility (for internal only)
-    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid = build_index_persons(internal_persons, is_internal=True)
-    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid = build_index_persons(external_persons, is_internal=False)
+    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid, internal_primary_org_by_uuid = build_index_persons(internal_persons, is_internal=True)  # ✅ Updated
+    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid, external_primary_org_by_uuid = build_index_persons(external_persons, is_internal=False)  # ✅ Updated
 
 
     # Define output options
@@ -887,6 +902,8 @@ def main():
             external_internal_orgs,
             external_external_orgs,
             internal_visibility_by_uuid,  # ✅ Pass visibility map
+            internal_primary_org_by_uuid,  # ✅ New: pass primary org map for internal
+            external_primary_org_by_uuid,  # ✅ New: pass primary org map for external (will be empty)
             output_option=option
         )
 

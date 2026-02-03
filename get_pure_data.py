@@ -10,7 +10,7 @@ TODAY = date.today().isoformat()
 
 # Define all available data types
 ALL_DATA_TYPES = [
-    # "research-outputs",
+    "research-outputs",
     "persons",
     "external-persons",
     "journals",

@@ -18,6 +18,8 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
+OVERRIDE_MODE = False  # Change to True to override existing Pure data
+
 DSPACE_CSV = "./matching_test/enriched_dspace_test_all_2026-01-21.csv"
 PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-23.json"
 PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_merged_authors_20260122.json"
@@ -27,19 +29,42 @@ MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 NO_AUTHOR_CSV = os.path.join(OUTPUT_DIR, f"no_author_records_{TODAY}.csv")
-API_KEY = os.getenv("PURE_API_KEY", "")
+API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
 BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
 
 EXTERNAL_ORGS_TO_IGNORE = [
-    "c3dd2704-6c2e-4b9c-861d-6c9959c9a612", # University of Galway
-    "4f1dc9e7-a654-4b84-8704-efeab9d69875", # University of Galway
-    "688759fc-d6e2-41a2-aef7-49fb5d228634", # Univbersity of Galway
-    "8f6fd722-2dc6-4cd1-8568-e232088b8f24", # NUI Galway
-    "d43008f7-0efa-41ce-9a28-c4aba2a335c5", # NUI Galway
-    "d40f2787-74f3-4b63-8151-89abc1919538" # NUI Galway
+    "c3dd2704-6c2e-4b9c-861d-6c9959c9a612",    # "University of Galway" 
+    "4f1dc9e7-a654-4b84-8704-efeab9d69875",    # "University of Galway" 
+    "688759fc-d6e2-41a2-aef7-49fb5d228634",    # "Univbersity of Galway" 
+    "8f6fd722-2dc6-4cd1-8568-e232088b8f24",    # "NUI Galway" 
+    "d43008f7-0efa-41ce-9a28-c4aba2a335c5",    # "NUI Galway" 
+    "d40f2787-74f3-4b63-8151-89abc1919538",    # "NUI Galway" 
+    "67e06257-a759-43e2-877e-ad1a7846e711",    # "National University of Ireland Galway " 
+    "5c0ba446-1322-4287-9bfb-cdfe607c606e",    # "National University of Ireland Galway" 
+    "18c76cc4-daaf-49c4-9867-7b0837b4a95b",    # "National University of Ireland ¡V Galway" 
+    "132c1680-5865-48ae-89c8-bd278d99832b",    # "National University of Ireland – Galway" 
+    "5c091814-92d4-4b6f-b50e-816725f105f8",    # "National University of Ireland, Galway " 
+    "cdc9d89f-b737-47ef-8cce-88fb619d1438",    # "National University of Ireland, Galway" 
+    "3d1d93ed-6e42-4cd0-af67-100c6d87a1a1",    # "National University of Ireland Galway." 
+    "3c5b13f5-1f04-494b-be48-c67eacd43dcf",    # "National university of Ireland Galway, Ireland " 
+    "0f02b3d9-dbf1-4970-9927-876ec82f895e",    # "National University of Ireland Galway, Ireland" 
+    "bccbb32b-8a4b-471f-a2ba-3a836479a0e7",    # "National University of Ireland Galway (Ireland)" 
+    "ed37f922-87e1-49d3-a30a-ac63d0322a87",    # "National University of Ireland, Galway." 
+    "684d8f18-0a1b-47cc-88b6-4fc50e8cc1cd",    # "National University of Ireland, Galway, Ireland" 
+    "05dd5c35-3f2a-4c17-b45e-b3ee2dffffed",    # "National University of Ireland, Galway, Galway, Ireland" 
+    "63da70e1-005a-45a6-a4d5-1cb161b5b72e",    # "National University of Ireland, Galway\t" 
+    "9e8c03cb-cfc3-4a91-aeb9-f65dd03dc42d",    # "National University of Ireland, Galway / UCG" 
+    "9ab586e4-be82-418b-9056-444f2b71faa0",    # "National University of Ireland, Galway (NUIG)" 
+    "44cc3e64-03d8-43c5-81fc-d712f335642b",    # "National University of Ireland, Galway (formerly University College Galway)" 
+    "3c493970-03e5-4670-b223-facf3a94dc2e",    # "National University of Ireland, Galway  " 
+    "689a3221-88fd-4d2e-8c20-74aeb22eb5ec",    # "National University of Ireland-Galway" 
+    "f026cf31-52e3-4aa3-a609-54a50ddd962b",    # "National University of Ireland—Galway" 
+    "0dc1af88-f709-4304-8a44-ad3178e1edb2",    # "National University of Ireland Galway College" 
+    "78363204-c24b-4e1c-a3e0-1e80614c1978",    # "National University of Ireland‐Galway" 
+    "6d370e14-c9b6-4749-8680-6d513e02976b"     # "National University of Ireland Galway (NUI Galway)" 
 ]
 
 SYSTEM_FIELDS_TO_EXCLUDE = {
@@ -73,8 +98,8 @@ dspace_pure_subtype_map = {
     "journal article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
     "review article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
     "review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
-    "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
-    "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
+    # "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
+    # "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
     "conference paper": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/paper",
     "conference output": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/other",
     "conference poster": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/poster",
@@ -272,7 +297,8 @@ def type_requires_peer_review(type_discriminator):
         "WorkingPaper",
         "ContributionToPeriodical",
         "Thesis",
-        "Memorandum"
+        "Memorandum",
+        "NonTextual"
     }
     return type_discriminator not in types_without_peer_review
 
@@ -317,9 +343,7 @@ def add_type_specific_fields(record, dspace_row):
             print(f"    ⚠️ No journal UUID found for {type_disc} - changing to OtherContribution")
             record["typeDiscriminator"] = "OtherContribution"
             record["type"]["uri"] = "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other"
-            # Remove peerReview if it was added
-            if "peerReview" in record:
-                del record["peerReview"]
+            record["peerReview"] = False
             return record
         
     if type_disc == "ContributionToBookAnthology":
@@ -392,7 +416,6 @@ def build_contributor(matched_person, role, pure_type_key):
         uuid_value = extract_uuid(matched_person.get("internalUUIDs")[0])
         contributor = {
             "typeDiscriminator": "InternalContributorAssociation",
-            "hidden": False,
             "name": {
                 "firstName": first,
                 "lastName": last
@@ -406,30 +429,21 @@ def build_contributor(matched_person, role, pure_type_key):
                 "uuid": uuid_value
             }
         }
-        if "internalOrganizations" in matched_person:
+        # For internal authors, ONLY use primaryOrganisationAssociation
+        if "primaryOrganisationAssociation" in matched_person and matched_person["primaryOrganisationAssociation"]:
             contributor["organizations"] = [
                 {
                     "systemName": "Organization",
-                    "uuid": org_uuid
+                    "uuid": matched_person["primaryOrganisationAssociation"]
                 }
-                for org_uuid in matched_person["internalOrganizations"]
             ]
-        if "externalOrganizations" in matched_person:
-            contributor["externalOrganizations"] = [
-                {
-                    "systemName": "ExternalOrganization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
-            ]
+
         return contributor
     
     elif has_valid_external:
         uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
         contributor = {
             "typeDiscriminator": "ExternalContributorAssociation",
-            "hidden": False,
-            "correspondingAuthor": False,
             "name": {
                 "firstName": first,
                 "lastName": last
@@ -443,22 +457,30 @@ def build_contributor(matched_person, role, pure_type_key):
                 "uuid": uuid_value
             }
         }
-        if "externalOrganizations" in matched_person:
-            contributor["externalOrganizations"] = [
-                {
-                    "systemName": "ExternalOrganization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in matched_person["externalOrganizations"] if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
+        # For external authors, filter out EXTERNAL_ORGS_TO_IGNORE unless it's the only one
+        if "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
+            external_orgs = matched_person["externalOrganizations"]
+            
+            # Filter out ignored organizations
+            filtered_external_orgs = [
+                org_uuid for org_uuid in external_orgs
+                if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
             ]
-        if "internalOrganizations" in matched_person:
-            contributor["organizations"] = [
-                {
-                    "systemName": "Organization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in matched_person["internalOrganizations"]
-            ]
+            
+            # If all orgs are in ignore list, keep the first one from the original list
+            if not filtered_external_orgs and external_orgs:
+                filtered_external_orgs = [external_orgs[0]]
+            
+            # Add to contributor if we have any orgs
+            if filtered_external_orgs:
+                contributor["externalOrganizations"] = [
+                    {
+                        "systemName": "ExternalOrganization",
+                        "uuid": org_uuid
+                    }
+                    for org_uuid in filtered_external_orgs
+                ]
+        
         return contributor
     
     return None
@@ -929,10 +951,14 @@ def parse_date(date_string):
     
     return (year, month, day)
 
-def update_record_from_dspace(pure_record, dspace_row, person_mapping, organization_mapping, log_entry, before_update_records):
+
+def update_record_from_dspace(pure_record, dspace_row, person_mapping, organization_mapping, log_entry, before_update_records, override_mode=False):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
+    
+    Args:
+        override_mode: If True, override all fields. If False, follow precedence rules.
     """
     success = True
     errors = []
@@ -950,56 +976,64 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     # Get existing contributors from Pure record (if any)
     existing_contributors = pure_record.get("contributors", [])
 
-    # Create a set of existing contributor keys for fast lookup
-    existing_author_keys = set()
-    existing_uuids = set()
-    existing_by_uuid = {}
-    existing_by_name = {}
+    # If override mode is on, ignore existing contributors
+    if override_mode:
+        existing_contributors = []
+        existing_author_keys = set()
+        existing_uuids = set()
+        existing_by_uuid = {}
+        existing_by_name = {}
+    else:
+        # Create a set of existing contributor keys for fast lookup
+        existing_author_keys = set()
+        existing_uuids = set()
+        existing_by_uuid = {}
+        existing_by_name = {}
 
-    for contrib in existing_contributors:
-        if not contrib:
-            continue
+        for contrib in existing_contributors:
+            if not contrib:
+                continue
 
-        # Extract name
-        name = contrib.get("name", {}) or {}
-        first = name.get("firstName", "") or ""
-        last = name.get("lastName", "") or ""
-        all_first_names = [first] if first else []
-        all_last_names = [last] if last else []
+            # Extract name
+            name = contrib.get("name", {}) or {}
+            first = name.get("firstName", "") or ""
+            last = name.get("lastName", "") or ""
+            all_first_names = [first] if first else []
+            all_last_names = [last] if last else []
 
-        # Add alternatives from 'names' array
-        for name_entry in contrib.get("names", []):
-            name_obj = name_entry.get("name", {})
-            if first := name_obj.get("firstName", ""):
-                all_first_names.append(first)
-            if last := name_obj.get("lastName", ""):
-                all_last_names.append(last)
+            # Add alternatives from 'names' array
+            for name_entry in contrib.get("names", []):
+                name_obj = name_entry.get("name", {})
+                if first := name_obj.get("firstName", ""):
+                    all_first_names.append(first)
+                if last := name_obj.get("lastName", ""):
+                    all_last_names.append(last)
 
-        # Generate all name combinations
-        normal_order = list(product(all_first_names, all_last_names))
-        reverse_order = list(product(all_last_names, all_first_names))
-        all_combinations = normal_order + reverse_order
+            # Generate all name combinations
+            normal_order = list(product(all_first_names, all_last_names))
+            reverse_order = list(product(all_last_names, all_first_names))
+            all_combinations = normal_order + reverse_order
 
-        for pair in all_combinations:
-            name_key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
-            existing_author_keys.add(name_key)
-            existing_by_name[name_key] = contrib
+            for pair in all_combinations:
+                name_key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
+                existing_author_keys.add(name_key)
+                existing_by_name[name_key] = contrib
 
-        # Extract UUID (internal or external)
-        if "person" in contrib:
-            person_obj = contrib["person"]
-            if person_obj:
-                uuid = person_obj.get("uuid")
-                if uuid:
-                    existing_uuids.add(uuid)
-                    existing_by_uuid[uuid] = contrib
-        elif "externalPerson" in contrib:
-            ext_person_obj = contrib["externalPerson"]
-            if ext_person_obj:
-                uuid = ext_person_obj.get("uuid")
-                if uuid:
-                    existing_uuids.add(uuid)
-                    existing_by_uuid[uuid] = contrib
+            # Extract UUID (internal or external)
+            if "person" in contrib:
+                person_obj = contrib["person"]
+                if person_obj:
+                    uuid = person_obj.get("uuid")
+                    if uuid:
+                        existing_uuids.add(uuid)
+                        existing_by_uuid[uuid] = contrib
+            elif "externalPerson" in contrib:
+                ext_person_obj = contrib["externalPerson"]
+                if ext_person_obj:
+                    uuid = ext_person_obj.get("uuid")
+                    if uuid:
+                        existing_uuids.add(uuid)
+                        existing_by_uuid[uuid] = contrib
 
     # Process DSpace contributors by role and build final contributors list
     final_contributors = []
@@ -1036,24 +1070,26 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                 elif has_valid_external:
                     uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
                 
-                # Check if this contributor already exists
+                # Check if this contributor already exists (only if not in override mode)
                 first = matched_person.get("firstName", "")
                 last = matched_person.get("lastName", "")
                 name_key = (normalize(first), normalize(last))
                 
-                # If contributor already exists, use existing one (preserves DSpace order)
-                if uuid_value in existing_by_uuid:
+                # If override mode is on, always create new contributor
+                # If contributor already exists and not in override mode, use existing one
+                if not override_mode and uuid_value in existing_by_uuid:
                     print(f"        ℹ️ Contributor already exists (by UUID), using existing: {first} {last}")
                     final_contributors.append(existing_by_uuid[uuid_value])
-                elif name_key in existing_by_name:
+                elif not override_mode and name_key in existing_by_name:
                     print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
                     final_contributors.append(existing_by_name[name_key])
                 else:
                     # Create new contributor
-                    contributor = build_contributor(matched_person, role, pure_type)
+                    contributor = build_contributor(matched_person, role, pure_type.lower())
                     if contributor:
                         final_contributors.append(contributor)
-                        print(f"        ✅ Added new {role}: {first} {last}")
+                        action = "Overriding" if override_mode else "Added new"
+                        print(f"        ✅ {action} {role}: {first} {last}")
             else:
                 print(f"        ⚠️ No matches found — adding to unmatched")
                 unmatched_contributors.append((role, contributor_name))
@@ -1070,27 +1106,91 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         final_contributors if final_contributors else []
     )
     
-    # Update top-level organizations with unique validated internal orgs
-    if all_internal_org_uuids:
-        updated_record["organizations"] = [
-            {
-                "systemName": "Organization",
-                "uuid": org_uuid
-            }
-            for org_uuid in all_internal_org_uuids
-        ]
-    
-    # Update top-level externalOrganizations with unique external orgs
-    if all_external_org_uuids:
-        updated_record["externalOrganizations"] = [
-            {
-                "systemName": "ExternalOrganization",
-                "uuid": org_uuid
-            }
-            for org_uuid in all_external_org_uuids
-        ]
+    # In override mode, replace organizations entirely
+    # In precedence mode, only add if not already present
+    if override_mode:
+        # Update top-level organizations with unique validated internal orgs
+        if all_internal_org_uuids:
+            updated_record["organizations"] = [
+                {
+                    "systemName": "Organization",
+                    "uuid": org_uuid
+                }
+                for org_uuid in all_internal_org_uuids
+            ]
+        
+        # Update top-level externalOrganizations with unique external orgs
+        if all_external_org_uuids:
+            updated_record["externalOrganizations"] = [
+                {
+                    "systemName": "ExternalOrganization",
+                    "uuid": org_uuid
+                }
+                for org_uuid in all_external_org_uuids
+            ]
+    else:
+        # Precedence mode: only update if not already present
+        if all_internal_org_uuids and not pure_record.get("organizations"):
+            updated_record["organizations"] = [
+                {
+                    "systemName": "Organization",
+                    "uuid": org_uuid
+                }
+                for org_uuid in all_internal_org_uuids
+            ]
+        
+        if all_external_org_uuids and not pure_record.get("externalOrganizations"):
+            updated_record["externalOrganizations"] = [
+                {
+                    "systemName": "ExternalOrganization",
+                    "uuid": org_uuid
+                }
+                for org_uuid in all_external_org_uuids
+            ]
 
-    # --- 1b. Remove author keyword group if all DSpace authors are now matched ---
+    # --- 1b. Managing Organization - Update based on override mode ---
+    # Find first internal organization from internal contributors only
+    first_internal_org_uuid = None
+    for contributor in (final_contributors if final_contributors else []):
+        # Only check internal contributors
+        if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
+            if "organizations" in contributor and contributor["organizations"]:
+                first_internal_org_uuid = contributor["organizations"][0].get("uuid")
+                if first_internal_org_uuid:
+                    break
+    
+    if override_mode:
+        # In override mode, always update managing organization
+        if first_internal_org_uuid:
+            updated_record["managingOrganization"] = {
+                "uuid": first_internal_org_uuid,
+                "systemName": "Organization"
+            }
+            print(f"  ✅ Override: Set managingOrganization to: {first_internal_org_uuid}")
+        else:
+            # No internal authors - set to Library Repository
+            updated_record["managingOrganization"] = {
+                "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
+                "systemName": "Organization"
+            }
+            print(f"  ✅ Override: Set managingOrganization to Library Repository (no internal authors)")
+    elif not pure_record.get("managingOrganization", {}).get("uuid"):
+        # In precedence mode, only set if not already present
+        if first_internal_org_uuid:
+            updated_record["managingOrganization"] = {
+                "uuid": first_internal_org_uuid,
+                "systemName": "Organization"
+            }
+            print(f"  ✅ Precedence: Set managingOrganization to: {first_internal_org_uuid}")
+        else:
+            # No internal authors - set to Library Repository
+            updated_record["managingOrganization"] = {
+                "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
+                "systemName": "Organization"
+            }
+            print(f"  ✅ Precedence: Set managingOrganization to Library Repository (no internal authors)")
+
+    # --- 1c. Remove author keyword group if all DSpace authors are now matched ---
     if final_contributors:
         existing_keyword_groups = pure_record.get("keywordGroups", [])
         if existing_keyword_groups:
@@ -1113,9 +1213,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     if issued:
         year, month, day = parse_date(issued)
         
-        # Only set if not already set
+        # Only set if not already set OR if override mode is on
         pub_status = pure_record.get("publicationStatuses", [])
-        if not pub_status:
+        if not pub_status or override_mode:
             updated_record["publicationStatuses"] = [{
                 "publicationStatus": {
                     "uri": "/dk/atira/pure/researchoutput/status/published",
@@ -1132,7 +1232,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
 
     # --- 3a. Sponsorship (dc.description.sponsorship) > fill if blank ---
     sponsorship = dspace_row.get("dc.description.sponsorship", "").strip()
-    if sponsorship and not has_text_in_any_language(pure_record, "fundingText"):
+    if sponsorship and (not has_text_in_any_language(pure_record, "fundingText") or override_mode):
         updated_record["fundingText"] = {"en_IE": escape_special_chars(sponsorship)}
 
     # --- 3b. Funder (dc.contributor.funder) > fill if blank, add new funders, don't overwrite ---
@@ -1144,14 +1244,18 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         # Get existing funding details
         existing_funding_details = pure_record.get("fundingDetails", [])
         
-        # Collect existing funder UUIDs to avoid duplicates
-        existing_funder_uuids = set()
-        for funding_detail in existing_funding_details:
-            for funding_org in funding_detail.get("fundingOrganizations", []):
-                if "organizationRef" in funding_org:
-                    existing_funder_uuids.add(funding_org["organizationRef"]["uuid"])
-                elif "externalOrganizationRef" in funding_org:
-                    existing_funder_uuids.add(funding_org["externalOrganizationRef"]["uuid"])
+        # If override mode is on, ignore existing funders
+        if override_mode:
+            existing_funder_uuids = set()
+        else:
+            # Collect existing funder UUIDs to avoid duplicates
+            existing_funder_uuids = set()
+            for funding_detail in existing_funding_details:
+                for funding_org in funding_detail.get("fundingOrganizations", []):
+                    if "organizationRef" in funding_org:
+                        existing_funder_uuids.add(funding_org["organizationRef"]["uuid"])
+                    elif "externalOrganizationRef" in funding_org:
+                        existing_funder_uuids.add(funding_org["externalOrganizationRef"]["uuid"])
         
         # Process new funders
         new_funder_uuids_with_type = []  # List of (uuid, is_internal) tuples
@@ -1168,11 +1272,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
                     uuid = matched_org.get("uuid")
                     is_internal = matched_org.get("internal", False)
                     
-                    # Check if already exists
-                    if uuid not in existing_funder_uuids:
+                    # Check if already exists (only if not in override mode)
+                    if override_mode or uuid not in existing_funder_uuids:
                         new_funder_uuids_with_type.append((uuid, is_internal))
                         existing_funder_uuids.add(uuid)  # Prevent duplicates within new funders
-                        print(f"      ✅ Added funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
+                        action = "Overriding" if override_mode else "Added"
+                        print(f"      ✅ {action} funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
                     else:
                         print(f"      ℹ️ Funder already exists: {funder_name}")
             else:
@@ -1182,15 +1287,19 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         if new_funder_uuids_with_type:
             new_funding_details = build_funding_organizations(new_funder_uuids_with_type)
             
-            if existing_funding_details:
+            if override_mode:
+                # In override mode, replace all funding details
+                updated_record["fundingDetails"] = new_funding_details
+                print(f"    ✅ Replaced fundingDetails with {len(new_funder_uuids_with_type)} new funders")
+            elif existing_funding_details:
                 # Append new funding details to existing list
                 existing_funding_details.extend(new_funding_details)
                 updated_record["fundingDetails"] = existing_funding_details
+                print(f"    ✅ Added {len(new_funder_uuids_with_type)} new funders to fundingDetails")
             else:
                 # Create new funding details list
                 updated_record["fundingDetails"] = new_funding_details
-            
-            print(f"    ✅ Added {len(new_funder_uuids_with_type)} new funders to fundingDetails")
+                print(f"    ✅ Added {len(new_funder_uuids_with_type)} new funders to fundingDetails")
 
     # --- 4. Electronic Versions (DOIs + embargo + rights + access) ---
     existing_evs = pure_record.get("electronicVersions", [])
@@ -1372,14 +1481,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     # --- 6. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
     lang_code = map_language(lang)
-    if lang and not pure_record.get("language", {}).get("uri", ""):
+    if lang and (not pure_record.get("language", {}).get("uri", "") or override_mode):
         updated_record["language"] = {
             "uri": f"/dk/atira/pure/core/languages/{lang_code}"
         }
 
     # --- 7. Abstract (dc.description.abstract) > fill if blank ---
     abstract = dspace_row.get("dc.description.abstract", "").strip()
-    if abstract and not has_text_in_any_language(pure_record, "abstract"):
+    if abstract and (not has_text_in_any_language(pure_record, "abstract") or override_mode):
         if lang_code == "ga":
             # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
             updated_record["abstract"] = {"en_IE": escape_special_chars(abstract), "ga": escape_special_chars(abstract)}
@@ -1399,13 +1508,34 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     pure_title = pure_record.get("title", {}).get("value", "").strip()
     pure_subtitle = pure_record.get("subTitle", {}).get("value", "").strip()
     
-    # Only update if Pure has no meaningful title
-    if combined_dspace_title and not pure_title:
+    # Only update if Pure has no meaningful title OR if override mode is on
+    if combined_dspace_title and (not pure_title or override_mode):
         updated_record["title"] = {"value": escape_special_chars(dspace_title)}
         if dspace_subtitle:
             updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
-    # --- 9. Set workflow step ---
+    # --- 9. Journal Association (for ContributionToJournal/ContributionToPeriodical) ---
+    type_disc = pure_record.get("typeDiscriminator", "")
+    
+    if type_disc in ["ContributionToJournal", "ContributionToPeriodical"]:
+        journal_uuid = dspace_row.get("journal_uuid", "").strip()
+        existing_journal = pure_record.get("journalAssociation", {}).get("journal", {}).get("uuid")
+        
+        # Add journal if we have a UUID and (no existing journal OR override mode is on)
+        if journal_uuid and (not existing_journal or override_mode):
+            updated_record["journalAssociation"] = {
+                "journal": {
+                    "systemName": "Journal",
+                    "uuid": journal_uuid
+                }
+            }
+            action = "Override" if override_mode else "Added"
+            print(f"  ✅ {action}: Set journal association to: {journal_uuid}")
+        elif not journal_uuid and not existing_journal:
+            # No journal UUID in DSpace and no existing journal - this shouldn't be a journal contribution
+            print(f"    ⚠️ No journal UUID found for {type_disc} - record may need type change")
+
+    # --- 10. Set workflow step ---
     updated_record["workflow"] = {
         "step": "approved"
     }
@@ -1613,13 +1743,15 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
     # Collect ALL validated organizations from ALL contributors
     all_internal_org_uuids, all_external_org_uuids = collect_validated_organizations(mapped_contributors)
     
-    # Track first internal contributor's first organization for managingOrganization
+    # Track first internal contributor's primary organization for managingOrganization
     first_internal_org_uuid = None
     for contributor in mapped_contributors:
-        if "organizations" in contributor and contributor["organizations"]:
-            first_internal_org_uuid = contributor["organizations"][0].get("uuid")
-            if first_internal_org_uuid:
-                break
+        # Only check internal contributors
+        if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
+            if "organizations" in contributor and contributor["organizations"]:
+                first_internal_org_uuid = contributor["organizations"][0].get("uuid")
+                if first_internal_org_uuid:
+                    break
     
     # Set top-level organizations with unique validated internal orgs
     if all_internal_org_uuids:
@@ -1641,7 +1773,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
             for org_uuid in all_external_org_uuids
         ]
     
-    # Set managingOrganization from first internal contributor's first validated organization
+    # Set managingOrganization from first internal contributor's primary organization
     if first_internal_org_uuid:
         record["managingOrganization"] = {
             "uuid": first_internal_org_uuid,
@@ -1649,10 +1781,12 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
         }
         print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
     else:
+        # No internal authors - set to Library Repository
         record["managingOrganization"] = {
-            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",  # Default: Library Repository
+            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
             "systemName": "Organization"
         }
+        print(f"✅ Set managingOrganization to Library Repository (no internal authors)")
     
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
     electronic_versions = []
@@ -1969,7 +2103,7 @@ def main():
             log_entry["matchType"] = match_type
 
             try:
-                updated_record, success = update_record_from_dspace(record, row, person_mapping, organization_mapping, log_entry, before_update_records)
+                updated_record, success = update_record_from_dspace(record, row, person_mapping, organization_mapping, log_entry, before_update_records, override_mode=OVERRIDE_MODE)
                 log_entry["success"] = success
                 if success:
                     # Save to matched folder

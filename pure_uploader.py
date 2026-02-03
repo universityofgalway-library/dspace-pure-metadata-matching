@@ -397,7 +397,7 @@ if __name__ == "__main__":
         mode = args.mode
         success_count, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR, args.test)
         print(f"\n✅ Single file results: {success_count} records succeeded")
-        print(f"Details: {results}")
+        # print(f"Details: {results}")
     else:
         print("Please specify --folder or --file")
         sys.exit(1)
