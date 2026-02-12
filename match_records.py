@@ -8,6 +8,7 @@ from datetime import date
 from collections import defaultdict
 from itertools import product
 from tqdm import tqdm
+from rapidfuzz import fuzz
 from dotenv import load_dotenv
 
 
@@ -34,6 +35,30 @@ BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+
+# --- TYPE MAPPING ---
+dspace_pure_subtype_map = {
+    "journal article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
+    "review article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
+    "review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
+    # "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
+    # "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
+    "conference paper": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/paper",
+    "conference output": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/other",
+    "conference poster": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/poster",
+    "book part": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontobookanthology/chapter",
+    "book": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/book",
+    "report": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/commissioned",
+    "conference proceedings": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/book",
+    "working paper": "/dk/atira/pure/researchoutput/researchoutputtypes/workingpaper/workingpaper",
+    "video": "/dk/atira/pure/researchoutput/researchoutputtypes/nontextual/audiovisual_material",
+    "interactive resource": "/dk/atira/pure/researchoutput/researchoutputtypes/nontextual/web_publication",
+    "newspaper article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/article",
+    "book review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/book",
+    "other": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
+    "data management plan": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
+}
 
 EXTERNAL_ORGS_TO_IGNORE = [
     "c3dd2704-6c2e-4b9c-861d-6c9959c9a612",    # "University of Galway" 
@@ -85,39 +110,23 @@ LANG_MAP = {
         # Add more as needed
     }
 
+
 if not API_KEY:
     print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
     print("   External person duplicate resolution will be skipped.")
+
 
 os.makedirs(MATCHED_DIR, exist_ok=True)
 os.makedirs(UNMATCHED_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# --- TYPE MAPPING ---
-dspace_pure_subtype_map = {
-    "journal article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
-    "review article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
-    "review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
-    # "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
-    # "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
-    "conference paper": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/paper",
-    "conference output": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/other",
-    "conference poster": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/poster",
-    "book part": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontobookanthology/chapter",
-    "book": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/book",
-    "report": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/commissioned",
-    "conference proceedings": "/dk/atira/pure/researchoutput/researchoutputtypes/bookanthology/book",
-    "working paper": "/dk/atira/pure/researchoutput/researchoutputtypes/workingpaper/workingpaper",
-    "video": "/dk/atira/pure/researchoutput/researchoutputtypes/nontextual/audiovisual_material",
-    "interactive resource": "/dk/atira/pure/researchoutput/researchoutputtypes/nontextual/web_publication",
-    "newspaper article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/article",
-    "book review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/book",
-    "other": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
-    "data management plan": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
-}
-
 _person_metadata_cache = {}
 _external_person_metadata_cache = {}
+_org_validation_cache = {}
+
+_unmatched_contributors = []
+_unmatched_funders = []
+
 
 # --- LOGGER SETUP --- #
 
@@ -150,17 +159,21 @@ def strip_system_fields(record):
         if k not in SYSTEM_FIELDS_TO_EXCLUDE
     }
 
+
 def normalize(s):
     return s.strip().lower() if s else ""
+
 
 def map_language(lang, lang_map=LANG_MAP):
 
     lang_code = lang_map.get(lang.lower(), "en_IE")
     return lang_code
 
+
 def has_text_in_any_language(obj, key, languages=LANG_MAP.values()):
     """Check if object has non-empty text in any of the given languages"""
     return any(obj.get(key, {}).get(lang, "").strip() for lang in languages)
+
 
 def escape_special_chars(text):
     """Replace special characters with HTML entity codes"""
@@ -186,18 +199,20 @@ def escape_special_chars(text):
     
     return result
 
+
 def extract_uuid(uuid_entry):
     return uuid_entry["uuid"] if isinstance(uuid_entry, dict) else uuid_entry
 
+
 def calculate_title_similarity(title1, title2, threshold=0.8):
     """
-    Calculate similarity between two titles.
+    Calculate similarity between two titles using rapidfuzz for performance.
     Returns tuple (similarity_score, is_match)
     
     Args:
         title1: First title string
         title2: Second title string
-        threshold: Minimum similarity ratio required (0-1), default 0.9 (80%)
+        threshold: Minimum similarity ratio required (0-1), default 0.8 (80%)
     
     Returns:
         Tuple of (similarity_ratio: float, is_match: bool)
@@ -212,27 +227,18 @@ def calculate_title_similarity(title1, title2, threshold=0.8):
     if t1 == t2:
         return (1.0, True)
     
-    # Calculate simple character matching similarity
-    # Using longest common subsequence approach
-    longer = max(len(t1), len(t2))
-    if longer == 0:
+    # Pre-filter by length difference (fast rejection)
+    len_diff = abs(len(t1) - len(t2))
+    max_len = max(len(t1), len(t2))
+    if max_len > 0 and (len_diff / max_len) > 0.5:  # More than 50% length difference
         return (0.0, False)
     
-    # Calculate matching characters (simple approach: count matching positions)
-    matches = sum(1 for a, b in zip(t1, t2) if a == b)
+    # Use rapidfuzz token_set_ratio for word-order-independent matching
+    # This handles cases where words are reordered
+    similarity = fuzz.token_set_ratio(t1, t2) / 100.0
     
-    # Also add bonus for common substrings
-    words1 = set(t1.split())
-    words2 = set(t2.split())
-    common_words = len(words1 & words2)
-    total_words = len(words1 | words2)
-    word_similarity = common_words / total_words if total_words > 0 else 0
-    
-    # Combine character and word similarity (weighted average)
-    char_similarity = matches / ((len(t1)+len(t2))/2)
-    combined_similarity = (char_similarity * 0.5) + (word_similarity * 0.5)
-    
-    return (combined_similarity, combined_similarity >= threshold)
+    return (similarity, similarity >= threshold)
+
 
 def normalize_doi(value: str) -> str:
     if not isinstance(value, str):
@@ -246,6 +252,7 @@ def normalize_doi(value: str) -> str:
 
     return f"https://doi.org/{match.group(1)}"
 
+
 def normalize_handle(value: str) -> str:
     if not isinstance(value, str):
         return value
@@ -257,6 +264,7 @@ def normalize_handle(value: str) -> str:
         return value  # not a valid handle → leave unchanged
 
     return f"http://hdl.handle.net/{match.group(1)}"
+
 
 def extract_dois_from_uri(uri_str):
     """Extract DOIs from dc.identifier.uri (semicolon-separated)"""
@@ -272,6 +280,7 @@ def extract_dois_from_uri(uri_str):
             dois.append(doi)
     return dois
 
+
 def extract_handles_from_uri(uri_str):
     """Extract handles from dc.identifier.uri"""
     if not uri_str:
@@ -285,6 +294,7 @@ def extract_handles_from_uri(uri_str):
             handles.append(handle)
     return handles
 
+
 def get_pure_type_key(pure_type_uri):
     """Returns last but one element: e.g., 'contributiontojournal'"""
     if not pure_type_uri:
@@ -293,6 +303,7 @@ def get_pure_type_key(pure_type_uri):
     if len(parts) >= 3:
         return parts[-2]
     return "unknown"
+
 
 def type_requires_peer_review(type_discriminator):
     """Check if a research output type requires the peerReview field"""
@@ -305,6 +316,7 @@ def type_requires_peer_review(type_discriminator):
     }
     return type_discriminator not in types_without_peer_review
 
+
 def get_default_peer_review_status(type_discriminator):
     """Get default peer review status for types that require it"""
     # Types typically peer-reviewed
@@ -314,6 +326,7 @@ def get_default_peer_review_status(type_discriminator):
         "BookAnthology"
     }
     return type_discriminator in typically_peer_reviewed
+
 
 def add_type_specific_fields(record, dspace_row):
     """Add type-specific required fields based on typeDiscriminator"""
@@ -356,11 +369,13 @@ def add_type_specific_fields(record, dspace_row):
     
     return record
 
+
 def parse_author_names(author_str):
     """Parse semicolon-separated author names from DSpace"""
     if not author_str:
         return []
     return [a.strip() for a in author_str.split(";") if a.strip()] 
+
 
 def parse_contributors_by_role(dspace_row):
     """Parse all contributor types from DSpace and return dict by role"""
@@ -387,6 +402,7 @@ def parse_contributors_by_role(dspace_row):
         contributors_by_role["illustrator"] = illustrators
     
     return contributors_by_role
+
 
 def build_contributor(matched_person, role, pure_type_key):
     """Build a contributor object from matched person and role"""
@@ -488,6 +504,7 @@ def build_contributor(matched_person, role, pure_type_key):
     
     return None
 
+
 def build_person_name_index(person_mapping):
     """Build a comprehensive index of all person name variations for O(1) lookup"""
     person_index = {}
@@ -521,6 +538,7 @@ def build_person_name_index(person_mapping):
     
     return person_index
 
+
 def find_person_match(person_name, person_index):
     """Find matching person using pre-built index - O(1) lookup"""
     first, last = "", ""
@@ -541,10 +559,82 @@ def find_person_match(person_name, person_index):
     return person_index.get(key, [])
 
 
+def batch_fetch_person_metadata(person_uuids, api_key, base_url, is_external=False):
+    """
+    Fetch metadata for multiple persons in batch.
+    Returns dict mapping UUID -> field_count
+    """
+    if not api_key:
+        return {uuid: 0 for uuid in person_uuids}
+    
+    results = {}
+    cache = _external_person_metadata_cache if is_external else _person_metadata_cache
+    endpoint = "external-persons" if is_external else "persons"
+    uncached_uuids = []
+    
+    # Check cache first
+    for uuid in person_uuids:
+        if uuid in cache:
+            results[uuid] = cache[uuid]
+        else:
+            uncached_uuids.append(uuid)
+    
+    # Batch fetch uncached UUIDs
+    if uncached_uuids:
+        for uuid in uncached_uuids:
+            try:
+                response = requests.get(
+                    f"{base_url}{endpoint}/{uuid}",
+                    headers={
+                        "accept": "application/json",
+                        "api-key": api_key
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    person_data = response.json()
+                    field_count = sum(1 for k, v in person_data.items() 
+                                    if k not in ["uuid", "createdBy", "modifiedBy", "version", 
+                                               "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
+                    results[uuid] = field_count
+                    cache[uuid] = field_count
+                else:
+                    results[uuid] = 0
+                    cache[uuid] = 0
+            except Exception:
+                results[uuid] = 0
+                cache[uuid] = 0
+    
+    return results
+
+
 def resolve_author_duplicate(matches):
     """Prefer Person over External Person, then by visibility (internal), then by metadata richness (both internal and external)"""
     if not matches:
         return None
+
+    # Collect all UUIDs that need metadata fetching
+    internal_uuids_to_fetch = []
+    external_uuids_to_fetch = []
+    
+    for person in matches:
+        if person.get("internal", False):
+            internal_uuids = person.get("internalUUIDs", [])
+            for uuid_obj in internal_uuids:
+                uuid_value = extract_uuid(uuid_obj)
+                if uuid_value not in _person_metadata_cache:
+                    internal_uuids_to_fetch.append(uuid_value)
+        elif person.get("external", False):
+            external_uuids = person.get("externalUUIDs", [])
+            for uuid_value in external_uuids:
+                if uuid_value not in _external_person_metadata_cache:
+                    external_uuids_to_fetch.append(uuid_value)
+    
+    # Batch fetch all needed metadata
+    if internal_uuids_to_fetch and API_KEY:
+        batch_fetch_person_metadata(internal_uuids_to_fetch, API_KEY, BASE_URL, is_external=False)
+    if external_uuids_to_fetch and API_KEY:
+        batch_fetch_person_metadata(external_uuids_to_fetch, API_KEY, BASE_URL, is_external=True)
 
     def score(person):
         internal = person.get("internal", False)
@@ -567,81 +657,35 @@ def resolve_author_duplicate(matches):
         if internal:
             internal_uuids = person.get("internalUUIDs", [])
             if internal_uuids:
-                best_uuid = None
                 max_fields = -1
                 for uuid_obj in internal_uuids:
                     uuid_value = extract_uuid(uuid_obj)
                     if not API_KEY:
-                        best_uuid = uuid_value
                         max_fields = 0
                         break
                     
-                    # Check cache first
-                    if uuid_value in _person_metadata_cache:
-                        field_count = _person_metadata_cache[uuid_value]
-                        if field_count > max_fields:
-                            max_fields = field_count
-                            best_uuid = uuid_value
-                        continue
-                    
-                    try:
-                        response = requests.get(
-                            f"{BASE_URL}persons/{uuid_value}",
-                            headers={
-                                "accept": "application/json",
-                                "api-key": API_KEY  
-                            },
-                            timeout=10
-                        )
-                        if response.status_code == 200:
-                            internal_person = response.json()
-                            field_count = sum(1 for k, v in internal_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
-                            _person_metadata_cache[uuid_value] = field_count
-                            if field_count > max_fields:
-                                max_fields = field_count
-                                best_uuid = uuid_value 
-                    except Exception as e:
-                        pass
-                metadata_score = max_fields if best_uuid else 0
+                    # Cache is already populated by batch fetch
+                    field_count = _person_metadata_cache.get(uuid_value, 0)
+                    if field_count > max_fields:
+                        max_fields = field_count
+                
+                metadata_score = max_fields
         
         elif external:
             external_uuids = person.get("externalUUIDs", [])
             if external_uuids:
-                best_uuid = None
                 max_fields = -1
                 for uuid_value in external_uuids:
                     if not API_KEY:
-                        best_uuid = uuid_value
                         max_fields = 0
                         break
                     
-                    # Check cache first
-                    if uuid_value in _external_person_metadata_cache:
-                        field_count = _external_person_metadata_cache[uuid_value]
-                        if field_count > max_fields:
-                            max_fields = field_count
-                            best_uuid = uuid_value
-                        continue
-                    
-                    try:
-                        response = requests.get(
-                            f"{BASE_URL}external-persons/{uuid_value}",
-                            headers={
-                                "accept": "application/json",
-                                "api-key": API_KEY  
-                            },
-                            timeout=10
-                        )
-                        if response.status_code == 200:
-                            external_person = response.json()
-                            field_count = sum(1 for k, v in external_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
-                            _external_person_metadata_cache[uuid_value] = field_count
-                            if field_count > max_fields:
-                                max_fields = field_count
-                                best_uuid = uuid_value
-                    except Exception as e:
-                        pass
-                metadata_score = max_fields if best_uuid else 0
+                    # Cache is already populated by batch fetch
+                    field_count = _external_person_metadata_cache.get(uuid_value, 0)
+                    if field_count > max_fields:
+                        max_fields = field_count
+                
+                metadata_score = max_fields
 
         return (type_score, vis_score, metadata_score)
 
@@ -671,6 +715,7 @@ def resolve_record_duplicate(records):
 
     sorted_records = sorted(records, key=score, reverse=True)
     return sorted_records[0]
+
 
 def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
                              license_type="UNSPECIFIED", embargo_end_date=None):
@@ -715,7 +760,12 @@ def validate_organization(org_uuid, api_key, base_url):
     """
     Validate if an organization UUID exists in Pure.
     Returns True if found, False otherwise.
+    Uses cache to avoid redundant API calls.
     """
+    # Check cache first
+    if org_uuid in _org_validation_cache:
+        return _org_validation_cache[org_uuid]
+    
     try:
         response = requests.get(
             f"{base_url}organizations/{org_uuid}",
@@ -725,9 +775,53 @@ def validate_organization(org_uuid, api_key, base_url):
             },
             timeout=10
         )
-        return response.status_code == 200
+        result = response.status_code == 200
+        _org_validation_cache[org_uuid] = result
+        return result
     except Exception:
+        _org_validation_cache[org_uuid] = False
         return False
+    
+
+def batch_validate_organizations(org_uuids, api_key, base_url):
+    """
+    Validate multiple organization UUIDs in batch.
+    Returns dict mapping UUID -> is_valid (bool)
+    """
+    if not api_key:
+        return {uuid: False for uuid in org_uuids}
+    
+    results = {}
+    uncached_uuids = []
+    
+    # Check cache first
+    for uuid in org_uuids:
+        if uuid in _org_validation_cache:
+            results[uuid] = _org_validation_cache[uuid]
+        else:
+            uncached_uuids.append(uuid)
+    
+    # Batch validate uncached UUIDs
+    if uncached_uuids:
+        print(f"  🔍 Batch validating {len(uncached_uuids)} organizations...")
+        for uuid in uncached_uuids:
+            try:
+                response = requests.get(
+                    f"{base_url}organizations/{uuid}",
+                    headers={
+                        "accept": "application/json",
+                        "api-key": api_key
+                    },
+                    timeout=10
+                )
+                is_valid = response.status_code == 200
+                results[uuid] = is_valid
+                _org_validation_cache[uuid] = is_valid
+            except Exception:
+                results[uuid] = False
+                _org_validation_cache[uuid] = False
+    
+    return results
 
 
 def validate_and_fix_organizations(contributors, api_key, base_url):
@@ -740,6 +834,21 @@ def validate_and_fix_organizations(contributors, api_key, base_url):
         print("  ⚠️ No API key - skipping organization validation")
         return contributors
     
+    # Collect all unique org UUIDs first
+    all_org_uuids = set()
+    for contributor in contributors:
+        if not contributor:
+            continue
+        internal_orgs = contributor.get("organizations", [])
+        for org in internal_orgs:
+            org_uuid = org.get("uuid")
+            if org_uuid:
+                all_org_uuids.add(org_uuid)
+    
+    # Batch validate all UUIDs at once
+    validation_results = batch_validate_organizations(list(all_org_uuids), api_key, base_url)
+    
+    # Now update contributors based on validation results
     updated_contributors = []
     
     for contributor in contributors:
@@ -755,7 +864,7 @@ def validate_and_fix_organizations(contributors, api_key, base_url):
             for org in internal_orgs:
                 org_uuid = org.get("uuid")
                 if org_uuid:
-                    if validate_organization(org_uuid, api_key, base_url):
+                    if validation_results.get(org_uuid, False):
                         valid_internal_orgs.append(org)
                     else:
                         print(f"    ⚠️ Invalid internal org UUID {org_uuid} - moving to external")
@@ -814,6 +923,7 @@ def collect_validated_organizations(contributors):
     
     return list(internal_org_uuids), list(external_org_uuids)
 
+
 def resolve_funder_duplicate(matches, api_key, base_url):
     """
     Resolve duplicate organization matches for funders.
@@ -868,6 +978,7 @@ def build_organization_name_index(organization_mapping):
     
     return org_index
 
+
 def find_funder_match(funder_name, org_index):
     """Find matching organization using pre-built index"""
     normalized_name = normalize(funder_name)
@@ -906,6 +1017,7 @@ def build_funding_organizations(funder_uuids_with_type):
             })
     
     return funding_details
+
 
 def parse_date(date_string):
     """
@@ -968,6 +1080,8 @@ def parse_date(date_string):
     return (year, month, day)
 
 
+# --- UPDATING RECORDS ---
+
 def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, override_mode=False):
     """
     Update pure_record with DSpace data according to precedence rules.
@@ -991,6 +1105,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     
     # Get existing contributors from Pure record (if any)
     existing_contributors = pure_record.get("contributors", [])
+
+    # Track unmatched contributors for this record
+    record_unmatched_contributors = []
 
     # If override mode is on, ignore existing contributors
     if override_mode:
@@ -1053,7 +1170,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # Process DSpace contributors by role and build final contributors list
     final_contributors = []
-    unmatched_contributors = []
 
     for role, contributor_names in contributors_by_role.items():
         print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
@@ -1068,7 +1184,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                 
                 if not matched_person:
                     print(f"        ❌ ERROR: resolve_author_duplicate returned None for {len(matches)} matches!")
-                    unmatched_contributors.append((role, contributor_name))
+                    record_unmatched_contributors.append({
+                        "name": contributor_name,
+                        "role": role,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": pure_record.get("uuid")
+                    })
                     continue
                 
                 # Get UUID to check if already exists
@@ -1077,7 +1199,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                 
                 if not has_valid_internal and not has_valid_external:
                     print(f"        ⚠️ Matched person has no valid UUIDs — adding to unmatched")
-                    unmatched_contributors.append((role, contributor_name))
+                    record_unmatched_contributors.append({
+                        "name": contributor_name,
+                        "role": role,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": pure_record.get("uuid")
+                    })
                     continue
                 
                 uuid_value = None
@@ -1108,7 +1236,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                         print(f"        ✅ {action} {role}: {first} {last}")
             else:
                 print(f"        ⚠️ No matches found — adding to unmatched")
-                unmatched_contributors.append((role, contributor_name))
+                record_unmatched_contributors.append({
+                    "name": contributor_name,
+                    "role": role,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_record.get("uuid")
+                })
 
     # Only update contributors if we have any
     if final_contributors:
@@ -1253,6 +1387,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # --- 3b. Funder (dc.contributor.funder) > fill if blank, add new funders, don't overwrite ---
     dspace_funders = parse_funders(dspace_row.get("dc.contributor.funder", ""))
+
+    # Track unmatched funders for this record
+    record_unmatched_funders = []
     
     if dspace_funders and len(dspace_funders) > 0:
         print(f"  ➤ Processing {len(dspace_funders)} funders: {dspace_funders}")
@@ -1296,8 +1433,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                         print(f"      ✅ {action} funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
                     else:
                         print(f"      ℹ️ Funder already exists: {funder_name}")
+                else:
+                    # NEW: Track unmatched funder
+                    record_unmatched_funders.append({
+                        "name": funder_name,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": pure_record.get("uuid")
+                    })
             else:
                 print(f"      ⚠️ No match found for funder: {funder_name}")
+                # Track unmatched funder
+                record_unmatched_funders.append({
+                    "name": funder_name,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_record.get("uuid")
+                })
+        
+        # Add unmatched funders to log entry and global tracker
+        if record_unmatched_funders:
+            log_entry["unmatchedFunders"] = record_unmatched_funders
+            _unmatched_funders.extend(record_unmatched_funders)
         
         # Add new funders to funding details
         if new_funder_uuids_with_type:
@@ -1566,6 +1723,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     return updated_record, success
 
 
+# --- CREATING RECORDS ---
+
 def create_new_record_from_dspace(dspace_row, person_index, org_index):
     """Create new Pure record from DSpace row"""
     # Escape special characters in title first
@@ -1674,6 +1833,9 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     # Set funders
     dspace_funders = parse_funders(dspace_row.get("dc.contributor.funder", ""))
     
+    # Track unmatched funders
+    record_unmatched_funders = []
+    
     if dspace_funders and len(dspace_funders) > 0:
         print(f"  ➤ Processing {len(dspace_funders)} funders: {dspace_funders}")
         
@@ -1692,8 +1854,27 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     is_internal = matched_org.get("internal", False)
                     funder_uuids_with_type.append((uuid, is_internal))
                     print(f"      ✅ Added funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
+                else:
+                    # Track unmatched funder
+                    record_unmatched_funders.append({
+                        "name": funder_name,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": None  # New record, no UUID yet
+                    })
             else:
                 print(f"      ⚠️ No match found for funder: {funder_name}")
+                # Track unmatched funder
+                record_unmatched_funders.append({
+                    "name": funder_name,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": None
+                })
+        
+        # Add to global tracker
+        if record_unmatched_funders:
+            _unmatched_funders.extend(record_unmatched_funders)
         
         # Add funders to record
         if funder_uuids_with_type:
@@ -1706,7 +1887,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     print(f"✅ Processing contributors: {sum(len(names) for names in contributors_by_role.values())} total")
 
     mapped_contributors = []
-    unmatched_contributors = []
+    record_unmatched_contributors = []  
 
     for role, contributor_names in contributors_by_role.items():
         print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
@@ -1721,7 +1902,13 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                 
                 if not matched_person:
                     print(f"        ❌ ERROR: resolve_author_duplicate returned None!")
-                    unmatched_contributors.append((role, contributor_name))
+                    record_unmatched_contributors.append({
+                        "name": contributor_name,
+                        "role": role,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": None
+                    })
                     continue
                 
                 # Check if person has valid UUIDs
@@ -1730,7 +1917,13 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                 
                 if not has_valid_internal and not has_valid_external:
                     print(f"        ⚠️ Matched person has no valid UUIDs — adding to unmatched")
-                    unmatched_contributors.append((role, contributor_name))
+                    record_unmatched_contributors.append({
+                        "name": contributor_name,
+                        "role": role,
+                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                        "title": dspace_row.get("dc.title", ""),
+                        "pure_uuid": None
+                    })
                     continue
                 
                 # Build contributor using helper function
@@ -1740,7 +1933,17 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     print(f"        ✅ Added {role}: {matched_person.get('firstName')} {matched_person.get('lastName')}")
             else:
                 print(f"        ⚠️ No matches found — adding to unmatched")
-                unmatched_contributors.append((role, contributor_name))
+                record_unmatched_contributors.append({
+                    "name": contributor_name,
+                    "role": role,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": None
+                })
+
+    # Add to global tracker
+    if record_unmatched_contributors:
+        _unmatched_contributors.extend(record_unmatched_contributors)
 
     # Check if we have any contributors - if not, skip this record
     if not mapped_contributors:
@@ -1910,6 +2113,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             }
 
     return record
+
 
 # --- MAIN FUNCTION ---
 
@@ -2207,6 +2411,28 @@ def main():
                 writer.writeheader()
                 writer.writerows(no_author_records)
         print(f"✅ No-author records saved to: {NO_AUTHOR_CSV}")
+
+    # Write unmatched contributors CSV
+    if _unmatched_contributors:
+        unmatched_contributors_csv = os.path.join(OUTPUT_DIR, f"unmatched_contributors_{TODAY}.csv")
+        print(f"\n📝 Writing {len(_unmatched_contributors)} unmatched contributors to CSV...")
+        with open(unmatched_contributors_csv, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['name', 'role', 'handle', 'title', 'pure_uuid']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_unmatched_contributors)
+        print(f"✅ Unmatched contributors saved to: {unmatched_contributors_csv}")
+
+    #  unmatched funders CSV
+    if _unmatched_funders:
+        unmatched_funders_csv = os.path.join(OUTPUT_DIR, f"unmatched_funders_{TODAY}.csv")
+        print(f"\n📝 Writing {len(_unmatched_funders)} unmatched funders to CSV...")
+        with open(unmatched_funders_csv, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['name', 'handle', 'title', 'pure_uuid']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_unmatched_funders)
+        print(f"✅ Unmatched funders saved to: {unmatched_funders_csv}")
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
