@@ -20,11 +20,11 @@ TODAY = date.today().isoformat()
 
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-DSPACE_CSV = "./matching_test/enriched_dspace_test_all_2026-01-21.csv"
-PURE_JSON = "./matching_test/research_outputs/pure_test_research-outputs_2026-01-23.json"
-PERSON_MAPPING_JSON = "./matching_test/matched_authors/test_merged_authors_20260122.json"
-ORGANIZATION_MAPPING_JSON = "./matching_test/organizations_mapping_2026-01-21.json"
-OUTPUT_DIR = f"./matching_test/test_output_{TODAY}"
+DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-02-12.csv"
+PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-02-03.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-02-12/test_authors_all_2026-02-12.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-01-21.json"
+OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -115,6 +115,9 @@ dspace_pure_subtype_map = {
     "other": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
     "data management plan": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
 }
+
+_person_metadata_cache = {}
+_external_person_metadata_cache = {}
 
 # --- LOGGER SETUP --- #
 
@@ -485,15 +488,47 @@ def build_contributor(matched_person, role, pure_type_key):
     
     return None
 
-def find_person_match(person_name, person_mapping):
-    """Find matching person by name (primary + alternatives)"""
+def build_person_name_index(person_mapping):
+    """Build a comprehensive index of all person name variations for O(1) lookup"""
+    person_index = {}
+    
+    for person in person_mapping:
+        p_first = person.get("firstName", "")
+        p_last = person.get("lastName", "")
+        alt_firsts = person.get("alternativeFirstName", []) or []
+        alt_lasts = person.get("alternativeLastName", []) or []
+        
+        # Build complete lists
+        all_firsts = [p_first] if p_first else []
+        all_firsts.extend(alt_firsts)
+        all_lasts = [p_last] if p_last else []
+        all_lasts.extend(alt_lasts)
+        
+        # Index all combinations
+        for af in all_firsts:
+            for al in all_lasts:
+                # Normal order: (first, last)
+                key1 = (normalize(af), normalize(al))
+                if key1 not in person_index:
+                    person_index[key1] = []
+                person_index[key1].append(person)
+                
+                # Swapped order: (last, first)
+                key2 = (normalize(al), normalize(af))
+                if key2 not in person_index:
+                    person_index[key2] = []
+                person_index[key2].append(person)
+    
+    return person_index
+
+def find_person_match(person_name, person_index):
+    """Find matching person using pre-built index - O(1) lookup"""
     first, last = "", ""
     if "," in person_name:
         parts = [p.strip() for p in person_name.split(",", 1)]
         last = parts[0]
         first = parts[1] if len(parts) > 1 else ""
     else:
-        # Assume "First Last"
         parts = person_name.split()
         if len(parts) >= 2:
             first = " ".join(parts[:-1])
@@ -501,65 +536,25 @@ def find_person_match(person_name, person_mapping):
         else:
             first = person_name
             last = ""
+    
+    key = (normalize(first), normalize(last))
+    return person_index.get(key, [])
 
-    matches = []
-    for person in person_mapping:
-        # Get all possible first and last name variations
-        p_first = person.get("firstName", "")
-        p_last = person.get("lastName", "")
-        alt_firsts = person.get("alternativeFirstName", []) or []
-        alt_lasts = person.get("alternativeLastName", []) or []
-
-        # Build complete lists of all possible first and last names
-        all_firsts = []
-        if p_first:
-            all_firsts.append(p_first)
-        all_firsts.extend(alt_firsts)
-
-        all_lasts = []
-        if p_last:
-            all_lasts.append(p_last)
-        all_lasts.extend(alt_lasts)
-
-        # Check all combinations of (first, last) in both orders
-        matched = False
-        for af in all_firsts:
-            for al in all_lasts:
-                # Try direct match: (first, last)
-                if normalize(af) == normalize(first) and normalize(al) == normalize(last):
-                    matches.append(person)
-                    matched = True
-                    break
-                # Try swapped match: (last, first)
-                if normalize(af) == normalize(last) and normalize(al) == normalize(first):
-                    matches.append(person)
-                    matched = True
-                    break
-            if matched:
-                break
-
-    return matches
-
-import requests
 
 def resolve_author_duplicate(matches):
     """Prefer Person over External Person, then by visibility (internal), then by metadata richness (both internal and external)"""
     if not matches:
         return None
 
-    # Sort by: internal > external, then by visibility (for internal), then by metadata richness (for both)
     def score(person):
         internal = person.get("internal", False)
         external = person.get("external", False)
-        # Prefer internal
         type_score = 2 if internal else (1 if external else 0)
 
-        # For internal: prefer FREE or CAMPUS
         vis_score = 0
         if internal:
             internal_uuids = person.get("internalUUIDs", [])
             if internal_uuids and isinstance(internal_uuids, list) and len(internal_uuids) > 0:
-                # Handle dict format with visibility
                 if isinstance(internal_uuids[0], dict):
                     vis = internal_uuids[0].get("visibility", "")
                     if vis in ["FREE", "CAMPUS"]:
@@ -567,7 +562,6 @@ def resolve_author_duplicate(matches):
                     elif vis in ["BACKEND", "CONFIDENTIAL"]:
                         vis_score = 1
 
-        # For both internal and external: fetch full record for each UUID and pick the most complete
         metadata_score = 0
         
         if internal:
@@ -578,10 +572,18 @@ def resolve_author_duplicate(matches):
                 for uuid_obj in internal_uuids:
                     uuid_value = extract_uuid(uuid_obj)
                     if not API_KEY:
-                        # If no API key, skip API calls and just use first UUID
                         best_uuid = uuid_value
                         max_fields = 0
                         break
+                    
+                    # Check cache first
+                    if uuid_value in _person_metadata_cache:
+                        field_count = _person_metadata_cache[uuid_value]
+                        if field_count > max_fields:
+                            max_fields = field_count
+                            best_uuid = uuid_value
+                        continue
+                    
                     try:
                         response = requests.get(
                             f"{BASE_URL}persons/{uuid_value}",
@@ -593,13 +595,12 @@ def resolve_author_duplicate(matches):
                         )
                         if response.status_code == 200:
                             internal_person = response.json()
-                            # Count non-empty fields (excluding system ones)
                             field_count = sum(1 for k, v in internal_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
+                            _person_metadata_cache[uuid_value] = field_count
                             if field_count > max_fields:
                                 max_fields = field_count
                                 best_uuid = uuid_value 
                     except Exception as e:
-                        # Log error but continue - use this person anyway
                         pass
                 metadata_score = max_fields if best_uuid else 0
         
@@ -610,10 +611,18 @@ def resolve_author_duplicate(matches):
                 max_fields = -1
                 for uuid_value in external_uuids:
                     if not API_KEY:
-                        # If no API key, skip API calls and just use first UUID
                         best_uuid = uuid_value
                         max_fields = 0
                         break
+                    
+                    # Check cache first
+                    if uuid_value in _external_person_metadata_cache:
+                        field_count = _external_person_metadata_cache[uuid_value]
+                        if field_count > max_fields:
+                            max_fields = field_count
+                            best_uuid = uuid_value
+                        continue
+                    
                     try:
                         response = requests.get(
                             f"{BASE_URL}external-persons/{uuid_value}",
@@ -625,20 +634,20 @@ def resolve_author_duplicate(matches):
                         )
                         if response.status_code == 200:
                             external_person = response.json()
-                            # Count non-empty fields (excluding system ones)
                             field_count = sum(1 for k, v in external_person.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"] and v)
+                            _external_person_metadata_cache[uuid_value] = field_count
                             if field_count > max_fields:
                                 max_fields = field_count
                                 best_uuid = uuid_value
                     except Exception as e:
-                        # Log error but continue - use this person anyway
                         pass
                 metadata_score = max_fields if best_uuid else 0
 
         return (type_score, vis_score, metadata_score)
 
     sorted_matches = sorted(matches, key=score, reverse=True)
-    return sorted_matches[0]  # Return best match
+    return sorted_matches[0]
+
 
 def resolve_record_duplicate(records):
     """Choose record with most metadata or updated by real user"""
@@ -845,18 +854,25 @@ def parse_funders(funder_str):
     return [f.strip() for f in funder_str.split(";") if f.strip()]
 
 
-def find_funder_match(funder_name, organization_mapping):
-    """Find matching organization by name (case-insensitive exact match)"""
-    normalized_name = normalize(funder_name)
-    matches = []
+def build_organization_name_index(organization_mapping):
+    """Build index for O(1) organization name lookup"""
+    org_index = {}
     
     for org in organization_mapping:
         org_names = org.get("name", [])
         for org_name in org_names:
-            if normalize(org_name) == normalized_name:
-                matches.append(org)
+            normalized = normalize(org_name)
+            if normalized not in org_index:
+                org_index[normalized] = []
+            org_index[normalized].append(org)
+    
+    return org_index
 
-    return matches
+def find_funder_match(funder_name, org_index):
+    """Find matching organization using pre-built index"""
+    normalized_name = normalize(funder_name)
+    return org_index.get(normalized_name, [])
+
 
 def build_funding_organizations(funder_uuids_with_type):
     """
@@ -952,7 +968,7 @@ def parse_date(date_string):
     return (year, month, day)
 
 
-def update_record_from_dspace(pure_record, dspace_row, person_mapping, organization_mapping, log_entry, before_update_records, override_mode=False):
+def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, override_mode=False):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -1044,7 +1060,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         
         for contributor_name in contributor_names:
             print(f"    ➤ Checking match for {role}: '{contributor_name}'")
-            matches = find_person_match(contributor_name, person_mapping)
+            matches = find_person_match(contributor_name, person_index)
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
@@ -1262,7 +1278,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
         
         for funder_name in dspace_funders:
             print(f"    ➤ Looking up funder: '{funder_name}'")
-            matches = find_funder_match(funder_name, organization_mapping)
+            matches = find_funder_match(funder_name, org_index)
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
@@ -1550,7 +1566,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_mapping, organizat
     return updated_record, success
 
 
-def create_new_record_from_dspace(dspace_row, person_mapping, organization_mapping):
+def create_new_record_from_dspace(dspace_row, person_index, org_index):
     """Create new Pure record from DSpace row"""
     # Escape special characters in title first
     escaped_title = escape_special_chars(dspace_row.get("dc.title", "").strip())
@@ -1665,7 +1681,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
         
         for funder_name in dspace_funders:
             print(f"    ➤ Looking up funder: '{funder_name}'")
-            matches = find_funder_match(funder_name, organization_mapping)
+            matches = find_funder_match(funder_name, org_index)
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
@@ -1697,7 +1713,7 @@ def create_new_record_from_dspace(dspace_row, person_mapping, organization_mappi
         
         for contributor_name in contributor_names:
             print(f"    ➤ Checking match for {role}: '{contributor_name}'")
-            matches = find_person_match(contributor_name, person_mapping)
+            matches = find_person_match(contributor_name, person_index)
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
@@ -1929,6 +1945,14 @@ def main():
         organization_mapping = json.load(f)
     print(f"✅ Loaded {len(organization_mapping)} organization records from {ORGANIZATION_MAPPING_JSON}")
 
+    # Build indices
+    print("\n🔨 Building lookup indices...")
+    person_index = build_person_name_index(person_mapping)
+    print(f"✅ Built person name index with {len(person_index)} entries")
+    
+    org_index = build_organization_name_index(organization_mapping)
+    print(f"✅ Built organization name index with {len(org_index)} entries")
+
     # Prepare logs
     log_entries = []
     error_log = []
@@ -2103,7 +2127,7 @@ def main():
             log_entry["matchType"] = match_type
 
             try:
-                updated_record, success = update_record_from_dspace(record, row, person_mapping, organization_mapping, log_entry, before_update_records, override_mode=OVERRIDE_MODE)
+                updated_record, success = update_record_from_dspace(record, row, person_index, org_index, log_entry, before_update_records, override_mode=OVERRIDE_MODE)
                 log_entry["success"] = success
                 if success:
                     # Save to matched folder
@@ -2126,7 +2150,7 @@ def main():
         else:
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
-                new_record = create_new_record_from_dspace(row, person_mapping, organization_mapping)
+                new_record = create_new_record_from_dspace(row, person_index, org_index)
                 
                 # Skip record if no contributors were matched
                 if new_record is None:
