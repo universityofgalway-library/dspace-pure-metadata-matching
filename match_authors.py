@@ -16,6 +16,9 @@ IRISH_SURNAMES_JSON = "./author_matching/irish_surnames.json"  # New file with c
 OUTPUT_DIR = f"./author_matching/{TODAY}"
 HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
 
+GENERATE_INITIAL_VARIANTS = False  # Generate variants from existing initials (e.g., "J." -> "J", "J P", etc.)
+GENERATE_INITIALS_FROM_NAMES = False  # Generate initials from full names (e.g., "John" -> "J", "J.")
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configure logging to write to file and stdout
@@ -33,6 +36,11 @@ def print(*args, **kwargs):
     logging.info(' '.join(map(str, args)))
 
 # --- HELPER FUNCTIONS ---
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+    
 
 def normalize(s):
     """Normalize string: replace curly apostrophes in Irish surnames, strip + lower case"""
@@ -112,16 +120,16 @@ def build_irish_surname_index(json_file_path):
     return index
 
 
-def get_firstname_variants(first_name):
+def get_firstname_variants(first_name, generate_initial_variants=False, generate_initials_from_names=False):
     """
     Generate variants of a first name.
     Returns two lists:
     - all_variants: all variants for recording in alternativeFirstNames
     - matching_variants: only variants that should be used for matching
     
-    Matching logic:
-    - If input is initials (has dots or is short), use all variants for matching
-    - If input is a full name, DON'T use the generated initial variants for matching
+    Parameters:
+    - generate_initial_variants: If True, generate variants from existing initials (J. -> J, J P, etc.) for matching
+    - generate_initials_from_names: If True, generate initials from full names (John -> J, J.) for recording ONLY
     """
     if not first_name:
         return [], []
@@ -132,59 +140,61 @@ def get_firstname_variants(first_name):
     
     # Check if it's initials (contains dots or is very short)
     has_dots = '.' in name
-    has_spaces = ' ' in name
-    is_short = len(name.replace('.', '').replace(' ', '')) <= 3  # Likely initials if ≤3 chars
+    is_short = len(name.replace('.', '').replace(' ', '').replace('-', '')) <= 2  # Likely initials if ≤2 chars
     
     if has_dots or (is_short and len(name) <= 5):
-        # This is already initials - generate variants and use ALL for matching
-        words = name.split()
-        variants = {
-            name.replace('.', '').title(),  # Remove dots
-            ' '.join([w[0].upper() for w in words]),  # Initials no dots, with spaces
-            ''.join([w[0].upper() for w in words]),  # Initials no dots, no spaces
-            '.'.join([w[0].upper() for w in words]) + '.',  # Initials with dots, no spaces
-            '. '.join([w[0].upper() for w in words]) + '.',  # Initials with dots, with spaces
-            '.-'.join([w[0].upper() for w in words]) + '.',  # Initials with dots and hyphens, without spaces
-        }
-        all_variants.update(variants)
-        matching_variants.update(variants)  # Use all variants for matching
+        # This is already initials
+        if generate_initial_variants:
+            words = name.split()
+            variants = {
+                name.replace('.', '').title(),  # Remove dots
+                ' '.join([w[0].upper() for w in words]),  # Initials no dots, with spaces
+                ''.join([w[0].upper() for w in words]),  # Initials no dots, no spaces
+                '.'.join([w[0].upper() for w in words]) + '.',  # Initials with dots, no spaces
+                '. '.join([w[0].upper() for w in words]) + '.',  # Initials with dots, with spaces
+                '.-'.join([w[0].upper() for w in words]) + '.',  # Initials with dots and hyphens, without spaces
+            }
+            all_variants.update(variants)
+            matching_variants.update(variants)  # Use for matching
     
     else:
-        # This is a full name - extract initials for recording but NOT for matching
-        initials = []
-        
-        # Handle hyphenated names like "Mary-Jane" -> "M-J" or "M.-J."
-        if '-' in name:
-            parts = name.split('-')
-            initials = [p[0].upper() for p in parts if p]
-            # Add hyphenated initials
-            all_variants.add('-'.join(initials))
-            all_variants.add('-'.join([i + '.' for i in initials]))
-        else:
-            # Simple name
-            parts = name.split()
-            if parts:
-                initials = [p[0].upper() for p in parts]
-        
-        # Add simple initial variants (for recording only, not matching)
-        if len(initials) > 0:
-            all_variants.add(initials[0])  # "J"
-            all_variants.add(initials[0] + '.')  # "J."
+        # This is a full name
+        if generate_initials_from_names:
+            initials = []
             
-            # If multiple initials, add combined versions
-            if len(initials) > 1:
-                all_variants.add(''.join(initials))  # "JP"
-                all_variants.add(' '.join(initials))  # "J P"
-                all_variants.add('.'.join(initials) + '.')  # "J.P."
-                all_variants.add('. '.join(initials) + '.')  # "J. P."
-        
-        # For full names: matching_variants remains empty (don't match on generated initials)
+            # Handle hyphenated names like "Mary-Jane" -> "M-J" or "M.-J."
+            if '-' in name:
+                parts = name.split('-')
+                initials = [p[0].upper() for p in parts if p]
+                # Add hyphenated initials
+                all_variants.add('-'.join(initials))
+                all_variants.add('-'.join([i + '.' for i in initials]))
+            else:
+                # Simple name
+                parts = name.split()
+                if parts:
+                    initials = [p[0].upper() for p in parts]
+            
+            # Add simple initial variants (for recording only, NOT matching)
+            if len(initials) > 0:
+                all_variants.add(initials[0])  # "J"
+                all_variants.add(initials[0] + '.')  # "J."
+                
+                # If multiple initials, add combined versions
+                if len(initials) > 1:
+                    all_variants.add(''.join(initials))  # "JP"
+                    all_variants.add(' '.join(initials))  # "J P"
+                    all_variants.add('.'.join(initials) + '.')  # "J.P."
+                    all_variants.add('. '.join(initials) + '.')  # "J. P."
+            
+            # NEVER add to matching_variants - these are for recording only
     
     # Remove the original name from variants (we'll add it separately)
     all_variants.discard(name)
     matching_variants.discard(name)
     
     return list(all_variants), list(matching_variants)
+
 
 def get_surname_variants_from_list(surname, irish_surname_index):
     """
@@ -290,7 +300,7 @@ def get_organizations_from_pure_person(person, is_internal=True):
     return list(set(internal_orgs)), list(set(external_orgs)), primary_internal_org  # Return both lists, deduplicated, + primary association
 
 
-def build_index_persons(person_list, irish_surname_index, is_internal=True):
+def build_index_persons(person_list, irish_surname_index, is_internal=True, generate_initial_variants=False, generate_initials_from_names=False):
     """
     Build a lookup index with Irish surname variant handling from canonical list.
     """
@@ -327,7 +337,7 @@ def build_index_persons(person_list, irish_surname_index, is_internal=True):
         if not all_first_names or not all_last_names:
             continue
 
-        # ✅ Use new function for surname variants
+        # Use new function for surname variants
         all_name_variants = [
             (norm_f_var, variant, first, last)
             for first in all_first_names
@@ -335,7 +345,7 @@ def build_index_persons(person_list, irish_surname_index, is_internal=True):
             for variant in get_surname_variants_from_list(last, irish_surname_index)['variants']
             for norm_f_var in (
                 {normalize(first)} |
-                {normalize(v) for v in get_firstname_variants(first)[1]} # Only use matching variants for indexing
+                {normalize(v) for v in get_firstname_variants(first, generate_initial_variants, generate_initials_from_names)[1]}  # [1] = matching_variants
             )
         ]
 
@@ -369,7 +379,7 @@ def build_index_persons(person_list, irish_surname_index, is_internal=True):
     return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid, primary_internal_org_by_uuid
 
 
-def enrich_authors(authors, internal_index, external_index, irish_surname_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, internal_primary_org_by_uuid=None, external_primary_org_by_uuid=None, output_option="all"):
+def enrich_authors(authors, internal_index, external_index, irish_surname_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, internal_primary_org_by_uuid=None, external_primary_org_by_uuid=None, output_option="all", generate_initial_variants=False, generate_initials_from_names=False):
     """
     Enrich authors with Pure match data using canonical Irish surname list.
     """
@@ -385,7 +395,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             parts = first.split()
             first = ' '.join([capitalize_after_hyphen(p.capitalize()) for p in parts])
         
-        # ✅ Use canonical form from list for last name
+        # Use canonical form from list for last name
         if last:
             last = capitalize_after_hyphen(last)
 
@@ -393,15 +403,15 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             filtered_out_count += 1
             continue
 
-        # ✅ Get surname variants from canonical list
+        # Get surname variants from canonical list
         surname_result = get_surname_variants_from_list(last, irish_surname_index)
         surname_variants = surname_result['variants']
         canonical_last_name = surname_result['canonical']
         surname_alternatives = surname_result['alternatives']
         
-        # Normalize for matching
+        # Normalize for matching - only use matching_variants [1]
         norm_first = normalize(first)
-        norm_first_variants = {norm_first} | {normalize(v) for v in get_firstname_variants(first)[1]}   # Only use matching variants for lookup 
+        norm_first_variants = {norm_first} | {normalize(v) for v in get_firstname_variants(first, generate_initial_variants, generate_initials_from_names)[1]}  # [1] = matching_variants
         
         # Try to find matches with surname variants
         internal_matches = []
@@ -432,7 +442,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             if internal_alt_names and uuid in internal_alt_names:
                 for orig_first, orig_last in internal_alt_names[uuid]:
                     alt_first = capitalize_after_hyphen(orig_first.capitalize())
-                    # ✅ Get canonical form from list (preserves original capitalization)
+                    # Get canonical form from list (preserves original capitalization)
                     alt_last_result = get_surname_variants_from_list(orig_last, irish_surname_index)
                     alt_last = alt_last_result['canonical']
                     if alt_first != first:
@@ -444,7 +454,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             if external_alt_names and uuid in external_alt_names:
                 for orig_first, orig_last in external_alt_names[uuid]:
                     alt_first = capitalize_after_hyphen(orig_first.capitalize())
-                    # ✅ Get canonical form from list (preserves original capitalization)
+                    # Get canonical form from list (preserves original capitalization)
                     alt_last_result = get_surname_variants_from_list(orig_last, irish_surname_index)
                     alt_last = alt_last_result['canonical']
                     if alt_first != first:
@@ -452,13 +462,13 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
                     if alt_last != canonical_last_name:
                         alternative_lastnames.add(alt_last)
         
-        # Add first name variants
-        first_name_variants = get_firstname_variants(first)[0] # Get all variants for recording 
+        # Add first name variants - use all_variants [0] for recording
+        first_name_variants = get_firstname_variants(first, generate_initial_variants, generate_initials_from_names)[0]  # [0] = all_variants
         for variant in first_name_variants:
             if variant != first:
                 alternative_firstnames.add(variant)
         
-        # ✅ Add surname alternatives from canonical list (preserve original capitalization)
+        # Add surname alternatives from canonical list (preserve original capitalization)
         for alt in surname_alternatives:
             if alt != canonical_last_name:
                 alternative_lastnames.add(alt)
@@ -510,7 +520,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
                         "title": paper.get("title", "").strip()
                     })
 
-        # ✅ Use canonical last name from list
+        # Use canonical last name from list
         enriched_author = {
             **author,
             "lastName": canonical_last_name,
@@ -550,7 +560,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
     return enriched
 
 
-def analyse_persons(json_file_path):
+def analyze_persons(json_file_path):
     with open(json_file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
@@ -635,6 +645,10 @@ def main():
         "matched_external_duplicates",
         "matched_internal_external_duplicates"
     ], help="Single output option to generate (if not specified, all options are generated)")
+    parser.add_argument("--generate-initial-variants", action="store_true", 
+                       help="Generate variants from existing initials (e.g., J. -> J, J P, etc.) and use for matching")
+    parser.add_argument("--generate-initials-from-names", action="store_true",
+                       help="Generate initials from full names (e.g., John -> J, J.) for recording ONLY (never used for matching)")
 
     args = parser.parse_args()
 
@@ -643,12 +657,20 @@ def main():
     internal_persons = load_json(Pure_Internal_JSON)
     external_persons = load_json(Pure_External_JSON)
     
-    # ✅ Build Irish surname index from JSON
+    # Build Irish surname index from JSON
     irish_surname_index = build_irish_surname_index(IRISH_SURNAMES_JSON)
 
-    # ✅ Pass irish_surname_index to build_index_persons
-    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid, internal_primary_org_by_uuid = build_index_persons(internal_persons, irish_surname_index, is_internal=True)
-    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid, external_primary_org_by_uuid = build_index_persons(external_persons, irish_surname_index, is_internal=False)
+    # Pass configuration flags to build_index_persons
+    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid, internal_primary_org_by_uuid = build_index_persons(
+        internal_persons, irish_surname_index, is_internal=True,
+        generate_initial_variants=args.generate_initial_variants,
+        generate_initials_from_names=args.generate_initials_from_names
+    )
+    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid, external_primary_org_by_uuid = build_index_persons(
+        external_persons, irish_surname_index, is_internal=False,
+        generate_initial_variants=args.generate_initial_variants,
+        generate_initials_from_names=args.generate_initials_from_names
+    )
 
     output_options = [
         ("all", "All authors"),
@@ -671,7 +693,7 @@ def main():
 
     for option, description in selected_options:
         print(f"\n--- Processing: {description} ---")
-        # ✅ Pass irish_surname_index to enrich_authors
+        # Pass configuration flags to enrich_authors
         enriched = enrich_authors(
             input_authors,
             internal_index,
@@ -686,7 +708,9 @@ def main():
             internal_visibility_by_uuid,
             internal_primary_org_by_uuid,
             external_primary_org_by_uuid,
-            output_option=option
+            output_option=option,
+            generate_initial_variants=args.generate_initial_variants,
+            generate_initials_from_names=args.generate_initials_from_names
         )
 
         filename = f"{args.prefix}_{option}_{TODAY}.json"
@@ -695,17 +719,10 @@ def main():
             json.dump(enriched, f, indent=4, ensure_ascii=False)
 
         print(f"✅ Output saved to: {filepath}")
-        analyse_persons(filepath)
+        analyze_persons(filepath)
 
     print("\n🎉 All outputs generated!")
 
 
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-
 if __name__ == "__main__":
-    from datetime import datetime
     main()
