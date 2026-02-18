@@ -1710,8 +1710,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # --- 10. Set workflow step ---
     updated_record["workflow"] = {
-        "step": "approved"
+        "step": "validated"
     }
+
+    #    {
+    #   "step": "validated",
+    #   "description": {
+    #     "en_IE": "Validated by Library"
+    #   }
 
     # Write log entry
     log_entry["success"] = success and not errors
