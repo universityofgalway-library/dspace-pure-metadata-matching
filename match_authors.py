@@ -9,7 +9,7 @@ from datetime import date
 # --- CONFIGURATION ---
 TODAY = date.today().isoformat()
 
-DSpace_Authors_JSON = "./author_matching/dspace_test_authors_2026-02-11.json"
+DSpace_Authors_JSON = "./author_matching/dspace_test_authors_2026-02-13.json"
 Pure_Internal_JSON = "./pure_entities/2026-02-03/pure_test_persons_2026-02-03.json"
 Pure_External_JSON = "./pure_entities/2026-02-03/pure_test_external-persons_2026-02-03.json"
 IRISH_SURNAMES_JSON = "./author_matching/irish_surnames.json"  # New file with canonical Irish surnames and their variants   
@@ -248,6 +248,24 @@ def normalize_surname_for_output(surname, irish_surname_index):
     return result['canonical']
 
 
+def get_identifiers_from_pure_person(person):
+    """
+    Extract ORCID and Scopus Author ID from a Pure internal person record.
+    Returns (orcid, scopus_id) as strings, or empty strings if not found.
+    """
+    orcid = person.get("orcid", "")
+    
+    scopus_id = ""
+    for identifier in person.get("identifiers", []):
+        if isinstance(identifier.get("type"), dict):
+            uri = identifier["type"].get("uri", "")
+            if uri == "/dk/atira/pure/person/personsources/scopusauthor":
+                scopus_id = identifier.get("id", "")
+                break
+    
+    return orcid, scopus_id
+
+
 def get_organizations_from_pure_person(person, is_internal=True):
     """Extract organization UUIDs from Pure person record"""
     internal_orgs = []
@@ -301,15 +319,14 @@ def get_organizations_from_pure_person(person, is_internal=True):
 
 
 def build_index_persons(person_list, irish_surname_index, is_internal=True, generate_initial_variants=False, generate_initials_from_names=False):
-    """
-    Build a lookup index with Irish surname variant handling from canonical list.
-    """
     index = {}
     alt_names_by_uuid = {}
     internal_orgs_by_uuid = {}
     external_orgs_by_uuid = {}
     primary_internal_org_by_uuid = {}
     visibility_by_uuid = {}
+    orcid_by_uuid = {}        
+    scopus_id_by_uuid = {}    
 
     for person in person_list:
         uuid = person.get("uuid")
@@ -320,6 +337,19 @@ def build_index_persons(person_list, irish_surname_index, is_internal=True, gene
             visibility = person.get("visibility", {})
             vis_key = visibility.get("key", "")
             visibility_by_uuid[uuid] = vis_key
+
+            # Extract and store ORCID and Scopus ID for internal persons only
+            orcid, scopus_id = get_identifiers_from_pure_person(person)
+            if orcid:
+                if uuid in orcid_by_uuid:
+                    print(f"⚠️ WARNING: Multiple ORCIDs found for internal UUID {uuid}: existing='{orcid_by_uuid[uuid]}', new='{orcid}'")
+                else:
+                    orcid_by_uuid[uuid] = orcid
+            if scopus_id:
+                if uuid in scopus_id_by_uuid:
+                    print(f"⚠️ WARNING: Multiple Scopus IDs found for internal UUID {uuid}: existing='{scopus_id_by_uuid[uuid]}', new='{scopus_id}'")
+                else:
+                    scopus_id_by_uuid[uuid] = scopus_id
 
         primary_first = person.get("name", {}).get("firstName", "")
         primary_last = person.get("name", {}).get("lastName", "")
@@ -376,10 +406,13 @@ def build_index_persons(person_list, irish_surname_index, is_internal=True, gene
         if primary_int_org:
             primary_internal_org_by_uuid[uuid] = primary_int_org
 
-    return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid, primary_internal_org_by_uuid
+    return index, alt_names_by_uuid, internal_orgs_by_uuid, external_orgs_by_uuid, visibility_by_uuid, primary_internal_org_by_uuid, orcid_by_uuid, scopus_id_by_uuid 
 
 
-def enrich_authors(authors, internal_index, external_index, irish_surname_index, internal_alt_names=None, external_alt_names=None, internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, internal_visibility_by_uuid=None, internal_primary_org_by_uuid=None, external_primary_org_by_uuid=None, output_option="all", generate_initial_variants=False, generate_initials_from_names=False):
+def enrich_authors(authors, internal_index, external_index, irish_surname_index, internal_alt_names=None, external_alt_names=None, 
+                   internal_internal_orgs=None, internal_external_orgs=None, external_internal_orgs=None, external_external_orgs=None, 
+                   internal_visibility_by_uuid=None, internal_primary_org_by_uuid=None, external_primary_org_by_uuid=None, 
+                   internal_orcid_by_uuid=None, internal_scopus_id_by_uuid=None,output_option="all", generate_initial_variants=False, generate_initials_from_names=False):
     """
     Enrich authors with Pure match data using canonical Irish surname list.
     """
@@ -437,6 +470,11 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
         # Extract alternative names from matches
         alternative_firstnames = set()
         alternative_lastnames = set()
+
+        orcid_values = set()
+        scopus_id_values = set()
+        orcid_out = ""       
+        scopus_id_out = ""    
 
         for uuid in internal_matches:
             if internal_alt_names and uuid in internal_alt_names:
@@ -497,6 +535,23 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             if not primary_internal_organisation and internal_primary_org_by_uuid and uuid in internal_primary_org_by_uuid:
                 primary_internal_organisation = internal_primary_org_by_uuid[uuid]
 
+            # Collect ORCID and Scopus ID from internal matches
+            orcid_values = set()
+            scopus_id_values = set()
+            for uuid in internal_matches:
+                if internal_orcid_by_uuid and uuid in internal_orcid_by_uuid:
+                    orcid_values.add(internal_orcid_by_uuid[uuid])
+                if internal_scopus_id_by_uuid and uuid in internal_scopus_id_by_uuid:
+                    scopus_id_values.add(internal_scopus_id_by_uuid[uuid])
+
+            if len(orcid_values) > 1:
+                print(f"⚠️ WARNING: Multiple distinct ORCIDs for author '{first} {last}': {orcid_values}")
+            if len(scopus_id_values) > 1:
+                print(f"⚠️ WARNING: Multiple distinct Scopus IDs for author '{first} {last}': {scopus_id_values}")
+
+            orcid_out = next(iter(orcid_values), "")
+            scopus_id_out = next(iter(scopus_id_values), "")
+
         for uuid in external_matches:
             if external_internal_orgs and uuid in external_internal_orgs:
                 internal_organizations.extend(external_internal_orgs[uuid])
@@ -524,6 +579,8 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
         enriched_author = {
             **author,
             "lastName": canonical_last_name,
+            "orcid": orcid_out,           
+            "scopusId": scopus_id_out,    
             "papers": unique_papers,
             "paperCount": len(unique_papers),
             "internal": len(internal_matches) > 0,
@@ -646,7 +703,7 @@ def main():
         "matched_internal_external_duplicates"
     ], help="Single output option to generate (if not specified, all options are generated)")
     parser.add_argument("--generate-initial-variants", action="store_true", 
-                       help="Generate variants from existing initials (e.g., J. -> J, J P, etc.) and use for matching")
+                       help="Generate variants from existing initials (e.g., J. -> J, etc.) and use for matching")
     parser.add_argument("--generate-initials-from-names", action="store_true",
                        help="Generate initials from full names (e.g., John -> J, J.) for recording ONLY (never used for matching)")
 
@@ -661,12 +718,12 @@ def main():
     irish_surname_index = build_irish_surname_index(IRISH_SURNAMES_JSON)
 
     # Pass configuration flags to build_index_persons
-    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid, internal_primary_org_by_uuid = build_index_persons(
+    internal_index, internal_alt_names, internal_internal_orgs, internal_external_orgs, internal_visibility_by_uuid, internal_primary_org_by_uuid, internal_orcid_by_uuid, internal_scopus_id_by_uuid = build_index_persons(
         internal_persons, irish_surname_index, is_internal=True,
         generate_initial_variants=args.generate_initial_variants,
         generate_initials_from_names=args.generate_initials_from_names
     )
-    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid, external_primary_org_by_uuid = build_index_persons(
+    external_index, external_alt_names, external_internal_orgs, external_external_orgs, external_visibility_by_uuid, external_primary_org_by_uuid, _orcid_unused, _scopus_unused = build_index_persons(
         external_persons, irish_surname_index, is_internal=False,
         generate_initial_variants=args.generate_initial_variants,
         generate_initials_from_names=args.generate_initials_from_names
@@ -708,6 +765,8 @@ def main():
             internal_visibility_by_uuid,
             internal_primary_org_by_uuid,
             external_primary_org_by_uuid,
+            internal_orcid_by_uuid,      
+            internal_scopus_id_by_uuid,   
             output_option=option,
             generate_initial_variants=args.generate_initial_variants,
             generate_initials_from_names=args.generate_initials_from_names
