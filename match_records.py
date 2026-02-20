@@ -718,7 +718,7 @@ def resolve_record_duplicate(records):
 
 
 def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
-                             license_type="UNSPECIFIED", embargo_end_date=None):
+                             license_type=None, embargo_end_date=None):
     """
     Build electronic version object ONLY when a DOI exists.
     If no DOI is supplied, return None (Pure must not receive an electronicVersion entry).
@@ -732,13 +732,15 @@ def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
         "accessType": {
             "uri": f"/dk/atira/pure/core/openaccesspermission/{access_type.lower()}"
         },
-        "licenseType": {
-            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-        },
         "versionType": {
             "uri": version_type_uri
         }
     }
+
+    if license_type:
+        ev["licenseType"] = {
+            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
+        }
 
     if embargo_end_date:
         ev["embargoPeriod"] = {
@@ -1500,9 +1502,21 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     new_publisher_ev = None
     if publisher_doi:
         publisher_doi = normalize_doi(publisher_doi)
-        # Check if already present
-        if publisher_doi not in existing_publisher_dois:
-            # Add as new electronic version
+        # Check if it's actually a repository DOI
+        if "10.13025" in publisher_doi:
+            if publisher_doi not in existing_repo_dois:
+                access_type = "EMBARGOED" if embargo_active else "OPEN"
+                ev = build_electronic_version(
+                    doi=publisher_doi,
+                    version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
+                    access_type=access_type,
+                    license_type="CC_BY_NC_ND"
+                )
+                if embargo_active and ev:
+                    ev["embargoPeriod"] = {"endDate": embargo_date}
+                if ev:
+                    repo_ev = ev
+        elif publisher_doi not in existing_publisher_dois:
             ev = build_electronic_version(
                 doi=publisher_doi,
                 version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion",
@@ -2073,12 +2087,28 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     if publisher_doi:
         publisher_doi = normalize_doi(publisher_doi)
-        ev = build_electronic_version(
-            publisher_doi, 
-            "/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion"
-        )
-        if ev:
-            electronic_versions.append(ev)
+        if "10.13025" in publisher_doi:
+            # Treat as repo DOI if not already added
+            already_added = any("10.13025" in ev.get("doi", "") for ev in electronic_versions)
+            if not already_added:
+                access_type = "EMBARGOED" if embargo_active else "OPEN"
+                ev = build_electronic_version(
+                    publisher_doi,
+                    "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
+                    access_type=access_type,
+                    license_type="CC_BY_NC_ND"
+                )
+                if embargo_active and ev and embargo_date:
+                    ev["embargoPeriod"] = {"endDate": embargo_date}
+                if ev:
+                    electronic_versions.insert(0, ev)
+        else:
+            ev = build_electronic_version(
+                publisher_doi,
+                "/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion"
+            )
+            if ev:
+                electronic_versions.append(ev)
     
     # Set electronic versions on record
     if electronic_versions:
