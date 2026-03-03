@@ -348,21 +348,20 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["create", "update"], help="Mode for single file upload")
     parser.add_argument("--test", type=bool, default=True, help="Get data from UAT (--test True) or Production (--test False)")
     parser.add_argument("--data", default= "research-outputs", choices=["research-outputs", "persons", "external-persons", 
-                        "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to get from Pure")
+                        "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to upload to Pure")
+    parser.add_argument("--log-dir", default=None, help=("Directory to save logs.")
+    )
     args = parser.parse_args()
 
-    LOG_DIR = f"./matching_test/test_output_{TODAY_DATE}/logs/uploader_logs"
+    LOG_DIR = f"{args.log_dir}/uploader_logs/"
     os.makedirs(LOG_DIR, exist_ok=True)
     ERROR_LOG_PATH = os.path.join(LOG_DIR, f"uploader_errors_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
     # Load environment variables from .env file
     load_dotenv()
 
-    if args.mode == "update":
-        # You need ROOT access API key to update keywords
-        API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
-    else:
-        API_KEY = os.getenv("PURE_API_KEY", "")
+
+    API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
 
     if not API_KEY:
         print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")

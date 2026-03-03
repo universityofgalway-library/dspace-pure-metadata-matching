@@ -22,9 +22,9 @@ TODAY = date.today().isoformat()
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-02-12.csv"
-PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-02-03.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-02-12/test_authors_all_2026-02-12.json"
-ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-01-21.json"
+PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-02.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
 OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -35,6 +35,8 @@ BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+PUNC = set('''—!–¿()-[]{};:'"‘’“”‐\,<>./?@#$%^&=+|£€*_~®™©0123456789''')
 
 
 # --- TYPE MAPPING ---
@@ -162,6 +164,14 @@ def strip_system_fields(record):
 
 def normalize(s):
     return s.strip().lower() if s else ""
+
+
+def normalize_funder_name(s):
+    """Normalize funder name: lowercase, replace punctuation with spaces, collapse whitespace."""
+    if not s:
+        return ""
+    result = "".join(" " if char in PUNC else char for char in s.lower())
+    return " ".join(result.split())  # collapse multiple spaces
 
 
 def map_language(lang, lang_map=LANG_MAP):
@@ -311,8 +321,7 @@ def type_requires_peer_review(type_discriminator):
         "WorkingPaper",
         "ContributionToPeriodical",
         "Thesis",
-        "Memorandum",
-        "NonTextual"
+        "Memorandum"
     }
     return type_discriminator not in types_without_peer_review
 
@@ -448,12 +457,12 @@ def build_contributor(matched_person, role, pure_type_key):
                 "uuid": uuid_value
             }
         }
-        # For internal authors, ONLY use primaryOrganisationAssociation
-        if "primaryOrganisationAssociation" in matched_person and matched_person["primaryOrganisationAssociation"]:
+        # For internal authors, ONLY use primaryInternalOrganization
+        if "primaryInternalOrganization" in matched_person and matched_person["primaryInternalOrganization"]:
             contributor["organizations"] = [
                 {
                     "systemName": "Organization",
-                    "uuid": matched_person["primaryOrganisationAssociation"]
+                    "uuid": matched_person["primaryInternalOrganization"]
                 }
             ]
 
@@ -510,27 +519,39 @@ def build_person_name_index(person_mapping):
     person_index = {}
     
     for person in person_mapping:
+        # --- NEW: Pre-index this person's known paper identifiers ---
+        paper_dois = set()
+        paper_handles = set()
+        paper_titles = set()
+        for paper in person.get("papers", []):
+            if doi := paper.get("doi", ""):
+                paper_dois.add(normalize_doi(doi.strip().lower()))
+            if handle := paper.get("handle", ""):
+                paper_handles.add(normalize_handle(handle.strip().lower()))
+            if title := paper.get("title", ""):
+                paper_titles.add(normalize(title))
+        person["_paper_dois"] = paper_dois
+        person["_paper_handles"] = paper_handles
+        person["_paper_titles"] = paper_titles
+        # --- END NEW ---
+
         p_first = person.get("firstName", "")
         p_last = person.get("lastName", "")
         alt_firsts = person.get("alternativeFirstName", []) or []
         alt_lasts = person.get("alternativeLastName", []) or []
         
-        # Build complete lists
         all_firsts = [p_first] if p_first else []
         all_firsts.extend(alt_firsts)
         all_lasts = [p_last] if p_last else []
         all_lasts.extend(alt_lasts)
         
-        # Index all combinations
         for af in all_firsts:
             for al in all_lasts:
-                # Normal order: (first, last)
                 key1 = (normalize(af), normalize(al))
                 if key1 not in person_index:
                     person_index[key1] = []
                 person_index[key1].append(person)
                 
-                # Swapped order: (last, first)
                 key2 = (normalize(al), normalize(af))
                 if key2 not in person_index:
                     person_index[key2] = []
@@ -608,35 +629,60 @@ def batch_fetch_person_metadata(person_uuids, api_key, base_url, is_external=Fal
     return results
 
 
-def resolve_author_duplicate(matches):
-    """Prefer Person over External Person, then by visibility (internal), then by metadata richness (both internal and external)"""
+def resolve_author_duplicate(matches, paper_dois=None, paper_handles=None, paper_title=None):
+    """
+    Prefer Person over External Person, then by visibility (internal),
+    then by metadata richness.
+
+    NEW: If a candidate's pre-indexed paper set contains any of the current
+    record's DOIs, handles, or title, that candidate scores highest
+    regardless of internal/external status — it is a confirmed match.
+
+    Args:
+        matches:        List of candidate person dicts from person_index.
+        paper_dois:     Set of normalised DOIs for the current DSpace record.
+        paper_handles:  Set of normalised handles for the current DSpace record.
+        paper_title:    Normalised title string for the current DSpace record.
+    """
     if not matches:
         return None
 
-    # Collect all UUIDs that need metadata fetching
+    paper_dois = paper_dois or set()
+    paper_handles = paper_handles or set()
+
+    # Batch-fetch metadata
     internal_uuids_to_fetch = []
     external_uuids_to_fetch = []
     
     for person in matches:
         if person.get("internal", False):
-            internal_uuids = person.get("internalUUIDs", [])
-            for uuid_obj in internal_uuids:
+            for uuid_obj in person.get("internalUUIDs", []):
                 uuid_value = extract_uuid(uuid_obj)
                 if uuid_value not in _person_metadata_cache:
                     internal_uuids_to_fetch.append(uuid_value)
         elif person.get("external", False):
-            external_uuids = person.get("externalUUIDs", [])
-            for uuid_value in external_uuids:
+            for uuid_value in person.get("externalUUIDs", []):
                 if uuid_value not in _external_person_metadata_cache:
                     external_uuids_to_fetch.append(uuid_value)
     
-    # Batch fetch all needed metadata
     if internal_uuids_to_fetch and API_KEY:
         batch_fetch_person_metadata(internal_uuids_to_fetch, API_KEY, BASE_URL, is_external=False)
     if external_uuids_to_fetch and API_KEY:
         batch_fetch_person_metadata(external_uuids_to_fetch, API_KEY, BASE_URL, is_external=True)
 
     def score(person):
+        person_dois    = person.get("_paper_dois", set())
+        person_handles = person.get("_paper_handles", set())
+        person_titles  = person.get("_paper_titles", set())
+
+        paper_score = 0
+        if paper_dois & person_dois:
+            paper_score = 3          # DOI match — strongest signal
+        elif paper_handles & person_handles:
+            paper_score = 2          # Handle match
+        elif paper_title and paper_title in person_titles:
+            paper_score = 1          # Title match — weakest but still evidence
+
         internal = person.get("internal", False)
         external = person.get("external", False)
         type_score = 2 if internal else (1 if external else 0)
@@ -644,50 +690,33 @@ def resolve_author_duplicate(matches):
         vis_score = 0
         if internal:
             internal_uuids = person.get("internalUUIDs", [])
-            if internal_uuids and isinstance(internal_uuids, list) and len(internal_uuids) > 0:
-                if isinstance(internal_uuids[0], dict):
-                    vis = internal_uuids[0].get("visibility", "")
-                    if vis in ["FREE", "CAMPUS"]:
-                        vis_score = 2
-                    elif vis in ["BACKEND", "CONFIDENTIAL"]:
-                        vis_score = 1
+            if internal_uuids and isinstance(internal_uuids[0], dict):
+                vis = internal_uuids[0].get("visibility", "")
+                if vis in ["FREE", "CAMPUS"]:
+                    vis_score = 2
+                elif vis in ["BACKEND", "CONFIDENTIAL"]:
+                    vis_score = 1
 
         metadata_score = 0
-        
         if internal:
-            internal_uuids = person.get("internalUUIDs", [])
-            if internal_uuids:
-                max_fields = -1
-                for uuid_obj in internal_uuids:
-                    uuid_value = extract_uuid(uuid_obj)
-                    if not API_KEY:
-                        max_fields = 0
-                        break
-                    
-                    # Cache is already populated by batch fetch
-                    field_count = _person_metadata_cache.get(uuid_value, 0)
-                    if field_count > max_fields:
-                        max_fields = field_count
-                
-                metadata_score = max_fields
-        
+            for uuid_obj in person.get("internalUUIDs", []):
+                uuid_value = extract_uuid(uuid_obj)
+                if not API_KEY:
+                    break
+                field_count = _person_metadata_cache.get(uuid_value, 0)
+                if field_count > metadata_score:
+                    metadata_score = field_count
         elif external:
-            external_uuids = person.get("externalUUIDs", [])
-            if external_uuids:
-                max_fields = -1
-                for uuid_value in external_uuids:
-                    if not API_KEY:
-                        max_fields = 0
-                        break
-                    
-                    # Cache is already populated by batch fetch
-                    field_count = _external_person_metadata_cache.get(uuid_value, 0)
-                    if field_count > max_fields:
-                        max_fields = field_count
-                
-                metadata_score = max_fields
+            for uuid_value in person.get("externalUUIDs", []):
+                if not API_KEY:
+                    break
+                field_count = _external_person_metadata_cache.get(uuid_value, 0)
+                if field_count > metadata_score:
+                    metadata_score = field_count
 
-        return (type_score, vis_score, metadata_score)
+        # paper_score is the leading sort key — a confirmed paper match
+        # always wins over a non-confirmed one before any other signal is considered.
+        return (paper_score, type_score, vis_score, metadata_score)
 
     sorted_matches = sorted(matches, key=score, reverse=True)
     return sorted_matches[0]
@@ -897,35 +926,6 @@ def validate_and_fix_organizations(contributors, api_key, base_url):
     return updated_contributors
 
 
-def collect_validated_organizations(contributors):
-    """
-    Collect all validated organizations from contributors.
-    Returns tuple: (internal_org_uuids, external_org_uuids)
-    """
-    internal_org_uuids = set()
-    external_org_uuids = set()
-    
-    for contributor in contributors:
-        if not contributor:
-            continue
-        
-        # Collect internal organizations
-        if "organizations" in contributor:
-            for org in contributor["organizations"]:
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    internal_org_uuids.add(org_uuid)
-        
-        # Collect external organizations
-        if "externalOrganizations" in contributor:
-            for org in contributor["externalOrganizations"]:
-                org_uuid = org.get("uuid")
-                if org_uuid:
-                    external_org_uuids.add(org_uuid)
-    
-    return list(internal_org_uuids), list(external_org_uuids)
-
-
 def resolve_funder_duplicate(matches, api_key, base_url):
     """
     Resolve duplicate organization matches for funders.
@@ -966,6 +966,7 @@ def parse_funders(funder_str):
     return [f.strip() for f in funder_str.split(";") if f.strip()]
 
 
+
 def build_organization_name_index(organization_mapping):
     """Build index for O(1) organization name lookup"""
     org_index = {}
@@ -973,7 +974,7 @@ def build_organization_name_index(organization_mapping):
     for org in organization_mapping:
         org_names = org.get("name", [])
         for org_name in org_names:
-            normalized = normalize(org_name)
+            normalized = normalize_funder_name(org_name)
             if normalized not in org_index:
                 org_index[normalized] = []
             org_index[normalized].append(org)
@@ -983,7 +984,7 @@ def build_organization_name_index(organization_mapping):
 
 def find_funder_match(funder_name, org_index):
     """Find matching organization using pre-built index"""
-    normalized_name = normalize(funder_name)
+    normalized_name = normalize_funder_name(funder_name)
     return org_index.get(normalized_name, [])
 
 
@@ -1172,7 +1173,23 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # Process DSpace contributors by role and build final contributors list
     final_contributors = []
+    
+    # Collect record-level identifiers for paper-evidence scoring
+    _record_paper_dois    = set()
+    _record_paper_handles = set()
+    _record_paper_title   = normalize(dspace_row.get("dc.title", "").strip())
 
+    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
+    if publisher_doi_raw:
+        _record_paper_dois.add(normalize_doi(publisher_doi_raw))
+
+    for _doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        _record_paper_dois.add(normalize_doi(_doi))
+
+    for _handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        _record_paper_handles.add(normalize_handle(_handle))
+
+    # Contributor processing 
     for role, contributor_names in contributors_by_role.items():
         print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
         
@@ -1182,7 +1199,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
-                matched_person = resolve_author_duplicate(matches)
+                matched_person = resolve_author_duplicate(
+                    matches,
+                    paper_dois=_record_paper_dois,
+                    paper_handles=_record_paper_handles,
+                    paper_title=_record_paper_title,
+                )
                 
                 if not matched_person:
                     print(f"        ❌ ERROR: resolve_author_duplicate returned None for {len(matches)} matches!")
@@ -1254,65 +1276,73 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         updated_record["contributors"] = final_contributors
     
     # --- 1a. Collect ALL validated organizations from ALL contributors ---
-    all_internal_org_uuids, all_external_org_uuids = collect_validated_organizations(
-        final_contributors if final_contributors else []
-    )
-    
-    # In override mode, replace organizations entirely
-    # In precedence mode, only add if not already present
+    # Internal contributors -> "organizations" (primaryInternalOrganization)
+    # External contributors -> "externalOrganizations" (all their external orgs)
+    all_internal_org_uuids = []
+    all_external_org_uuids = []
+    seen_internal = set()
+    seen_external = set()
+
+    for contributor in (final_contributors if final_contributors else []):
+        if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
+            for org in contributor.get("organizations", []):
+                uuid = org.get("uuid")
+                if uuid and uuid not in seen_internal:
+                    all_internal_org_uuids.append(uuid)
+                    seen_internal.add(uuid)
+        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation":
+            for org in contributor.get("externalOrganizations", []):
+                uuid = org.get("uuid")
+                if uuid and uuid not in seen_external:
+                    all_external_org_uuids.append(uuid)
+                    seen_external.add(uuid)
+
     if override_mode:
-        # Update top-level organizations with unique validated internal orgs
         if all_internal_org_uuids:
             updated_record["organizations"] = [
-                {
-                    "systemName": "Organization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in all_internal_org_uuids
+                {"systemName": "Organization", "uuid": uuid}
+                for uuid in all_internal_org_uuids
             ]
-        
-        # Update top-level externalOrganizations with unique external orgs
         if all_external_org_uuids:
             updated_record["externalOrganizations"] = [
-                {
-                    "systemName": "ExternalOrganization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in all_external_org_uuids
+                {"systemName": "ExternalOrganization", "uuid": uuid}
+                for uuid in all_external_org_uuids
             ]
     else:
-        # Precedence mode: only update if not already present
-        if all_internal_org_uuids and not pure_record.get("organizations"):
-            updated_record["organizations"] = [
-                {
-                    "systemName": "Organization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in all_internal_org_uuids
-            ]
-        
-        if all_external_org_uuids and not pure_record.get("externalOrganizations"):
-            updated_record["externalOrganizations"] = [
-                {
-                    "systemName": "ExternalOrganization",
-                    "uuid": org_uuid
-                }
-                for org_uuid in all_external_org_uuids
-            ]
+        # Always merge contributor orgs into record-level lists to satisfy Pure's
+        # validation rule: every contributor org must appear at the record level.
+        # Start from whatever the Pure record already has, then add any missing UUIDs.
+        if all_internal_org_uuids:
+            existing_internal = pure_record.get("organizations", [])
+            existing_internal_uuids = {o.get("uuid") for o in existing_internal}
+            merged_internal = list(existing_internal)
+            for uuid in all_internal_org_uuids:
+                if uuid not in existing_internal_uuids:
+                    merged_internal.append({"systemName": "Organization", "uuid": uuid})
+                    existing_internal_uuids.add(uuid)
+            updated_record["organizations"] = merged_internal
+
+        if all_external_org_uuids:
+            existing_external = pure_record.get("externalOrganizations", [])
+            existing_external_uuids = {o.get("uuid") for o in existing_external}
+            merged_external = list(existing_external)
+            for uuid in all_external_org_uuids:
+                if uuid not in existing_external_uuids:
+                    merged_external.append({"systemName": "ExternalOrganization", "uuid": uuid})
+                    existing_external_uuids.add(uuid)
+            updated_record["externalOrganizations"] = merged_external
 
     # --- 1b. Managing Organization - Update based on override mode ---
-    # Find first internal organization from internal contributors only
     first_internal_org_uuid = None
     for contributor in (final_contributors if final_contributors else []):
-        # Only check internal contributors
         if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
-            if "organizations" in contributor and contributor["organizations"]:
-                first_internal_org_uuid = contributor["organizations"][0].get("uuid")
+            orgs = contributor.get("organizations", [])
+            if orgs:
+                first_internal_org_uuid = orgs[0].get("uuid")
                 if first_internal_org_uuid:
                     break
-    
+
     if override_mode:
-        # In override mode, always update managing organization
         if first_internal_org_uuid:
             updated_record["managingOrganization"] = {
                 "uuid": first_internal_org_uuid,
@@ -1320,14 +1350,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             }
             print(f"  ✅ Override: Set managingOrganization to: {first_internal_org_uuid}")
         else:
-            # No internal authors - set to Library Repository
             updated_record["managingOrganization"] = {
                 "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
                 "systemName": "Organization"
             }
             print(f"  ✅ Override: Set managingOrganization to Library Repository (no internal authors)")
     elif not pure_record.get("managingOrganization", {}).get("uuid"):
-        # In precedence mode, only set if not already present
         if first_internal_org_uuid:
             updated_record["managingOrganization"] = {
                 "uuid": first_internal_org_uuid,
@@ -1335,7 +1363,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             }
             print(f"  ✅ Precedence: Set managingOrganization to: {first_internal_org_uuid}")
         else:
-            # No internal authors - set to Library Repository
             updated_record["managingOrganization"] = {
                 "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
                 "systemName": "Organization"
@@ -1436,7 +1463,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     else:
                         print(f"      ℹ️ Funder already exists: {funder_name}")
                 else:
-                    # NEW: Track unmatched funder
                     record_unmatched_funders.append({
                         "name": funder_name,
                         "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
@@ -1445,7 +1471,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     })
             else:
                 print(f"      ⚠️ No match found for funder: {funder_name}")
-                # Track unmatched funder
                 record_unmatched_funders.append({
                     "name": funder_name,
                     "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
@@ -1457,6 +1482,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         if record_unmatched_funders:
             log_entry["unmatchedFunders"] = record_unmatched_funders
             _unmatched_funders.extend(record_unmatched_funders)
+
+        # If sponsorship is empty and there are unmatched funders, add them to fundingText
+        if not sponsorship and record_unmatched_funders:
+            unmatched_names = "; ".join(f["name"] for f in record_unmatched_funders)
+            if not has_text_in_any_language(pure_record, "fundingText") or override_mode:
+                updated_record["fundingText"] = {"en_IE": escape_special_chars(unmatched_names)}
+                print(f"    ℹ️ No sponsorship text — added {len(record_unmatched_funders)} unmatched funder(s) to fundingText")
         
         # Add new funders to funding details
         if new_funder_uuids_with_type:
@@ -1497,6 +1529,18 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
     existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
 
+    # --- 5a. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
+    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
+    embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
+    
+    # Parse embargo date using same function as publication date
+    embargo_date = None
+    if embargo_date_str:
+        year, month, day = parse_date(embargo_date_str)
+        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
+    
+    embargo_active = bool(embargo_date and embargo_date > TODAY)
+
     # --- 5a. Publisher DOI (dc.identifier.doi) > add if blank ---
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     new_publisher_ev = None
@@ -1523,18 +1567,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             )
             if ev:
                 new_publisher_ev = ev
-
-    # --- 5b. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
-    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
-    embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
-    
-    # Parse embargo date using same function as publication date
-    embargo_date = None
-    if embargo_date_str:
-        year, month, day = parse_date(embargo_date_str)
-        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
-    
-    embargo_active = bool(embargo_date and embargo_date > TODAY)
 
     repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
@@ -1803,6 +1835,9 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     # Add type-specific required fields
     record = add_type_specific_fields(record, dspace_row)
 
+    # Re-derive pure_type_key AFTER add_type_specific_fields, in case type was downgraded
+    pure_type_key = get_pure_type_key(record["type"]["uri"])
+
     # Set publication date
     issued = dspace_row.get("dc.date.issued", "").strip()
     if issued:
@@ -1875,16 +1910,14 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     funder_uuids_with_type.append((uuid, is_internal))
                     print(f"      ✅ Added funder: {funder_name} (UUID: {uuid}, Internal: {is_internal})")
                 else:
-                    # Track unmatched funder
                     record_unmatched_funders.append({
                         "name": funder_name,
                         "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
                         "title": dspace_row.get("dc.title", ""),
-                        "pure_uuid": None  # New record, no UUID yet
+                        "pure_uuid": None
                     })
             else:
                 print(f"      ⚠️ No match found for funder: {funder_name}")
-                # Track unmatched funder
                 record_unmatched_funders.append({
                     "name": funder_name,
                     "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
@@ -1895,6 +1928,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         # Add to global tracker
         if record_unmatched_funders:
             _unmatched_funders.extend(record_unmatched_funders)
+
+        # If sponsorship is empty and there are unmatched funders, add them to fundingText
+        if not sponsorship and record_unmatched_funders:
+            unmatched_names = "; ".join(f["name"] for f in record_unmatched_funders)
+            record["fundingText"] = {"en_IE": escape_special_chars(unmatched_names)}
+            print(f"    ℹ️ No sponsorship text — added {len(record_unmatched_funders)} unmatched funder(s) to fundingText")
         
         # Add funders to record
         if funder_uuids_with_type:
@@ -1909,6 +1948,22 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     mapped_contributors = []
     record_unmatched_contributors = []  
 
+    # Collect record-level identifiers for paper-evidence scoring 
+    _record_paper_dois    = set()
+    _record_paper_handles = set()
+    _record_paper_title   = normalize(dspace_row.get("dc.title", "").strip())
+
+    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
+    if publisher_doi_raw:
+        _record_paper_dois.add(normalize_doi(publisher_doi_raw))
+
+    for _doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        _record_paper_dois.add(normalize_doi(_doi))
+
+    for _handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        _record_paper_handles.add(normalize_handle(_handle))
+
+    # Process each role and its contributors
     for role, contributor_names in contributors_by_role.items():
         print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
         
@@ -1918,7 +1973,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             
             if matches:
                 print(f"      ✅ Found {len(matches)} matches")
-                matched_person = resolve_author_duplicate(matches)
+                matched_person = resolve_author_duplicate(
+                    matches,
+                    paper_dois=_record_paper_dois,
+                    paper_handles=_record_paper_handles,
+                    paper_title=_record_paper_title,
+                )
                 
                 if not matched_person:
                     print(f"        ❌ ERROR: resolve_author_duplicate returned None!")
@@ -1969,50 +2029,61 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     if not mapped_contributors:
         print(f"❌ No matched contributors found for record {dspace_row.get('dc.title', '')} - skipping")
         return None
-    
-    # Always ensure contributor info is present
-    record["contributors"] = mapped_contributors
 
-    print(f"✅ Added {len(mapped_contributors)} contributors")
-    
-    # Validate and fix organizations
+    # Validate and fix organizations BEFORE assigning to record
     print("  🔍 Validating organization UUIDs...")
     mapped_contributors = validate_and_fix_organizations(mapped_contributors, API_KEY, BASE_URL)
-    
+
+    # Always ensure contributor info is present (post-validation list)
+    record["contributors"] = mapped_contributors
+    print(f"✅ Added {len(mapped_contributors)} contributors")
+
     # Collect ALL validated organizations from ALL contributors
-    all_internal_org_uuids, all_external_org_uuids = collect_validated_organizations(mapped_contributors)
-    
-    # Track first internal contributor's primary organization for managingOrganization
-    first_internal_org_uuid = None
+    # Internal contributors -> "organizations" (primaryInternalOrganization)
+    # External contributors -> "externalOrganizations" (all their external orgs)
+    all_internal_org_uuids = []
+    all_external_org_uuids = []
+    seen_internal = set()
+    seen_external = set()
+
     for contributor in mapped_contributors:
-        # Only check internal contributors
         if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
-            if "organizations" in contributor and contributor["organizations"]:
-                first_internal_org_uuid = contributor["organizations"][0].get("uuid")
-                if first_internal_org_uuid:
-                    break
-    
-    # Set top-level organizations with unique validated internal orgs
+            for org in contributor.get("organizations", []):
+                uuid = org.get("uuid")
+                if uuid and uuid not in seen_internal:
+                    all_internal_org_uuids.append(uuid)
+                    seen_internal.add(uuid)
+        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation":
+            for org in contributor.get("externalOrganizations", []):
+                uuid = org.get("uuid")
+                if uuid and uuid not in seen_external:
+                    all_external_org_uuids.append(uuid)
+                    seen_external.add(uuid)
+
+    # Set record-level organizations from internal contributors
     if all_internal_org_uuids:
         record["organizations"] = [
-            {
-                "systemName": "Organization",
-                "uuid": org_uuid
-            }
-            for org_uuid in all_internal_org_uuids
+            {"systemName": "Organization", "uuid": uuid}
+            for uuid in all_internal_org_uuids
         ]
-    
-    # Set top-level externalOrganizations with unique external orgs
+
+    # Set record-level externalOrganizations from external contributors
     if all_external_org_uuids:
         record["externalOrganizations"] = [
-            {
-                "systemName": "ExternalOrganization",
-                "uuid": org_uuid
-            }
-            for org_uuid in all_external_org_uuids
+            {"systemName": "ExternalOrganization", "uuid": uuid}
+            for uuid in all_external_org_uuids
         ]
-    
+
     # Set managingOrganization from first internal contributor's primary organization
+    first_internal_org_uuid = None
+    for contributor in mapped_contributors:
+        if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
+            orgs = contributor.get("organizations", [])
+            if orgs:
+                first_internal_org_uuid = orgs[0].get("uuid")
+                if first_internal_org_uuid:
+                    break
+
     if first_internal_org_uuid:
         record["managingOrganization"] = {
             "uuid": first_internal_org_uuid,
@@ -2020,7 +2091,6 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         }
         print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
     else:
-        # No internal authors - set to Library Repository
         record["managingOrganization"] = {
             "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
             "systemName": "Organization"

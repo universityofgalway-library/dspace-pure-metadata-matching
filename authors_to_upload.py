@@ -39,9 +39,6 @@ def extract_external_persons(input_file, output_file):
                 },
                 "workflow": {
                     "step": "forApproval",
-                    "description": {
-                        "en_IE": "For approval"
-                    }
                 },
                 "systemName": "ExternalPerson"
             }
@@ -61,8 +58,8 @@ def extract_external_persons(input_file, output_file):
 
 if __name__ == "__main__":
     # Example usage
-    input_file = "./matching_test/matched_authors/temp_authors_all_2026-01-22.json"  # Replace with your input file path
-    output_file = f"./matching_test/matched_authors/authors_to_upload_{TODAY}.json"  # Replace with desired output path
+    input_file = "./author_matching/2026-02-26/merged_all_authors_2026-02-26.json"  # Replace with your input file path
+    output_file = f"./author_matching/2026-02-26/authors_to_upload_{TODAY}.json"  # Replace with desired output path
     
     external_persons = extract_external_persons(input_file, output_file)
     
