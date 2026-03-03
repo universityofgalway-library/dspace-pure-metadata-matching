@@ -19,10 +19,10 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
-OVERRIDE_MODE = False  # Change to True to override existing Pure data
+OVERRIDE_MODE = True  # Change to True to override existing Pure data
 
 DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-02-12.csv"
-PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-02.json"
+PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-03.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
 OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
@@ -91,7 +91,10 @@ EXTERNAL_ORGS_TO_IGNORE = [
     "f026cf31-52e3-4aa3-a609-54a50ddd962b",    # "National University of Ireland—Galway" 
     "0dc1af88-f709-4304-8a44-ad3178e1edb2",    # "National University of Ireland Galway College" 
     "78363204-c24b-4e1c-a3e0-1e80614c1978",    # "National University of Ireland‐Galway" 
-    "6d370e14-c9b6-4749-8680-6d513e02976b"     # "National University of Ireland Galway (NUI Galway)" 
+    "6d370e14-c9b6-4749-8680-6d513e02976b",    # "National University of Ireland Galway (NUI Galway)" 
+    "3b995820-9623-4914-b158-2f2a217d20ec",    # "National University of Ireland"
+    "6d415501-0899-44ae-aac3-258f31cd1b03",    # "National University of Ireland"
+    "0aa5ccc1-a672-42ce-b262-fd01b3c54f5c"     # "National University of Ireland"
 ]
 
 SYSTEM_FIELDS_TO_EXCLUDE = {
@@ -387,29 +390,62 @@ def parse_author_names(author_str):
 
 
 def parse_contributors_by_role(dspace_row):
-    """Parse all contributor types from DSpace and return dict by role"""
-    contributors_by_role = {}
+    """Parse all contributor types from DSpace and return dict by role.
     
-    # Parse authors
+    Handles two special cases:
+    1. Same name appears in both author and editor fields — keep only one role
+       based on dc.type (editor preferred for book/interactive resource/conference
+       proceedings, author preferred for everything else).
+    2. Metadata correction: if dc.type is NOT a book-like type but the record has
+       editors and no authors, treat those editors as authors instead.
+    """
+    # Types where editor role takes precedence over author role
+    EDITOR_PREFERRED_TYPES = {"book", "interactive resource", "conference proceedings"}
+    dspace_type = dspace_row.get("dc.type", "").strip().lower()
+    prefer_editor = dspace_type in EDITOR_PREFERRED_TYPES
+
+    contributors_by_role = {}
+
+    # Parse all roles
     authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
+    editors = parse_author_names(dspace_row.get("dc.contributor.editor", ""))
+    translators = parse_author_names(dspace_row.get("dc.contributor.translator", ""))
+    illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
+
+    # Resolve author/editor overlap for the same name
+    author_set = {normalize(n) for n in authors}
+    editor_set = {normalize(n) for n in editors}
+    overlap = author_set & editor_set
+
+    if overlap:
+        if prefer_editor:
+            # Remove overlapping names from authors, keep in editors
+            authors = [n for n in authors if normalize(n) not in overlap]
+            print(f"  ℹ️ Duplicate author/editor names — keeping as editor for type '{dspace_type}': "
+                  f"{[n for n in editors if normalize(n) in overlap]}")
+        else:
+            # Remove overlapping names from editors, keep in authors
+            editors = [n for n in editors if normalize(n) not in overlap]
+            print(f"  ℹ️ Duplicate author/editor names — keeping as author for type '{dspace_type}': "
+                  f"{[n for n in authors if normalize(n) in overlap]}")
+
+    # Metadata correction: non-book type with editors but no authors
+    # → those editors are almost certainly authors mislabelled in DSpace
+    if not prefer_editor and editors and not authors:
+        print(f"  ⚠️ Metadata correction: dc.type='{dspace_type}' has editors but no authors "
+              f"— treating editors as authors: {editors}")
+        authors = editors
+        editors = []
+
     if authors:
         contributors_by_role["author"] = authors
-    
-    # Parse editors
-    editors = parse_author_names(dspace_row.get("dc.contributor.editor", ""))
     if editors:
         contributors_by_role["editor"] = editors
-    
-    # Parse translators
-    translators = parse_author_names(dspace_row.get("dc.contributor.translator", ""))
     if translators:
         contributors_by_role["translator"] = translators
-    
-    # Parse illustrators
-    illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
     if illustrators:
         contributors_by_role["illustrator"] = illustrators
-    
+
     return contributors_by_role
 
 
@@ -457,14 +493,21 @@ def build_contributor(matched_person, role, pure_type_key):
                 "uuid": uuid_value
             }
         }
-        # For internal authors, ONLY use primaryInternalOrganization
-        if "primaryInternalOrganization" in matched_person and matched_person["primaryInternalOrganization"]:
+        # For internal authors, prefer primaryInternalOrganization,
+        # fall back to any available internal organisation
+        primary_org = matched_person.get("primaryInternalOrganization")
+        if not primary_org:
+            internal_orgs = matched_person.get("internalOrganizations", [])
+            if internal_orgs:
+                primary_org = internal_orgs[0] if isinstance(internal_orgs[0], str) else internal_orgs[0].get("uuid")
+                print(f"        ℹ️ No primaryInternalOrganization for {first} {last} — using fallback org: {primary_org}")
+
+        if primary_org:
             contributor["organizations"] = [
-                {
-                    "systemName": "Organization",
-                    "uuid": matched_person["primaryInternalOrganization"]
-                }
+                {"systemName": "Organization", "uuid": primary_org}
             ]
+        else:
+            print(f"        ⚠️ Internal person {first} {last} has no primaryInternalOrganization and no internalOrganizations in mapping")
 
         return contributor
     
@@ -489,17 +532,12 @@ def build_contributor(matched_person, role, pure_type_key):
         if "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
             external_orgs = matched_person["externalOrganizations"]
             
-            # Filter out ignored organizations
+            # Filter out ignored organizations — always, even if it's the only one
             filtered_external_orgs = [
                 org_uuid for org_uuid in external_orgs
                 if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
             ]
             
-            # If all orgs are in ignore list, keep the first one from the original list
-            if not filtered_external_orgs and external_orgs:
-                filtered_external_orgs = [external_orgs[0]]
-            
-            # Add to contributor if we have any orgs
             if filtered_external_orgs:
                 contributor["externalOrganizations"] = [
                     {
@@ -1303,15 +1341,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                 {"systemName": "Organization", "uuid": uuid}
                 for uuid in all_internal_org_uuids
             ]
-        if all_external_org_uuids:
-            updated_record["externalOrganizations"] = [
-                {"systemName": "ExternalOrganization", "uuid": uuid}
-                for uuid in all_external_org_uuids
-            ]
+        # Set record-level externalOrganizations, excluding ignored orgs
+        record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+        updated_record["externalOrganizations"] = [
+            {"systemName": "ExternalOrganization", "uuid": uuid}
+            for uuid in record_level_external
+        ]
     else:
-        # Always merge contributor orgs into record-level lists to satisfy Pure's
-        # validation rule: every contributor org must appear at the record level.
-        # Start from whatever the Pure record already has, then add any missing UUIDs.
         if all_internal_org_uuids:
             existing_internal = pure_record.get("organizations", [])
             existing_internal_uuids = {o.get("uuid") for o in existing_internal}
@@ -1322,11 +1358,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     existing_internal_uuids.add(uuid)
             updated_record["organizations"] = merged_internal
 
-        if all_external_org_uuids:
+        # Only merge non-ignored external orgs into the record level
+        record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+        if record_level_external:
             existing_external = pure_record.get("externalOrganizations", [])
             existing_external_uuids = {o.get("uuid") for o in existing_external}
             merged_external = list(existing_external)
-            for uuid in all_external_org_uuids:
+            for uuid in record_level_external:
                 if uuid not in existing_external_uuids:
                     merged_external.append({"systemName": "ExternalOrganization", "uuid": uuid})
                     existing_external_uuids.add(uuid)
@@ -2067,11 +2105,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             for uuid in all_internal_org_uuids
         ]
 
-    # Set record-level externalOrganizations from external contributors
-    if all_external_org_uuids:
+    # Set record-level externalOrganizations, excluding ignored orgs
+    record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+    if record_level_external:
         record["externalOrganizations"] = [
             {"systemName": "ExternalOrganization", "uuid": uuid}
-            for uuid in all_external_org_uuids
+            for uuid in record_level_external
         ]
 
     # Set managingOrganization from first internal contributor's primary organization

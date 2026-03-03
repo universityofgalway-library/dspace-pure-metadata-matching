@@ -53,7 +53,7 @@ def extract_name_from_response(response_data, data_type):
         name_obj = response_data.get("name", {})
         first_name = name_obj.get("firstName", "")
         last_name = name_obj.get("lastName", "")
-        return f"{first_name} {last_name}".strip()
+        return f"{first_name};{last_name}".strip()
     
     # For research-outputs, events: use "title"
     if data_type in ["research-outputs", "events"]:
@@ -349,11 +349,19 @@ if __name__ == "__main__":
     parser.add_argument("--test", type=bool, default=True, help="Get data from UAT (--test True) or Production (--test False)")
     parser.add_argument("--data", default= "research-outputs", choices=["research-outputs", "persons", "external-persons", 
                         "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to upload to Pure")
-    parser.add_argument("--log-dir", default=None, help=("Directory to save logs.")
-    )
+    parser.add_argument("--log-dir", default=None, help="Directory to save logs (default: ./logs/uploader_logs next to the input file or folder)")
     args = parser.parse_args()
 
-    LOG_DIR = f"{args.log_dir}/uploader_logs/"
+    if args.log_dir is None:
+        input_path = args.folder if args.folder else args.file
+        if input_path:
+            base = os.path.dirname(os.path.abspath(input_path.rstrip("/\\")))
+        else:
+            base = os.getcwd()
+        args.log_dir = os.path.join(base, "logs")
+
+    LOG_DIR = os.path.join(args.log_dir, "uploader_logs")
+
     os.makedirs(LOG_DIR, exist_ok=True)
     ERROR_LOG_PATH = os.path.join(LOG_DIR, f"uploader_errors_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
