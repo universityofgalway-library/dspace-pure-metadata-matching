@@ -21,11 +21,11 @@ TODAY = date.today().isoformat()
 
 OVERRIDE_MODE = True  # Change to True to override existing Pure data
 
-DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-02-12.csv"
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-03.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
-OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
+OUTPUT_DIR = f"./record_matching/full_test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -1841,7 +1841,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             "key": "FREE"
         },
         "workflow": {
-            "step": "approved"
+            "step": "validated"
         },
         "typeDiscriminator": "OtherContribution"
     }
@@ -2587,18 +2587,23 @@ def main():
     
     # Count results
     matched_count = sum(1 for e in log_entries if e['matched'])
-    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') != "No contributors found in any contributor field")
-    success_count = sum(1 for e in log_entries if e['success'])
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
+    no_matched_authors_count = sum(1 for e in log_entries if e.get('error') == "No matched contributors")
+    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') not in ("No contributors found in any contributor field", "No matched contributors"))
+    success_count = sum(1 for e in log_entries if e['success'])
+    failed_count = sum(1 for e in log_entries if not e['success'])
     error_count = len(error_log)
-    
+
     print(f"\n✅ Done! {len(log_entries)} records processed.")
-    print(f"   Matched: {matched_count}")
-    print(f"   Unmatched: {unmatched_count}")
-    print(f"   Success: {success_count}")
-    print(f"   No contributors: {no_contributors_count}")
-    print(f"   No matched authors: {len(no_author_records)}")
-    print(f"   Errors: {error_count}")
+    print(f"   Matched to existing Pure record: {matched_count}")
+    print(f"   Unmatched (new records created): {unmatched_count}")
+    print(f"   Successfully processed: {success_count}")
+    print(f"   Failed (total): {failed_count}")
+    print(f"     ↳ No contributors in any field: {no_contributors_count}")
+    print(f"     ↳ No contributors matched to Pure persons: {no_matched_authors_count}")
+    print(f"     ↳ Other errors: {error_count}")
+    print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
+    print(f"   Unmatched funders: {len(_unmatched_funders)}")
     print(f"   Logs saved to: {LOG_DIR}")
     print(f"\n⏱️  Total time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
