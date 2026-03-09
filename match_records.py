@@ -19,7 +19,12 @@ load_dotenv()
 
 TODAY = date.today().isoformat()
 
-OVERRIDE_MODE = True  # Change to True to override existing Pure data
+# If True, external organisations are collected from external authors and applied at
+# the contributor and record level.  If False, no external organisation data is
+# attached anywhere (external authors are still linked via their externalPerson UUID).
+COLLECT_EXTERNAL_ORGS = False
+
+OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-03.json"
@@ -36,7 +41,7 @@ BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
 
-PUNC = set('''—!–¿()-[]{};:'"‘’“”‐\,<>./?@#$%^&=+|£€*_~®™©0123456789''')
+PUNC = set('''—!–¿()-[]{};:'"''""‐\,<>./?@#$%^&=+|£€*_~®™©0123456789''')
 
 
 # --- TYPE MAPPING ---
@@ -449,8 +454,16 @@ def parse_contributors_by_role(dspace_row):
     return contributors_by_role
 
 
-def build_contributor(matched_person, role, pure_type_key):
-    """Build a contributor object from matched person and role"""
+def build_contributor(matched_person, role, pure_type_key, collect_external_orgs=True):
+    """Build a contributor object from matched person and role.
+
+    Args:
+        matched_person: Person dict from the person mapping.
+        role: Contributor role string (e.g. 'author', 'editor').
+        pure_type_key: Lower-cased Pure type key used to construct role URIs.
+        collect_external_orgs: When False, external organisation data is omitted
+            from the built contributor even if present in the person mapping.
+    """
     first = matched_person.get("firstName", "")
     last = matched_person.get("lastName", "")
     
@@ -528,8 +541,8 @@ def build_contributor(matched_person, role, pure_type_key):
                 "uuid": uuid_value
             }
         }
-        # For external authors, filter out EXTERNAL_ORGS_TO_IGNORE unless it's the only one
-        if "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
+        # Only attach external organisations when the feature is enabled
+        if collect_external_orgs and "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
             external_orgs = matched_person["externalOrganizations"]
             
             # Filter out ignored organizations — always, even if it's the only one
@@ -1290,8 +1303,11 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
                     final_contributors.append(existing_by_name[name_key])
                 else:
-                    # Create new contributor
-                    contributor = build_contributor(matched_person, role, pure_type.lower())
+                    # Create new contributor, passing the global COLLECT_EXTERNAL_ORGS flag
+                    contributor = build_contributor(
+                        matched_person, role, pure_type.lower(),
+                        collect_external_orgs=COLLECT_EXTERNAL_ORGS
+                    )
                     if contributor:
                         final_contributors.append(contributor)
                         action = "Overriding" if override_mode else "Added new"
@@ -1315,7 +1331,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     
     # --- 1a. Collect ALL validated organizations from ALL contributors ---
     # Internal contributors -> "organizations" (primaryInternalOrganization)
-    # External contributors -> "externalOrganizations" (all their external orgs)
+    # External contributors -> "externalOrganizations" (only when COLLECT_EXTERNAL_ORGS is True)
     all_internal_org_uuids = []
     all_external_org_uuids = []
     seen_internal = set()
@@ -1328,7 +1344,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                 if uuid and uuid not in seen_internal:
                     all_internal_org_uuids.append(uuid)
                     seen_internal.add(uuid)
-        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation":
+        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation" and COLLECT_EXTERNAL_ORGS:
             for org in contributor.get("externalOrganizations", []):
                 uuid = org.get("uuid")
                 if uuid and uuid not in seen_external:
@@ -1341,12 +1357,13 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                 {"systemName": "Organization", "uuid": uuid}
                 for uuid in all_internal_org_uuids
             ]
-        # Set record-level externalOrganizations, excluding ignored orgs
-        record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
-        updated_record["externalOrganizations"] = [
-            {"systemName": "ExternalOrganization", "uuid": uuid}
-            for uuid in record_level_external
-        ]
+        if COLLECT_EXTERNAL_ORGS:
+            # Set record-level externalOrganizations, excluding ignored orgs
+            record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+            updated_record["externalOrganizations"] = [
+                {"systemName": "ExternalOrganization", "uuid": uuid}
+                for uuid in record_level_external
+            ]
     else:
         if all_internal_org_uuids:
             existing_internal = pure_record.get("organizations", [])
@@ -1358,17 +1375,18 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     existing_internal_uuids.add(uuid)
             updated_record["organizations"] = merged_internal
 
-        # Only merge non-ignored external orgs into the record level
-        record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
-        if record_level_external:
-            existing_external = pure_record.get("externalOrganizations", [])
-            existing_external_uuids = {o.get("uuid") for o in existing_external}
-            merged_external = list(existing_external)
-            for uuid in record_level_external:
-                if uuid not in existing_external_uuids:
-                    merged_external.append({"systemName": "ExternalOrganization", "uuid": uuid})
-                    existing_external_uuids.add(uuid)
-            updated_record["externalOrganizations"] = merged_external
+        if COLLECT_EXTERNAL_ORGS:
+            # Only merge non-ignored external orgs into the record level
+            record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+            if record_level_external:
+                existing_external = pure_record.get("externalOrganizations", [])
+                existing_external_uuids = {o.get("uuid") for o in existing_external}
+                merged_external = list(existing_external)
+                for uuid in record_level_external:
+                    if uuid not in existing_external_uuids:
+                        merged_external.append({"systemName": "ExternalOrganization", "uuid": uuid})
+                        existing_external_uuids.add(uuid)
+                updated_record["externalOrganizations"] = merged_external
 
     # --- 1b. Managing Organization - Update based on override mode ---
     first_internal_org_uuid = None
@@ -1778,15 +1796,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         journal_uuid = dspace_row.get("journal_uuid", "").strip()
         existing_journal = pure_record.get("journalAssociation", {}).get("journal", {}).get("uuid")
         
-        # Add journal if we have a UUID and (no existing journal OR override mode is on)
-        if journal_uuid and (not existing_journal or override_mode):
+        # Add journal if we have a UUID and (no existing journal)
+        if journal_uuid and (not existing_journal):
             updated_record["journalAssociation"] = {
                 "journal": {
                     "systemName": "Journal",
                     "uuid": journal_uuid
                 }
             }
-            action = "Override" if override_mode else "Added"
+            action = "Added"
             print(f"  ✅ {action}: Set journal association to: {journal_uuid}")
         elif not journal_uuid and not existing_journal:
             # No journal UUID in DSpace and no existing journal - this shouldn't be a journal contribution
@@ -1796,12 +1814,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     updated_record["workflow"] = {
         "step": "validated"
     }
-
-    #    {
-    #   "step": "validated",
-    #   "description": {
-    #     "en_IE": "Validated by Library"
-    #   }
 
     # Write log entry
     log_entry["success"] = success and not errors
@@ -2044,8 +2056,11 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     })
                     continue
                 
-                # Build contributor using helper function
-                contributor = build_contributor(matched_person, role, pure_type_key)
+                # Build contributor using helper function, passing the global flag
+                contributor = build_contributor(
+                    matched_person, role, pure_type_key,
+                    collect_external_orgs=COLLECT_EXTERNAL_ORGS
+                )
                 if contributor:
                     mapped_contributors.append(contributor)
                     print(f"        ✅ Added {role}: {matched_person.get('firstName')} {matched_person.get('lastName')}")
@@ -2078,7 +2093,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
 
     # Collect ALL validated organizations from ALL contributors
     # Internal contributors -> "organizations" (primaryInternalOrganization)
-    # External contributors -> "externalOrganizations" (all their external orgs)
+    # External contributors -> "externalOrganizations" (only when COLLECT_EXTERNAL_ORGS is True)
     all_internal_org_uuids = []
     all_external_org_uuids = []
     seen_internal = set()
@@ -2091,7 +2106,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                 if uuid and uuid not in seen_internal:
                     all_internal_org_uuids.append(uuid)
                     seen_internal.add(uuid)
-        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation":
+        elif contributor.get("typeDiscriminator") == "ExternalContributorAssociation" and COLLECT_EXTERNAL_ORGS:
             for org in contributor.get("externalOrganizations", []):
                 uuid = org.get("uuid")
                 if uuid and uuid not in seen_external:
@@ -2105,13 +2120,14 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             for uuid in all_internal_org_uuids
         ]
 
-    # Set record-level externalOrganizations, excluding ignored orgs
-    record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
-    if record_level_external:
-        record["externalOrganizations"] = [
-            {"systemName": "ExternalOrganization", "uuid": uuid}
-            for uuid in record_level_external
-        ]
+    # Set record-level externalOrganizations only when enabled, excluding ignored orgs
+    if COLLECT_EXTERNAL_ORGS:
+        record_level_external = [u for u in all_external_org_uuids if u not in EXTERNAL_ORGS_TO_IGNORE]
+        if record_level_external:
+            record["externalOrganizations"] = [
+                {"systemName": "ExternalOrganization", "uuid": uuid}
+                for uuid in record_level_external
+            ]
 
     # Set managingOrganization from first internal contributor's primary organization
     first_internal_org_uuid = None
