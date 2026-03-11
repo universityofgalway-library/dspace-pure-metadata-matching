@@ -222,40 +222,85 @@ def extract_uuid(uuid_entry):
     return uuid_entry["uuid"] if isinstance(uuid_entry, dict) else uuid_entry
 
 
-def calculate_title_similarity(title1, title2, threshold=0.8):
+def strip_subtitle_from_title(title, subtitle):
     """
-    Calculate similarity between two titles using rapidfuzz for performance.
-    Returns tuple (similarity_score, is_match)
-    
-    Args:
-        title1: First title string
-        title2: Second title string
-        threshold: Minimum similarity ratio required (0-1), default 0.8 (80%)
-    
-    Returns:
-        Tuple of (similarity_ratio: float, is_match: bool)
+    If title ends with subtitle (case-insensitive, punctuation-ignored),
+    strip it from the title, including any preceding colon (and optional space).
+    Returns the cleaned title string (original register/punctuation preserved).
     """
-    if not title1 or not title2:
+    if not title or not subtitle:
+        return title
+
+    def strip_punc(s):
+        return "".join(ch for ch in s.lower() if ch not in PUNC and not ch.isspace())
+
+    title_clean = strip_punc(title)
+    sub_clean = strip_punc(subtitle)
+
+    if not sub_clean or not title_clean.endswith(sub_clean):
+        return title
+
+    # Find how many original chars of `title` correspond to the subtitle suffix.
+    # Walk backwards through title matching against sub_clean in reverse.
+    sub_rev = sub_clean[::-1]
+    matched = 0
+    i = len(title) - 1
+    for target_ch in sub_rev:
+        while i >= 0:
+            ch = title[i]
+            i -= 1
+            if ch.lower() not in PUNC and not ch.isspace():
+                if ch.lower() == target_ch:
+                    matched += 1
+                    break
+                else:
+                    return title  # mismatch — safety exit
+    # i now points just before the subtitle portion
+    cut = i + 1  # index in original title where subtitle begins (approx)
+
+    # Walk back over any whitespace then an optional colon (and its preceding space)
+    trimmed = title[:cut].rstrip()
+    if trimmed.endswith(":"):
+        trimmed = trimmed[:-1].rstrip()
+
+    return trimmed if trimmed else title
+
+
+def calculate_title_similarity(dspace_title, dspace_subtitle, pure_title, pure_subtitle, threshold=0.8):
+    """
+    Compare titles using three strategies and return the highest similarity.
+
+    Strategies:
+      a) dc.title  vs  Pure title
+      b) dc.title + dc.title.subtitle  vs  Pure title
+      c) dc.title  vs  Pure title + Pure subTitle
+
+    Returns (best_similarity: float, is_match: bool)
+    """
+    if not dspace_title or not pure_title:
         return (0.0, False)
-    
-    # Normalize titles for comparison
-    t1 = normalize(title1)
-    t2 = normalize(title2)
-    
-    if t1 == t2:
-        return (1.0, True)
-    
-    # Pre-filter by length difference (fast rejection)
-    len_diff = abs(len(t1) - len(t2))
-    max_len = max(len(t1), len(t2))
-    if max_len > 0 and (len_diff / max_len) > 0.5:  # More than 50% length difference
-        return (0.0, False)
-    
-    # Use rapidfuzz token_set_ratio for word-order-independent matching
-    # This handles cases where words are reordered
-    similarity = fuzz.token_set_ratio(t1, t2) / 100.0
-    
-    return (similarity, similarity >= threshold)
+
+    def _sim(t1, t2):
+        if not t1 or not t2:
+            return 0.0
+        t1n, t2n = normalize(t1), normalize(t2)
+        if t1n == t2n:
+            return 1.0
+        max_len = max(len(t1n), len(t2n))
+        if max_len > 0 and abs(len(t1n) - len(t2n)) / max_len > 0.5:
+            return 0.0
+        return fuzz.token_set_ratio(t1n, t2n) / 100.0
+
+    combined_dspace = f"{dspace_title} {dspace_subtitle}".strip() if dspace_subtitle else dspace_title
+    combined_pure = f"{pure_title} {pure_subtitle}".strip() if pure_subtitle else pure_title
+
+    scores = [
+        _sim(dspace_title, pure_title),         
+        _sim(combined_dspace, pure_title),        
+        _sim(dspace_title, combined_pure),       
+    ]
+    best = max(scores)
+    return (best, best >= threshold)
 
 
 def normalize_doi(value: str) -> str:
@@ -972,7 +1017,8 @@ def validate_and_fix_organizations(contributors, api_key, base_url):
                         existing_external.append(invalid_org)
                 contributor["externalOrganizations"] = existing_external
         
-        updated_contributors.append(contributor)
+        if contributor is not None:
+            updated_contributors.append(contributor)
     
     return updated_contributors
 
@@ -1158,7 +1204,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     contributors_by_role = parse_contributors_by_role(dspace_row)
     
     # Get existing contributors from Pure record (if any)
-    existing_contributors = pure_record.get("contributors", [])
+    existing_contributors = [c for c in pure_record.get("contributors", []) if c is not None]
 
     # Track unmatched contributors for this record
     record_unmatched_contributors = []
@@ -1584,6 +1630,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     
     existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
     existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
+    repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
     # --- 5a. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
     embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
@@ -1598,6 +1645,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     embargo_active = bool(embargo_date and embargo_date > TODAY)
 
     # --- 5a. Publisher DOI (dc.identifier.doi) > add if blank ---
+  
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     new_publisher_ev = None
     if publisher_doi:
@@ -1623,8 +1671,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             )
             if ev:
                 new_publisher_ev = ev
-
-    repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
     if repo_ev:
         # Update existing repo version
@@ -1732,11 +1778,12 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             filtered_links.append(link)
     
     # Add new handle links
+    new_handle_links = []
+
     if uri_str:
         handles = extract_handles_from_uri(uri_str)
         if handles:
             existing_handle_urls = {normalize_handle(link.get("url", "")) for link in filtered_links}
-            new_handle_links = []
             for handle in handles:
                 normalized_handle = normalize_handle(handle)
                 if normalized_handle not in existing_handle_urls:
@@ -1770,23 +1817,31 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         else:
             updated_record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
-    # --- 8. Title (dc.title) > fill if blank ---
-    dspace_title = dspace_row.get("dc.title", "").strip()
+    # --- 8. Title (dc.title) > fill if blank, prefer Pure data ---
+    dspace_title    = dspace_row.get("dc.title", "").strip()
     dspace_subtitle = dspace_row.get("dc.title.subtitle", "").strip()
-    
-    # Combine title and subtitle if both exist
-    combined_dspace_title = dspace_title
-    if dspace_subtitle:
-        combined_dspace_title = f"{dspace_title} {dspace_subtitle}"
-    
-    # Check if Pure record has any title content
-    pure_title = pure_record.get("title", {}).get("value", "").strip()
+    if not dspace_subtitle:
+        dspace_subtitle = dspace_row.get("dc.title.alternative", "").strip()
+
+    pure_title    = pure_record.get("title", {}).get("value", "").strip()
     pure_subtitle = pure_record.get("subTitle", {}).get("value", "").strip()
-    
-    # Only update if Pure has no meaningful title OR if override mode is on
-    if combined_dspace_title and (not pure_title or override_mode):
-        updated_record["title"] = {"value": escape_special_chars(dspace_title)}
-        if dspace_subtitle:
+
+    if override_mode:
+        # Override: replace both title and subtitle together
+        if dspace_title:
+            clean_title    = strip_subtitle_from_title(dspace_title, dspace_subtitle)
+            updated_record["title"] = {"value": escape_special_chars(clean_title)}
+            if dspace_subtitle:
+                updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
+            else:
+                updated_record["subTitle"] = {"value": ""}
+    else:
+        # Precedence: fill only if Pure field is blank
+        if dspace_title and not pure_title:
+            clean_title = strip_subtitle_from_title(dspace_title, dspace_subtitle)
+            updated_record["title"] = {"value": escape_special_chars(clean_title)}
+
+        if dspace_subtitle and not pure_subtitle:
             updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
     # --- 9. Journal Association (for ContributionToJournal/ContributionToPeriodical) ---
@@ -1829,11 +1884,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
 def create_new_record_from_dspace(dspace_row, person_index, org_index):
     """Create new Pure record from DSpace row"""
-    # Escape special characters in title first
-    escaped_title = escape_special_chars(dspace_row.get("dc.title", "").strip())
     
     record = {
-        "title": {"value": escaped_title},
+        "title": {"value": ""},
         "type": {
             "uri": ""
         },
@@ -1921,12 +1974,15 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             record["abstract"] = {lang_code: escape_special_chars(abstract)}
 
     # Set title and subtitle
-    dspace_title = dspace_row.get("dc.title", "").strip()
+    dspace_title    = dspace_row.get("dc.title", "").strip()
     dspace_subtitle = dspace_row.get("dc.title.subtitle", "").strip()
-    
+    if not dspace_subtitle:
+        dspace_subtitle = dspace_row.get("dc.title.alternative", "").strip()
+
     if dspace_title:
-        record["title"] = {"value": escape_special_chars(dspace_title)}
-    
+        clean_title = strip_subtitle_from_title(dspace_title, dspace_subtitle)
+        record["title"] = {"value": escape_special_chars(clean_title)}
+
     if dspace_subtitle:
         record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
 
@@ -2433,38 +2489,39 @@ def main():
         if not matched_records:
             dspace_title = row.get("dc.title", "").strip()
             dspace_subtitle = row.get("dc.title.subtitle", "").strip()
-            
-            # Combine DSpace title and subtitle
-            combined_dspace_title = dspace_title
-            if dspace_subtitle:
-                combined_dspace_title = f"{dspace_title} {dspace_subtitle}"
-            
-            if combined_dspace_title:
-                normalized_title = normalize(combined_dspace_title)
-                # First try exact match
-                if normalized_title in pure_by_title:
-                    matched_records.extend(pure_by_title[normalized_title])
-                    match_type = "Title (Exact)"
-                else:
-                    # Try similarity matching against all titles
+            if not dspace_subtitle:
+                dspace_subtitle = row.get("dc.title.alternative", "").strip()
+
+            if dspace_title:
+                combined_dspace_title = f"{dspace_title} {dspace_subtitle}".strip() if dspace_subtitle else dspace_title
+
+                # Exact match: try all three key variants against the index
+                exact_candidates = [dspace_title, combined_dspace_title]
+                for candidate in dict.fromkeys(exact_candidates):  # deduplicate, preserve order
+                    key = normalize(candidate)
+                    if key in pure_by_title:
+                        matched_records.extend(pure_by_title[key])
+                        match_type = "Title (Exact)"
+                        break
+
+                if not matched_records:
                     best_match = None
                     best_similarity = 0
                     for pure_item in pure_items:
-                        pure_title = pure_item.get("title", {}).get("value", "").strip()
-                        if pure_title:
-                            pure_subtitle = pure_item.get("subTitle", {}).get("value", "").strip()
-                            # Combine Pure title and subtitle
-                            combined_pure_title = pure_title
-                            if pure_subtitle:
-                                combined_pure_title = f"{pure_title} {pure_subtitle}"
-                            
+                        pure_title_val = pure_item.get("title", {}).get("value", "").strip()
+                        if pure_title_val:
+                            pure_subtitle_val = pure_item.get("subTitle", {}).get("value", "").strip()
                             similarity, is_match = calculate_title_similarity(
-                                combined_dspace_title, combined_pure_title, TITLE_SIMILARITY_THRESHOLD
+                                dspace_title,
+                                dspace_subtitle,
+                                pure_title_val,
+                                pure_subtitle_val,
+                                TITLE_SIMILARITY_THRESHOLD,
                             )
                             if is_match and similarity > best_similarity:
                                 best_match = pure_item
                                 best_similarity = similarity
-                    
+
                     if best_match:
                         matched_records = [best_match]
                         match_type = f"Title Similarity ({best_similarity:.1%})"
