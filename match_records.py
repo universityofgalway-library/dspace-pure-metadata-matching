@@ -107,8 +107,25 @@ SYSTEM_FIELDS_TO_EXCLUDE = {
     "createdDate",
     "modifiedBy",
     "modifiedDate",
+    "portalUrl",
     "prettyUrlIdentifiers",
     "version",
+    "pureId"
+}
+
+SYSTEM_FIELDS = {
+    "createdBy",
+    "createdDate",
+    "modifiedBy",
+    "modifiedDate",
+    "prettyUrlIdentifiers",
+    "version",
+    "pureId",
+    "portalUrl",
+	"systemName",
+	"uuid", 
+	"version", 
+	"previousUuids"
 }
 
 LANG_MAP = {
@@ -826,17 +843,22 @@ def resolve_record_duplicate(records):
     def score(record):
         # 1. Prefer visibility FREE or CAMPUS
         vis = record.get("visibility", {}).get("key", "")
-        # No reason to give any score to CONFIDENTIAL or BACKEND records
         vis_score = 1 if vis in ["FREE", "CAMPUS"] else 0
 
-        # 2. Count filled fields (excluding system ones)
-        field_count = sum(1 for k, v in record.items() if k not in ["uuid", "createdBy", "modifiedBy", "version", "portalUrl", "prettyUrlIdentifiers", "previousUuids"])
+        # 2. Count filled fields at 0.5 each (excluding system ones)
+        field_count = sum(0.5 for k, v in record.items() if k not in SYSTEM_FIELDS and v)
 
-        # 3. Prefer real users
+        # 3. Prefer real users — 2 if real user, 0 otherwise
         modifier = record.get("modifiedBy", "")
-        is_real_user = modifier not in ["root", "atira", "sync_user", "admin", "system", ""]
+        real_user_score = 2 if modifier not in ["root", "atira", "sync_user", "admin", "system", ""] else 0
 
-        return (vis_score, field_count, is_real_user)
+        # 4. Count internal contributors — 1 point each
+        internal_contributor_score = sum(
+            1 for c in record.get("contributors", [])
+            if c and c.get("typeDiscriminator") == "InternalContributorAssociation"
+        )
+
+        return (vis_score, internal_contributor_score, field_count, real_user_score)
 
     sorted_records = sorted(records, key=score, reverse=True)
     return sorted_records[0]
@@ -1826,19 +1848,27 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     pure_title    = pure_record.get("title", {}).get("value", "").strip()
     pure_subtitle = pure_record.get("subTitle", {}).get("value", "").strip()
 
+    # Resolve the effective subtitle: prefer explicit dc.title.subtitle,
+    # but fall back to Pure's existing subtitle so we can strip it from
+    # the DSpace title if it is embedded there (e.g. "Title: Subtitle").
+    effective_subtitle = dspace_subtitle or pure_subtitle
+
     if override_mode:
-        # Override: replace both title and subtitle together
         if dspace_title:
-            clean_title    = strip_subtitle_from_title(dspace_title, dspace_subtitle)
+            # Strip any embedded subtitle from the title string before writing,
+            # using whichever subtitle we know about.
+            clean_title = strip_subtitle_from_title(dspace_title, effective_subtitle)
             updated_record["title"] = {"value": escape_special_chars(clean_title)}
             if dspace_subtitle:
                 updated_record["subTitle"] = {"value": escape_special_chars(dspace_subtitle)}
             else:
                 updated_record["subTitle"] = {"value": ""}
     else:
-        # Precedence: fill only if Pure field is blank
+        # Precedence: fill only if Pure field is blank.
         if dspace_title and not pure_title:
-            clean_title = strip_subtitle_from_title(dspace_title, dspace_subtitle)
+            # Strip any embedded subtitle (from DSpace or already in Pure)
+            # before writing the title.
+            clean_title = strip_subtitle_from_title(dspace_title, effective_subtitle)
             updated_record["title"] = {"value": escape_special_chars(clean_title)}
 
         if dspace_subtitle and not pure_subtitle:
