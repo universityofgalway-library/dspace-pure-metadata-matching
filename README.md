@@ -2,19 +2,53 @@
 
 # `match_records.py`
 
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Configuration & Usage](#configuration--usage)
+   - [Basic Execution](#basic-execution)
+   - [Configuration](#configuration)
+   - [Modes of Operation](#modes-of-operation)
+   - [Input Files](#input-files)
+   - [Output Files](#output-files)
+3. [Record Matching](#record-matching)
+   - [Matching Logic](#matching-logic)
+   - [Contributor Processing](#contributor-processing)
+   - [Funder Processing](#funder-processing)
+   - [Electronic Versions & DOI Handling](#electronic-versions--doi-handling)
+4. [Deduplication Strategies](#deduplication-strategies)
+   - [Record Deduplication](#record-deduplication-resolve_record_duplicate)
+   - [Person Deduplication](#person-deduplication-resolve_author_duplicate)
+   - [Organisation Deduplication](#organisation-deduplication-resolve_funder_duplicate)
+   - [Contributor Deduplication Within a Record](#contributor-deduplication-within-a-record)
+5. [Type Mapping](#type-mapping)
+   - [Type Downgrade](#type-downgrade)
+   - [Peer Review Defaults](#peer-review-defaults)
+6. [Metadata Update Rules](#metadata-update-rules)
+   - [Field-Level Precedence](#field-level-precedence)
+   - [Author Keyword Group](#author-keyword-group)
+   - [Subtitle Stripping](#title-subtitle-stripping)
+   - [External Organisation Filtering](#external-organisation-filtering)
+7. [Logging & Diagnostics](#logging--diagnostics)
+   - [Status Log](#1-status-log-status_log_datejson)
+   - [Console / Processing Log](#2-console--processing-log-processing_log_yyyy-mm-ddlog)
+   - [Error Log](#3-error-log-error_log_yyyy-mm-ddlog)
+8. [Caching & Performance](#caching--performance)
+9. [Known Limitations & Edge Cases](#known-limitations--edge-cases)
 
 ## Overview
  
 This script is a data migration and enrichment tool that bridges two research information systems: **DSpace** (an institutional repository) and **Pure** (a research information management system). For each record in a DSpace CSV export, the script attempts to find a corresponding record in a Pure JSON export and update it with enriched metadata according to precedence rules. If no Pure match is found, a new Pure record is created from the DSpace data.
  
-The script is designed to be run as a batch process over tens of thousands of records, with extensive logging to support manual review of edge cases.
+The script is designed to be run as a batch process over tens of thousands of records, with extensive logging to support manual review of edge cases. **NB!** The script and all data files use American spelling (e.g. "organization", not "organisation") to match Pure metadata schemas.
+
 
 **High-level processing loop per DSpace record:**
  
 1. Skip if no contributors present in any role field.
 2. Attempt to match to an existing Pure record (4-step cascade).
-3. If matched: update the Pure record according to precedence rules.
-4. If unmatched: create a new Pure record from scratch.
+   - **If matched**: update the Pure record according to precedence rules.
+   - **If unmatched**: create a new Pure record from scratch.
 5. Write outputs to type-partitioned JSON files.
 6. Append to processing log.
 
@@ -47,8 +81,8 @@ An `.env` file is required to provide the `PURE_ROOT_API_KEY` for API-based orga
  
 #### Standard Mode (`OVERRIDE_MODE = False`)
  
-- Pure data is preserved for all non-empty fields.
-- DSpace data fills gaps only.
+- The default setting.
+- Updates strictly follow the precedence rules (see [Field-Level Precedence](#field-level-precedence)).
 - Existing contributors, funders, and organisations are preserved and new ones appended.
 - Recommended for initial enrichment passes.
  
@@ -75,6 +109,7 @@ A flat CSV export from DSpace with one row per item. Required columns used by th
  
 | Column | Purpose |
 |---|---|
+| `uuid` | DSpace UUID |
 | `dc.title` | Primary title |
 | `dc.title.subtitle` | Subtitle (also falls back to `dc.title.alternative`) |
 | `dc.contributor.author` | Semicolon-separated author names |
@@ -95,19 +130,30 @@ A flat CSV export from DSpace with one row per item. Required columns used by th
  
 #### Pure JSON
  
-A list of Pure research output objects as returned by the Pure API. Key fields used for matching and updating: `uuid`, `typeDiscriminator`, `type.uri`, `title.value`, `subTitle.value`, `contributors`, `electronicVersions`, `links`, `publicationStatuses`, `fundingDetails`, `fundingText`, `keywordGroups`, `language`, `abstract`, `journalAssociation`, `managingOrganization`, `organizations`, `visibility`, `modifiedBy`.
+A list of Pure research output objects as returned by the Pure API. Key fields used for matching and updating: `uuid`, `typeDiscriminator`, `type.uri`, `title.value`, `subTitle.value`, `contributors`, `electronicVersions`, `links`, `publicationStatuses`, `fundingDetails`, `fundingText`, `keywordGroups`, `language`, `abstract`, `journalAssociation`, `managingOrganization`, `organizations`.
  
 #### Person Mapping JSON
  
 A list of person objects, each with:
 - `firstName`, `lastName`: canonical name
 - `alternativeFirstName`, `alternativeLastName`: lists of name variations
-- `internal` (bool) + `internalUUIDs`: for Pure internal persons
-- `external` (bool) + `externalUUIDs`: for Pure external persons
+- `internal` (bool): if a person is internal 
+- `internalUUIDs`: a list of Pure UUIDs for internal persons, including their visibility (`FREE`, `CAMPUS`, `BACKEND`, `CONFIDENTIAL`)
+- `internalDuplicates` (bool): whether a person has internal duplicates in Pure
+- `external` (bool): if a person is external
+- `externalUUIDs`: a list of Pure UUIDs for external persons
+- `externalDuplicates` (bool): whether a person has external duplicates in Pure
 - `primaryInternalOrganization`: preferred organisation UUID for internal persons
-- `internalOrganizations`: fallback organisation list
-- `externalOrganizations`: organisation UUIDs for external persons
-- `papers`: list of known papers (`doi`, `handle`, `title`) used for disambiguation
+- `internalOrganizations`: a list of internal organisation UUIDs associated with an internal person
+- `externalOrganizations`: a list of external organisation UUIDs associated with any person
+- `orcid`: person's ORCID number (if available)
+- `scopusId`: person's Scopus ID (if available)
+- `papers`: a list of known papers (`doi`, `handle`, `title`) used for disambiguation
+- `paperCount`: the number of papers associated with this person
+- `dspaceMerge` (bool): if the record is a result of the merge of 2+ DSpace authors
+- `sourceAuthorIds`: a list of DSpace author IDs that were merged *(these IDs are assigned by the DSpace author merging script and aren't present in DSpace)*
+
+**NB!** An person can have both internal & external UUIDs and both internal & external duplicates. This is a reflection of the duplicates that exist in Pure. 
  
 #### Organisation Mapping JSON
  
@@ -115,7 +161,7 @@ A list of organisation objects, each with:
 - `name`: list of known name strings for the organisation
 - `uuid`: Pure organisation UUID
 - `internal` / `external`: boolean flags
-- `visibility`: visibility key (e.g., `FREE`, `CAMPUS`)
+- `visibility`: visibility key (`FREE`, `CAMPUS`, `BACKEND`, `CONFIDENTIAL`)
  
 ### Output Files
  
@@ -142,7 +188,6 @@ test_output/
 ├── matched/
 │   ├── contributiontojournal_2025-12-06.json
 │   ├── contributiontoconference_2025-12-06.json
-│   ├── thesis_2025-12-06.json
 │   └── ...
 ├── unmatched/
 │   ├── contributiontojournal_2025-12-06.json
@@ -155,38 +200,26 @@ test_output/
     └── processing_log_2025-12-06.log
 ```
 
-#### File Organization
-
-**Research Output JSONs** are organized by Pure type (extracted from `type.uri`):
-
-- `contributiontojournal` - Journal articles, reviews
-- `contributiontoconference` - Conference papers, posters
-- `thesis` - Doctoral/master theses
-- `bookanthology` - Books, reports, proceedings
-- `workingpaper` - Working papers
-- `nontextual` - AV materials, interactive resources
-- `contributiontoperiodical` - Newspaper articles, book reviews
-- `othercontribution` - Other
- 
----
 
 ## Record Matching
 
 Matching is attempted in a strict priority cascade. The script stops at the first strategy that returns at least one result.
+
+### Matching logic
  
-### Strategy 1: Publisher DOI
+#### Strategy 1: Publisher DOI
  
 The `dc.identifier.doi` field is normalised to a canonical `https://doi.org/10.xxxx` form and looked up against an index of Pure records keyed by their electronic version DOIs (excluding repository DOIs in the `10.13025` namespace).
  
-### Strategy 2: Repository DOI
+#### Strategy 2: Repository DOI
  
 DOIs in the `10.13025` namespace are extracted from `dc.identifier.uri` (which may contain multiple semicolon-separated values) and looked up against a separate index of Pure records keyed by their repository electronic version DOIs.
  
-### Strategy 3: Handle
+#### Strategy 3: Handle
  
 All `hdl.handle.net` URLs are extracted from `dc.identifier.uri` and looked up against an index built from two sources in Pure records: the `links` array (Handle entries) and electronic versions whose DOIs resolve to handle URLs.
  
-### Strategy 4: Title Similarity
+#### Strategy 4: Title Similarity
  
 Applied only when strategies 1–3 all fail. Two sub-strategies are tried in order:
  
@@ -199,14 +232,105 @@ Applied only when strategies 1–3 all fail. Two sub-strategies are tried in ord
  
 The best score across the three variants must meet the `TITLE_SIMILARITY_THRESHOLD` (default 90%) to be accepted. A short-circuit length check (>50% relative length difference) skips clearly mismatched pairs before fuzzy comparison. If the query title contains no indexable tokens (e.g. it consists entirely of stop words or very short words), the candidate set is empty and no fuzzy match is attempted.
  
-### Pre-built Lookup Indices
+#### Pre-built Lookup Indices
  
 All four strategies use pre-built in-memory data structures constructed once before the main processing loop:
 - Strategies 1–3 use `defaultdict(list)` dictionaries keyed by normalised identifiers — all lookups are O(1).
 - Strategy 4a uses a normalised title dictionary — also O(1).
 - Strategy 4b uses `title_token_index`, an inverted index mapping significant title words to sets of Pure record positions. Candidate retrieval is O(q × k) where q is the number of query tokens and k is the average posting list length, followed by fuzzy scoring over at most 200 candidates — effectively constant time in practice compared to the previous O(n) full scan.
+
+### Contributor Processing
  
----
+#### Name Parsing
+ 
+Contributor names from DSpace are semicolon-separated and parsed individually. Each name is parsed into first/last components:
+- `"Last, First"` format: split on the first comma.
+- `"First Last"` format: last token is the surname, all preceding tokens are the first name.
+ 
+#### Role Resolution
+ 
+DSpace contributor fields map to Pure roles as follows:
+ 
+| DSpace field | Pure role URI fragment |
+|---|---|
+| `dc.contributor.author` | `/author` |
+| `dc.contributor.editor` | `/editor` |
+| `dc.contributor.translator` | `/translator` |
+| `dc.contributor.illustrator` | `/illustrator` |
+ 
+Role URIs are constructed dynamically from the record's Pure type key (e.g., `/dk/atira/pure/researchoutput/roles/contributiontojournal/author`).
+ 
+#### Author/Editor Overlap Resolution
+ 
+If the same name appears in both `dc.contributor.author` and `dc.contributor.editor`, the script resolves the conflict based on `dc.type`:
+ 
+- **Book-like types** (`book`, `interactive resource`, `conference proceedings`): the name is kept as **editor** and removed from the author list.
+- **All other types**: the name is kept as **author** and removed from the editor list.
+ 
+#### Missing Author Correction
+ 
+If `dc.type` is a non-book type but `dc.contributor.editor` is populated and `dc.contributor.author` is empty, the editors are treated as authors. This corrects a common metadata error in DSpace exports where book chapter authors were entered in the editor field.
+ 
+#### No-contributor Gatekeeping
+ 
+Records with no content in any of the four contributor fields (`author`, `editor`, `translator`, `illustrator`) are skipped entirely before matching is attempted. They are logged to the status log with error `"No contributors found in any contributor field"`.
+ 
+For new record creation (unmatched path), if contributor matching produces zero successfully resolved contributors, the record is also skipped (logged as `"No matched contributors"`).
+ 
+#### Organisation Validation
+ 
+After building the contributor list, all internal organisation UUIDs are batch-validated against the Pure API. Any UUID that returns a non-200 response is moved from `organizations` (internal) to `externalOrganizations` (external) on the contributor. This prevents write failures caused by stale or incorrect UUIDs in the person mapping.
+
+ 
+### Funder Processing
+ 
+#### Name Matching
+ 
+Funder names from `dc.contributor.funder` (semicolon-separated) are normalised by lowercasing and replacing punctuation with spaces. The normalised name is looked up in a pre-built index of organisation names from the organisation mapping.
+ 
+#### Unmatched Funders
+ 
+If a funder name cannot be matched, it is added to the `_unmatched_funders` global list and written to `unmatched_funders_<date>.csv` at the end of processing.
+ 
+If no `dc.description.sponsorship` text is available and there are unmatched funders, their names are concatenated and written to the Pure `fundingText` field as a fallback. This preserves the funding information in a human-readable form even without a matched UUID.
+ 
+### Electronic Versions & DOI Handling
+
+#### Electronic Version Types
+
+- **Publisher Version** (`dc.identifier.doi`):
+  - `versionType: "publishersversion"`
+  - `accessType: "UNKNOWN"` (default)
+  
+- **Repository Version** (`dc.identifier.uri` with DOI `10.13025/*`):
+  - `versionType: "authorsversion"`
+  - `accessType: "OPEN_ACCESS"` or `"EMBARGOED"` (if embargo present)
+  - `licenseType`: mapped from `dc.rights` (e.g., "CC BY-NC-ND")
+ 
+#### DOI Normalisation
+ 
+All DOIs throughout the script are normalised to the canonical form `https://doi.org/10.xxxx` before any comparison or storage, stripping `doi:`, `http://doi.org/`, and bare `10.` prefixes.
+ 
+#### Embargo Handling
+ 
+Embargo status is computed by comparing the parsed embargo end date against today's date (`TODAY`). If active, the electronic version's `accessType` is set to `EMBARGOED` and an `embargoPeriod.endDate` is attached. Expired embargos result in `OPEN` access type.
+ 
+#### Repository vs Publisher DOIs
+ 
+The script distinguishes DOIs by prefix:
+- **Repository DOIs** (`10.13025/...`): mapped to `authorsVersion`, with `CC BY-NC-ND` licence. These always appear first in the `electronicVersions` array.
+- **Publisher DOIs** (all other `10.` prefixes): mapped to `publishersVersion`. These appear after repository versions.
+ 
+#### Handle Links
+ 
+Exactly one Handle link is written to the Pure `links` array per record, with `alias: "Handle"`. The selection logic is:
+ 
+1. **DSpace takes precedence.** The first Handle URL extracted from `dc.identifier.uri` is used as the canonical handle, replacing any handle(s) already present in Pure.
+2. **Fallback to Pure.** If DSpace supplies no handle, the first existing handle from the Pure record is preserved unchanged.
+3. **Surplus handles are dropped.** Any additional handles from either source are discarded, ensuring the links array never accumulates multiple Handle entries across runs.
+ 
+All DOI links that may exist in the Pure `links` array are removed unconditionally — DOIs belong in `electronicVersions`, not `links`. All other non-handle, non-DOI links are preserved as-is.
+
  
 ## Deduplication Strategies
  
@@ -229,7 +353,7 @@ The record with the highest combined score is selected. The `duplicates: true` f
  
 When a contributor name matches more than one person in the mapping, the best candidate is selected using a four-level scoring key, evaluated in strict priority order:
  
-**Level 1 — Paper evidence (highest priority)**
+**Level 1: Paper evidence (highest priority)**
  
 The person's pre-indexed set of known papers (`_paper_dois`, `_paper_handles`, `_paper_titles`) is compared against the current DSpace record's identifiers:
  
@@ -242,7 +366,7 @@ The person's pre-indexed set of known papers (`_paper_dois`, `_paper_handles`, `
  
 A confirmed paper evidence match always wins before any other criterion is considered, regardless of whether the candidate is internal or external.
  
-**Level 2 — Person type**
+**Level 2: Person type**
  
 Internal Pure persons (staff) are preferred over external persons, who are preferred over unclassified entries.
  
@@ -252,7 +376,7 @@ Internal Pure persons (staff) are preferred over external persons, who are prefe
 | External | 1 |
 | Other | 0 |
  
-**Level 3 — Visibility**
+**Level 3: Visibility**
  
 For internal persons, the visibility of their UUID record is used:
  
@@ -261,7 +385,7 @@ For internal persons, the visibility of their UUID record is used:
 | `FREE` or `CAMPUS` | 2 |
 | `BACKEND` or `CONFIDENTIAL` | 1 |
  
-**Level 4 — Metadata richness (lowest priority)**
+**Level 4: Metadata richness (lowest priority)**
  
 If an API key is available, the number of populated fields on the person record is fetched from the Pure API and used as a tiebreaker. Results are cached to avoid repeated API calls for the same UUID.
  
@@ -276,100 +400,6 @@ When a funder name matches more than one organisation, the best candidate is sel
  
 When updating an existing Pure record (non-override mode), a contributor from DSpace is not added again if they already appear in the Pure record. Existing contributors are identified by both UUID and name (including all name variations from the `names` array). The matching uses a set of normalised `(first, last)` tuples covering all combinations of name variants in both normal and reversed order.
  
-### External Organisation Filtering
- 
-A hardcoded list (`EXTERNAL_ORGS_TO_IGNORE`) contains UUIDs for all known variants of "University of Galway" / "NUI Galway" in the Pure external organisation database. These are silently excluded from contributor-level `externalOrganizations` and record-level `externalOrganizations` to avoid circular institutional affiliation data. This filtering is applied even if an ignored UUID is the only available organisation.
- 
----
-
-## Contributor Processing
- 
-### Name Parsing
- 
-Contributor names from DSpace are semicolon-separated and parsed individually. Each name is parsed into first/last components:
-- `"Last, First"` format: split on the first comma.
-- `"First Last"` format: last token is the surname, all preceding tokens are the first name.
- 
-### Role Resolution
- 
-DSpace contributor fields map to Pure roles as follows:
- 
-| DSpace field | Pure role URI fragment |
-|---|---|
-| `dc.contributor.author` | `/author` |
-| `dc.contributor.editor` | `/editor` |
-| `dc.contributor.translator` | `/translator` |
-| `dc.contributor.illustrator` | `/illustrator` |
- 
-Role URIs are constructed dynamically from the record's Pure type key (e.g., `/dk/atira/pure/researchoutput/roles/contributiontojournal/author`).
- 
-### Author/Editor Overlap Resolution
- 
-If the same name appears in both `dc.contributor.author` and `dc.contributor.editor`, the script resolves the conflict based on `dc.type`:
- 
-- **Book-like types** (`book`, `interactive resource`, `conference proceedings`): the name is kept as **editor** and removed from the author list.
-- **All other types**: the name is kept as **author** and removed from the editor list.
- 
-### Missing Author Correction
- 
-If `dc.type` is a non-book type but `dc.contributor.editor` is populated and `dc.contributor.author` is empty, the editors are treated as authors. This corrects a common metadata error in DSpace exports where book chapter authors were entered in the editor field.
- 
-### No-contributor Gatekeeping
- 
-Records with no content in any of the four contributor fields (`author`, `editor`, `translator`, `illustrator`) are skipped entirely before matching is attempted. They are logged to the status log with error `"No contributors found in any contributor field"`.
- 
-For new record creation (unmatched path), if contributor matching produces zero successfully resolved contributors, the record is also skipped (logged as `"No matched contributors"`).
- 
-### Organisation Validation
- 
-After building the contributor list, all internal organisation UUIDs are batch-validated against the Pure API. Any UUID that returns a non-200 response is moved from `organizations` (internal) to `externalOrganizations` (external) on the contributor. This prevents write failures caused by stale or incorrect UUIDs in the person mapping.
- 
----
- 
-## Funder Processing
- 
-### Name Matching
- 
-Funder names from `dc.contributor.funder` (semicolon-separated) are normalised by lowercasing, replacing punctuation with spaces, and collapsing whitespace. The normalised name is looked up in a pre-built index of organisation names from the organisation mapping. The index covers all name variants listed for each organisation.
- 
-### Unmatched Funders
- 
-If a funder name cannot be matched, it is added to the `_unmatched_funders` global list and written to `unmatched_funders_<date>.csv` at the end of processing.
- 
-If no `dc.description.sponsorship` text is available and there are unmatched funders, their names are concatenated and written to the Pure `fundingText` field as a fallback. This preserves the funding information in a human-readable form even without a matched UUID.
- 
----
- 
-## Electronic Versions & DOI Handling
- 
-### DOI Normalisation
- 
-All DOIs throughout the script are normalised to the canonical form `https://doi.org/10.xxxx` before any comparison or storage, stripping `doi:`, `http://doi.org/`, and bare `10.` prefixes.
- 
-### Embargo Handling
- 
-Embargo status is computed by comparing the parsed embargo end date against today's date (`TODAY`). If active, the electronic version's `accessType` is set to `EMBARGOED` and an `embargoPeriod.endDate` is attached. Expired embargos result in `OPEN` access type.
- 
-### Repository vs Publisher DOIs
- 
-The script distinguishes DOIs by prefix:
-- **Repository DOIs** (`10.13025/...`): mapped to `authorsVersion`, with `CC BY-NC-ND` licence. These always appear first in the `electronicVersions` array.
-- **Publisher DOIs** (all other `10.` prefixes): mapped to `publishersVersion`. These appear after repository versions.
- 
-DOI links that may exist in the Pure `links` array are removed, since DOIs belong in `electronicVersions`, not `links`.
- 
-### Handle Links
- 
-Exactly one Handle link is written to the Pure `links` array per record, with `alias: "Handle"`. The selection logic is:
- 
-1. **DSpace takes precedence.** The first Handle URL extracted from `dc.identifier.uri` is used as the canonical handle, replacing any handle(s) already present in Pure.
-2. **Fallback to Pure.** If DSpace supplies no handle, the first existing handle from the Pure record is preserved unchanged.
-3. **Surplus handles are dropped.** Any additional handles from either source are discarded, ensuring the links array never accumulates multiple Handle entries across runs.
- 
-All DOI links that may exist in the Pure `links` array are removed unconditionally — DOIs belong in `electronicVersions`, not `links`. All other non-handle, non-DOI links are preserved as-is.
- 
----
-
 ## Type Mapping
  
 Used for **unmatched records** to create them on Pure.
@@ -395,17 +425,6 @@ Used for **unmatched records** to create them on Pure.
 | book review | `/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/book` |
 | other | `/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other` |
 | data management plan | `/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other` |
-
-### Electronic Version Types
-
-- **Publisher Version** (`dc.identifier.doi`):
-  - `versionType: "publishersversion"`
-  - `accessType: "UNKNOWN"` (default)
-  
-- **Repository Version** (`dc.identifier.uri` with DOI `10.13025/*`):
-  - `versionType: "authorsversion"`
-  - `accessType: "OPEN_ACCESS"` or `"EMBARGOED"` (if embargo present)
-  - `licenseType`: mapped from `dc.rights` (e.g., "CC BY-NC-ND")
  
 ### Type Downgrade
  
@@ -417,8 +436,7 @@ Types that require a `peerReview` field receive a default value based on type:
 - `ContributionToJournal`, `ContributionToBookAnthology`, `BookAnthology`: `true`
 - All other applicable types: `false`
 - `WorkingPaper`, `ContributionToPeriodical`, `Thesis`, `Memorandum`: field omitted entirely
- 
----
+
 
 ## Metadata Update Rules
 
@@ -449,8 +467,11 @@ When contributors are successfully resolved and added, the `keywordGroups` entry
 ### Title Subtitle Stripping
  
 Before writing a title to Pure, the script checks whether the subtitle is embedded at the end of the title string (e.g., `"Main Title: Subtitle"`). If so, the subtitle portion and any preceding colon are stripped from the title field to avoid duplication. Matching is punctuation-insensitive and case-insensitive.
+
+### External Organisation Filtering
  
----
+A hardcoded list (`EXTERNAL_ORGS_TO_IGNORE`) contains UUIDs for all known variants of "University of Galway" / "NUI Galway" in the Pure external organisation database. These are silently excluded from contributor-level `externalOrganizations` and record-level `externalOrganizations`. This filtering is applied even if an ignored UUID is the only available organisation. This filter only makes a difference if `COLLECT_EXTERNAL_ORGS` is set to `True`; if `False`, no external organisations are collected.
+
 
 ## Logging & Diagnostics
  
@@ -461,15 +482,23 @@ One entry per DSpace record.
 Tracks each DSpace record's matching status:
 
 ```json
-{
-  "handle": "http://hdl.handle.net/10379/1422",
-  "uuid": "7f3a5b8c-9d2e-4f1a-a6c7-3e9d5b8a2f1c",
-  "pure_type": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/paper",
-  "matched": true,
-  "duplicates": false,
-  "success": true,
-  "error": null
-}
+  {
+    "handle": "http://hdl.handle.net/10379/6474",
+    "uuid": "fdf47230-6997-400e-8252-e0e92be337ee",
+    "pureType": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
+    "matched": true,
+    "duplicates": false,
+    "success": true,
+    "error": null,
+    "matches": [
+      {
+        "pureUUID": "fdf47230-6997-400e-8252-e0e92be337ee",
+        "title": "Defining the heathen Irish and the pagan African: two similar discourses a century apart",
+        "matchType": "Publisher DOI"
+      }
+    ],
+    "matchType": "Publisher DOI"
+  }
 
 ```
 
@@ -484,7 +513,6 @@ Tracks each DSpace record's matching status:
 | `success` | `true` if the record was processed without errors |
 | `error` | Error message if `success` is `false` |
 | `matches` | Array of all Pure records that matched, with UUID, title, and match type |
-| `unmatchedFunders` | Array of funders that could not be resolved (if any) |
  
 ### 2. Console / Processing Log (`processing_log_YYYY-MM-DD.log`)
 
@@ -504,8 +532,6 @@ Per-record output uses emoji prefixes for fast visual scanning:
 #### 3. Error Log (`error_log_YYYY-MM-DD.log`)
 
 Full Python tracebacks for any errors encountered during processing.
-
----
  
 ## Caching & Performance
  
@@ -518,15 +544,10 @@ Full Python tracebacks for any errors encountered during processing.
 All three caches are module-level dicts that persist across all records in a single run. Organisation UUIDs are batch-validated per record (collecting all unique UUIDs, then validating in one pass) to reduce API round trips.
  
 Lookup indices (`person_index`, `org_index`, `pure_by_doi`, `pure_by_handle`, `pure_by_title`, `title_token_index`) are all built once before the main loop. Identifier-based matching (strategies 1–3) and exact title matching (strategy 4a) are O(1) dictionary lookups. Fuzzy title matching (strategy 4b) uses `title_token_index` to reduce the candidate pool to at most 200 records before scoring, avoiding the O(n) full scan of the previous approach.
- 
----
+
  
 ## Known Limitations & Edge Cases
  
-- **Multiple handles per record:** Only the first matching handle is used for matching. If a DSpace record has multiple handles and only the second one matches a Pure record, it will be missed by strategy 3 and fall through to title matching.
-- **Fuzzy title matching performance:** Strategy 4b iterates over all Pure records for every unmatched DSpace record. With large datasets (100k+ records each), this can be slow for records that reach this fallback.
-- **`COLLECT_EXTERNAL_ORGS = False` by default:** External organisation data from the person mapping is not attached to any records unless this flag is explicitly enabled. When disabled, external persons are still linked via their UUID but carry no organisation affiliation.
 - **Date parsing and `dayfirst` convention:** Date parsing is handled by `python-dateutil`, which supports ISO 8601 and most common formats robustly. For ambiguous formats (e.g. `01/02/03`), the `dayfirst` parameter controls interpretation — it defaults to `False` (ISO/US order). If your DSpace export uses European day-first dates, set `dayfirst=True` at the two `parse_date` call sites in `update_record_from_dspace` and `create_new_record_from_dspace`. Strings that cannot be parsed at all fall back to a year-extraction regex, and ultimately to `(1970, 1, 1)` if no four-digit year is found.
 - **Irish-language abstracts:** Records with `dc.language.iso: gle` have their abstract written to both the `en_IE` and `ga` keys as a workaround for a display limitation. This means the abstract will appear under both languages in Pure.
 - **Re-run behaviour for output files:** Output JSON files are deduplicated on `uuid` before writing. If a record with the same `uuid` already exists in the output file from a previous run, it is replaced rather than appended, making re-runs idempotent for matched records. New (unmatched) records created from DSpace have no `uuid` yet, so they are keyed under `None` and will overwrite each other if the script is re-run on the same unmatched set — consider clearing the unmatched output directory between runs if this is a concern.
-- **No rollback mechanism:** The `matched_records_before_updates_<date>.json` snapshot provides a reference point for manual recovery, but the script does not implement automated rollback. API writes (if any downstream process consumes the output) must be managed separately.
