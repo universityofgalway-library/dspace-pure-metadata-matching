@@ -10,6 +10,8 @@ from itertools import product
 from tqdm import tqdm
 from rapidfuzz import fuzz
 from dotenv import load_dotenv
+from dateutil import parser as dateutil_parser
+from dateutil.parser import ParserError
 
 
 # --- CONFIGURATION ---
@@ -178,6 +180,47 @@ class LoggerOutput:
 
 # --- HELPER FUNCTIONS ---
 
+def parse_date(date_string, dayfirst=False):
+    """
+    Parse a date string into a (year, month, day) tuple.
+
+    Supports ISO 8601, yyyy-mm-dd, dd-mm-yyyy, yyyy/mm/dd, dd/mm/yyyy,
+    year-only, and most other common formats via dateutil.
+
+    Args:
+        date_string: Raw date string from DSpace metadata.
+        dayfirst:    When True, ambiguous dates like "01/02/03" are interpreted
+                     as dd/mm/yy. When False (default), mm/dd or yyyy-mm-dd order
+                     is assumed. Set to True if your DSpace export uses European
+                     date conventions.
+
+    Returns:
+        (year, month, day) tuple. Falls back to (1970, 1, 1) on failure.
+    """
+    if not date_string:
+        return (1970, 1, 1)
+
+    date_string = date_string.strip()
+
+    # Year-only: "2008", "1995"
+    if date_string.isdigit() and len(date_string) == 4:
+        return (int(date_string), 1, 1)
+
+    try:
+        parsed = dateutil_parser.parse(date_string, dayfirst=dayfirst)
+        return (parsed.year, parsed.month, parsed.day)
+    except (ParserError, ValueError, OverflowError):
+        pass
+
+    # Last resort: extract the first 4-digit year found
+    import re
+    year_match = re.search(r'\b(1[89]\d{2}|20\d{2})\b', date_string)
+    if year_match:
+        return (int(year_match.group(1)), 1, 1)
+
+    return (1970, 1, 1)
+
+
 def strip_system_fields(record):
     """Return a shallow copy of record without system fields."""
     return {
@@ -237,6 +280,60 @@ def escape_special_chars(text):
 
 def extract_uuid(uuid_entry):
     return uuid_entry["uuid"] if isinstance(uuid_entry, dict) else uuid_entry
+
+
+def build_title_token_index(pure_items):
+    """
+    Build an inverted index mapping significant title tokens → Pure records.
+    Common short words (stop words) are excluded to keep candidate sets small.
+    """
+    STOP_WORDS = {
+        "a", "an", "the", "of", "in", "on", "at", "to", "for", "and",
+        "or", "but", "with", "by", "from", "is", "are", "was", "were"
+    }
+    index = defaultdict(set)  # token → set of indices into pure_items
+
+    for i, item in enumerate(pure_items):
+        title = item.get("title", {}).get("value", "")
+        subtitle = item.get("subTitle", {}).get("value", "")
+        combined = f"{title} {subtitle}".strip()
+        tokens = {
+            w for w in normalize(combined).split()
+            if len(w) > 3 and w not in STOP_WORDS
+        }
+        for token in tokens:
+            index[token].add(i)
+
+    return index
+
+
+def find_fuzzy_title_candidates(dspace_title, dspace_subtitle, token_index, pure_items, max_candidates=200):
+    """
+    Use the token index to retrieve a small candidate set before fuzzy scoring.
+    Returns the subset of pure_items worth scoring.
+    """
+    STOP_WORDS = {
+        "a", "an", "the", "of", "in", "on", "at", "to", "for", "and",
+        "or", "but", "with", "by", "from", "is", "are", "was", "were"
+    }
+    combined = f"{dspace_title} {dspace_subtitle}".strip()
+    tokens = {
+        w for w in normalize(combined).split()
+        if len(w) > 3 and w not in STOP_WORDS
+    }
+
+    # Count how many query tokens each Pure record shares
+    hit_counts = defaultdict(int)
+    for token in tokens:
+        for idx in token_index.get(token, set()):
+            hit_counts[idx] += 1
+
+    if not hit_counts:
+        return []
+
+    # Take the top candidates by shared token count
+    top_indices = sorted(hit_counts, key=hit_counts.__getitem__, reverse=True)[:max_candidates]
+    return [pure_items[i] for i in top_indices]
 
 
 def strip_subtitle_from_title(title, subtitle):
@@ -1202,6 +1299,34 @@ def parse_date(date_string):
     return (year, month, day)
 
 
+def append_record_to_file(filepath, new_record):
+    """
+    Append new_record to a JSON array file, deduplicating by uuid.
+    If the file does not exist it is created. Re-running is idempotent:
+    a record with the same uuid as an existing entry replaces it.
+    """
+    existing = []
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                print(f"  ⚠️ Could not parse existing file {filepath} — starting fresh.")
+                existing = []
+
+    # Build a dict keyed by uuid for O(1) dedup; preserve insertion order
+    records_by_uuid = {r.get("uuid"): r for r in existing}
+    record_uuid = new_record.get("uuid")
+
+    if record_uuid and record_uuid in records_by_uuid:
+        print(f"  ℹ️ uuid {record_uuid} already in {os.path.basename(filepath)} — replacing.")
+
+    records_by_uuid[record_uuid] = new_record
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(list(records_by_uuid.values()), f, indent=2, ensure_ascii=False)
+
+
 # --- UPDATING RECORDS ---
 
 def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, override_mode=False):
@@ -1791,32 +1916,38 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
     existing_links = pure_record.get("links", [])
 
-    # Filter out DOI links from existing links
-    filtered_links = []
+    # Separate existing links into handles and everything else (excluding DOIs)
+    existing_handle_links = []
+    non_handle_non_doi_links = []
     for link in existing_links:
         url = link.get("url", "")
-        # Keep the link if it's NOT a DOI link
-        if not "doi.org" in url:
-            filtered_links.append(link)
-    
-    # Add new handle links
-    new_handle_links = []
+        if "doi.org" in url:
+            pass  # drop DOI links entirely
+        elif "hdl.handle.net" in url:
+            existing_handle_links.append(link)
+        else:
+            non_handle_non_doi_links.append(link)
 
+    # Determine the single canonical handle to use
+    canonical_handle = None
     if uri_str:
-        handles = extract_handles_from_uri(uri_str)
-        if handles:
-            existing_handle_urls = {normalize_handle(link.get("url", "")) for link in filtered_links}
-            for handle in handles:
-                normalized_handle = normalize_handle(handle)
-                if normalized_handle not in existing_handle_urls:
-                    link = build_link(handle, alias="Handle", description="Repository Handle")
-                    new_handle_links.append(link)
+        dspace_handles = extract_handles_from_uri(uri_str)
+        if dspace_handles:
+            canonical_handle = dspace_handles[0]  # DSpace takes precedence; use first only
 
-    if new_handle_links:
-        new_handle_links.extend(filtered_links)
-        updated_links = new_handle_links
-    else:
-        updated_links = filtered_links
+    if canonical_handle is None and existing_handle_links:
+        # No DSpace handle available — fall back to Pure's existing handle
+        canonical_handle = existing_handle_links[0].get("url")
+        print(f"  ℹ️ No handle in DSpace URI — keeping existing Pure handle: {canonical_handle}")
+
+    # Build the final links list: canonical handle first, then other non-DOI links
+    updated_links = []
+    if canonical_handle:
+        updated_links.append(build_link(canonical_handle, alias="Handle", description="Repository Handle"))
+    updated_links.extend(non_handle_non_doi_links)
+
+    if updated_links != existing_links:
+        updated_record["links"] = updated_links
     
     # Update links only if changed
     if updated_links != existing_links:
@@ -2325,14 +2456,11 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     if electronic_versions:
         record["electronicVersions"] = electronic_versions
 
-    # Add handles to links
+    # Add only the first Handle from DSpace to links to avoid duplication
     if uri_str:
         handles = extract_handles_from_uri(uri_str)
-        for handle in handles:
-            link = build_link(handle, alias="Handle", description="Repository Handle")
-            if "links" not in record:
-                record["links"] = []
-            record["links"].append(link)
+        if handles:
+            record["links"] = [build_link(handles[0], alias="Handle", description="Repository Handle")]
 
     # Set rights
     rights = dspace_row.get("dc.rights", "").strip()
@@ -2403,6 +2531,10 @@ def main():
     
     org_index = build_organization_name_index(organization_mapping)
     print(f"✅ Built organization name index with {len(org_index)} entries")
+
+    print("Building title token index...")
+    title_token_index = build_title_token_index(pure_items)
+    print(f"✅ Built title token index with {len(title_token_index)} tokens")
 
     # Prepare logs
     log_entries = []
@@ -2525,7 +2657,7 @@ def main():
             if dspace_title:
                 combined_dspace_title = f"{dspace_title} {dspace_subtitle}".strip() if dspace_subtitle else dspace_title
 
-                # Exact match: try all three key variants against the index
+                # Strategy 4a. Exact match: try all three key variants against the index
                 exact_candidates = [dspace_title, combined_dspace_title]
                 for candidate in dict.fromkeys(exact_candidates):  # deduplicate, preserve order
                     key = normalize(candidate)
@@ -2534,10 +2666,14 @@ def main():
                         match_type = "Title (Exact)"
                         break
 
+                # Strategy 4b. Fuzzy title match: candidates only, not all Pure records
                 if not matched_records:
+                    candidates = find_fuzzy_title_candidates(
+                        dspace_title, dspace_subtitle, title_token_index, pure_items
+                    )
                     best_match = None
                     best_similarity = 0
-                    for pure_item in pure_items:
+                    for pure_item in candidates:
                         pure_title_val = pure_item.get("title", {}).get("value", "").strip()
                         if pure_title_val:
                             pure_subtitle_val = pure_item.get("subTitle", {}).get("value", "").strip()
@@ -2582,17 +2718,10 @@ def main():
                 updated_record, success = update_record_from_dspace(record, row, person_index, org_index, log_entry, before_update_records, override_mode=OVERRIDE_MODE)
                 log_entry["success"] = success
                 if success:
-                    # Save to matched folder
                     type_key = get_pure_type_key(log_entry["pureType"])
                     filename = f"{type_key}_{TODAY}.json"
                     filepath = os.path.join(MATCHED_DIR, filename)
-                    existing = []
-                    if os.path.exists(filepath):
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            existing = json.load(f)
-                    existing.append(updated_record)
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(existing, f, indent=2, ensure_ascii=False)
+                    append_record_to_file(filepath, updated_record)
             except Exception as e:
                 log_entry["success"] = False
                 log_entry["error"] = str(e)
@@ -2612,17 +2741,10 @@ def main():
                     log_entry["success"] = True
                     log_entry["pureType"] = new_record.get("type", {}).get("uri", "")
 
-                    # Save to unmatched folder
                     type_key = get_pure_type_key(log_entry["pureType"])
                     filename = f"{type_key}_{TODAY}.json"
                     filepath = os.path.join(UNMATCHED_DIR, filename)
-                    existing = []
-                    if os.path.exists(filepath):
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            existing = json.load(f)
-                    existing.append(new_record)
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(existing, f, indent=2, ensure_ascii=False)
+                    append_record_to_file(filepath, new_record)
             except Exception as e:
                 log_entry["success"] = False
                 log_entry["error"] = str(e)
