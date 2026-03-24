@@ -283,8 +283,12 @@ For new record creation (unmatched path), if contributor matching produces zero 
  
 #### Organisation Validation
  
-After building the contributor list, all internal organisation UUIDs are batch-validated against the Pure API. Any UUID that returns a non-200 response is moved from `organizations` (internal) to `externalOrganizations` (external) on the contributor. This prevents write failures caused by stale or incorrect UUIDs in the person mapping.
+After building the contributor list, all internal organisation UUIDs are batch-validated against the Pure API. For any UUID that returns a non-200 response from the internal organisations endpoint, the behaviour depends on `COLLECT_EXTERNAL_ORGS`:
 
+- `COLLECT_EXTERNAL_ORGS = False`: the UUID is omitted entirely from the contributor and a warning is written to the processing log.
+- `COLLECT_EXTERNAL_ORGS = True`: the Pure external organisations endpoint is checked for the same UUID. If found, the UUID is attached to the contributor as an `externalOrganization` and the type change is recorded in the processing log. If not found in external organisations either, the UUID is omitted entirely and a warning is written to the processing log.
+
+This prevents write failures caused by stale or incorrect UUIDs in the person mapping while avoiding silent data loss.
  
 ### Funder Processing
  
@@ -544,7 +548,7 @@ Full Python tracebacks for any errors encountered during processing.
 |---|---|---|
 | `_person_metadata_cache` | Internal persons | Stores field counts from the Pure persons API to avoid repeat calls |
 | `_external_person_metadata_cache` | External persons | Same as above for external-persons endpoint |
-| `_org_validation_cache` | Organisations | Stores boolean validity results from the Pure organisations API |
+| `_org_validation_cache` | Organisations | Stores boolean validity results from both the Pure internal organisations API and the external organisations API (keyed with an external:: prefix to avoid collision) |
  
 All three caches are module-level dicts that persist across all records in a single run. Organisation UUIDs are batch-validated per record (collecting all unique UUIDs, then validating in one pass) to reduce API round trips.
  
