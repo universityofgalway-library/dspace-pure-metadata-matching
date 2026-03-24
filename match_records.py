@@ -180,7 +180,7 @@ class LoggerOutput:
 
 # --- HELPER FUNCTIONS ---
 
-def parse_date(date_string, dayfirst=False):
+def parse_date(date_string, dayfirst=True):
     """
     Parse a date string into a (year, month, day) tuple.
 
@@ -411,7 +411,8 @@ def calculate_title_similarity(dspace_title, dspace_subtitle, pure_title, pure_s
     scores = [
         _sim(dspace_title, pure_title),         
         _sim(combined_dspace, pure_title),        
-        _sim(dspace_title, combined_pure),       
+        _sim(dspace_title, combined_pure),
+        _sim(combined_dspace, combined_pure)       
     ]
     best = max(scores)
     return (best, best >= threshold)
@@ -887,7 +888,7 @@ def resolve_author_duplicate(matches, paper_dois=None, paper_handles=None, paper
 
         paper_score = 0
         if paper_dois & person_dois:
-            paper_score = 3          # DOI match — strongest signal
+            paper_score = 2          # DOI match — strongest signal
         elif paper_handles & person_handles:
             paper_score = 2          # Handle match
         elif paper_title and paper_title in person_titles:
@@ -903,8 +904,6 @@ def resolve_author_duplicate(matches, paper_dois=None, paper_handles=None, paper
             if internal_uuids and isinstance(internal_uuids[0], dict):
                 vis = internal_uuids[0].get("visibility", "")
                 if vis in ["FREE", "CAMPUS"]:
-                    vis_score = 2
-                elif vis in ["BACKEND", "CONFIDENTIAL"]:
                     vis_score = 1
 
         metadata_score = 0
@@ -1002,32 +1001,6 @@ def build_link(url, alias="", description=""):
         }
 
 
-def validate_organization(org_uuid, api_key, base_url):
-    """
-    Validate if an organization UUID exists in Pure.
-    Returns True if found, False otherwise.
-    Uses cache to avoid redundant API calls.
-    """
-    # Check cache first
-    if org_uuid in _org_validation_cache:
-        return _org_validation_cache[org_uuid]
-    
-    try:
-        response = requests.get(
-            f"{base_url}organizations/{org_uuid}",
-            headers={
-                "accept": "application/json",
-                "api-key": api_key
-            },
-            timeout=10
-        )
-        result = response.status_code == 200
-        _org_validation_cache[org_uuid] = result
-        return result
-    except Exception:
-        _org_validation_cache[org_uuid] = False
-        return False
-    
 
 def batch_validate_organizations(org_uuids, api_key, base_url):
     """
@@ -1070,75 +1043,109 @@ def batch_validate_organizations(org_uuids, api_key, base_url):
     return results
 
 
-def validate_and_fix_organizations(contributors, api_key, base_url):
+def validate_organization_as_external(org_uuid, api_key, base_url):
     """
-    Validate all internal organization UUIDs for contributors.
-    Move invalid internal orgs to externalOrganizations.
+    Check whether an org UUID exists in the Pure external-organizations endpoint.
+    Uses a separate cache key prefix to avoid collision with internal org cache.
+    Returns True if found, False otherwise.
+    """
+    cache_key = f"external::{org_uuid}"
+    if cache_key in _org_validation_cache:
+        return _org_validation_cache[cache_key]
+
+    try:
+        response = requests.get(
+            f"{base_url}external-organizations/{org_uuid}",
+            headers={
+                "accept": "application/json",
+                "api-key": api_key
+            },
+            timeout=10
+        )
+        result = response.status_code == 200
+        _org_validation_cache[cache_key] = result
+        return result
+    except Exception:
+        _org_validation_cache[cache_key] = False
+        return False
+
+
+def validate_and_fix_organizations(contributors, api_key, base_url, collect_external_orgs=False):
+    """
+    Validate all internal organization UUIDs for contributors against the Pure API.
+
+    For each invalid internal org UUID:
+    - If collect_external_orgs is False: omit the UUID entirely and log a warning.
+    - If collect_external_orgs is True: check whether the UUID exists as an external
+      organisation. If found, attach it as an externalOrganization and log the change.
+      If not found, omit it entirely and log a warning.
+
     Returns updated contributors list.
     """
     if not api_key:
         print("  ⚠️ No API key - skipping organization validation")
         return contributors
-    
-    # Collect all unique org UUIDs first
+
+    # Collect all unique internal org UUIDs first
     all_org_uuids = set()
     for contributor in contributors:
         if not contributor:
             continue
-        internal_orgs = contributor.get("organizations", [])
-        for org in internal_orgs:
+        for org in contributor.get("organizations", []):
             org_uuid = org.get("uuid")
             if org_uuid:
                 all_org_uuids.add(org_uuid)
-    
-    # Batch validate all UUIDs at once
+
+    # Batch validate all UUIDs against the internal organizations endpoint
     validation_results = batch_validate_organizations(list(all_org_uuids), api_key, base_url)
-    
-    # Now update contributors based on validation results
+
     updated_contributors = []
-    
+
     for contributor in contributors:
         if not contributor:
             continue
-        
-        # Check internal organizations
+
         internal_orgs = contributor.get("organizations", [])
         if internal_orgs:
             valid_internal_orgs = []
-            invalid_orgs = []
-            
+
             for org in internal_orgs:
                 org_uuid = org.get("uuid")
-                if org_uuid:
-                    if validation_results.get(org_uuid, False):
-                        valid_internal_orgs.append(org)
+                if not org_uuid:
+                    continue
+
+                if validation_results.get(org_uuid, False):
+                    valid_internal_orgs.append(org)
+                else:
+                    if not collect_external_orgs:
+                        # Omit entirely, log warning
+                        print(f"    ⚠️ Invalid internal org UUID {org_uuid} not found in Pure "
+                              f"— omitting (COLLECT_EXTERNAL_ORGS is False)")
                     else:
-                        print(f"    ⚠️ Invalid internal org UUID {org_uuid} - moving to external")
-                        invalid_orgs.append({
-                            "systemName": "ExternalOrganization",
-                            "uuid": org_uuid
-                        })
-            
-            # Update organizations
+                        # Check if it exists as an external organisation
+                        is_external = validate_organization_as_external(org_uuid, api_key, base_url)
+                        if is_external:
+                            print(f"    ℹ️ Invalid internal org UUID {org_uuid} found as external "
+                                  f"organisation — adding to externalOrganizations")
+                            existing_external = contributor.get("externalOrganizations", [])
+                            existing_external_uuids = {o.get("uuid") for o in existing_external}
+                            if org_uuid not in existing_external_uuids:
+                                existing_external.append({
+                                    "systemName": "ExternalOrganization",
+                                    "uuid": org_uuid
+                                })
+                            contributor["externalOrganizations"] = existing_external
+                        else:
+                            print(f"    ⚠️ Invalid internal org UUID {org_uuid} not found in Pure "
+                                  f"as internal or external organisation — omitting")
+
             if valid_internal_orgs:
                 contributor["organizations"] = valid_internal_orgs
             else:
-                # Remove organizations key if all were invalid
                 contributor.pop("organizations", None)
-            
-            # Add invalid orgs to externalOrganizations
-            if invalid_orgs:
-                existing_external = contributor.get("externalOrganizations", [])
-                # Avoid duplicates
-                existing_external_uuids = {org.get("uuid") for org in existing_external}
-                for invalid_org in invalid_orgs:
-                    if invalid_org["uuid"] not in existing_external_uuids:
-                        existing_external.append(invalid_org)
-                contributor["externalOrganizations"] = existing_external
-        
-        if contributor is not None:
-            updated_contributors.append(contributor)
-    
+
+        updated_contributors.append(contributor)
+
     return updated_contributors
 
 
@@ -1161,10 +1168,8 @@ def resolve_funder_duplicate(matches, api_key, base_url):
         # 2. Prefer visibility
         vis = org.get("visibility", "")
         if vis == "FREE":
-            vis_score = 3
-        elif vis == "CAMPUS":
             vis_score = 2
-        elif vis in ["BACKEND", "CONFIDENTIAL"]:
+        elif vis == "CAMPUS":
             vis_score = 1
         else:
             vis_score = 0
@@ -1236,67 +1241,6 @@ def build_funding_organizations(funder_uuids_with_type):
             })
     
     return funding_details
-
-
-def parse_date(date_string):
-    """
-    Parse date string with multiple formats and separators.
-    Handles: yyyy-mm-dd, dd-mm-yyyy, yyyy/mm/dd, dd/mm/yyyy
-    Returns: (year, month, day) tuple
-    """
-    if not date_string:
-        return (1970, 1, 1)
-    
-    # Try different separators
-    parts = None
-    separator = None
-    for sep in ['-', '/']:
-        if sep in date_string:
-            parts = date_string.split(sep)
-            separator = sep
-            break
-    
-    if not parts or len(parts) < 3:
-        # Handle year-only format
-        if date_string.isdigit() and len(date_string) == 4:
-            return (int(date_string), 1, 1)
-        return (1970, 1, 1)
-    
-    # Extract numeric parts
-    try:
-        part1 = int(parts[0]) if parts[0].isdigit() else 1970
-        part2 = int(parts[1]) if parts[1].isdigit() else 1
-        part3 = int(parts[2]) if parts[2].isdigit() else 1
-    except (ValueError, IndexError):
-        return (1970, 1, 1)
-    
-    # Determine format based on first part
-    # If first part > 31, it's likely yyyy-mm-dd
-    # If first part <= 31 and third part > 31, it's likely dd-mm-yyyy
-    if part1 > 31:
-        # yyyy-mm-dd or yyyy/mm/dd
-        year = part1
-        month = part2 if 1 <= part2 <= 12 else 1
-        day = part3 if 1 <= part3 <= 31 else 1
-    elif part3 > 31:
-        # dd-mm-yyyy or dd/mm/yyyy
-        day = part1 if 1 <= part1 <= 31 else 1
-        month = part2 if 1 <= part2 <= 12 else 1
-        year = part3
-    else:
-        # Ambiguous - default to yyyy-mm-dd if first part could be a year
-        if part1 > 12:
-            # Likely dd-mm-yyyy (day > 12)
-            day = part1 if 1 <= part1 <= 31 else 1
-            month = part2 if 1 <= part2 <= 12 else 1
-            year = part3
-        else:
-            # Default to yyyy-mm-dd
-            year = part1
-            month = part2 if 1 <= part2 <= 12 else 1
-            day = part3 if 1 <= part3 <= 31 else 1
-    
-    return (year, month, day)
 
 
 def append_record_to_file(filepath, new_record):
@@ -1519,7 +1463,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     if final_contributors:
         # Validate and fix organizations
         print("  🔍 Validating organization UUIDs...")
-        final_contributors = validate_and_fix_organizations(final_contributors, API_KEY, BASE_URL)
+        final_contributors = validate_and_fix_organizations(final_contributors, API_KEY, BASE_URL, collect_external_orgs=COLLECT_EXTERNAL_ORGS)
         updated_record["contributors"] = final_contributors
     
     # --- 1a. Collect ALL validated organizations from ALL contributors ---
@@ -1884,28 +1828,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     # Add repository DOI first (if exists)
     if repo_ev:
         # Strip https://doi.org/ prefix from DOI
-        if "doi" in repo_ev and repo_ev["doi"].startswith("https://doi.org/"):
-            repo_ev["doi"] = repo_ev["doi"].replace("https://doi.org/", "")
+        # if "doi" in repo_ev and repo_ev["doi"].startswith("https://doi.org/"):
+        #     repo_ev["doi"] = repo_ev["doi"].replace("https://doi.org/", "")
         final_evs.append(repo_ev)
     
     # Add publisher DOIs second
     for ev in existing_publisher_evs:
         # Strip https://doi.org/ prefix from DOI
-        if "doi" in ev and ev["doi"].startswith("https://doi.org/"):
-            ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        # if "doi" in ev and ev["doi"].startswith("https://doi.org/"):
+        #     ev["doi"] = ev["doi"].replace("https://doi.org/", "")
         final_evs.append(ev)
     
     if new_publisher_ev:
         # Strip https://doi.org/ prefix from DOI
-        if "doi" in new_publisher_ev and new_publisher_ev["doi"].startswith("https://doi.org/"):
-            new_publisher_ev["doi"] = new_publisher_ev["doi"].replace("https://doi.org/", "")
+        # if "doi" in new_publisher_ev and new_publisher_ev["doi"].startswith("https://doi.org/"):
+        #     new_publisher_ev["doi"] = new_publisher_ev["doi"].replace("https://doi.org/", "")
         final_evs.append(new_publisher_ev)
     
     # Add other electronic versions last
     for ev in existing_other_evs:
         # Strip https://doi.org/ prefix from DOI if present
-        if "doi" in ev and isinstance(ev["doi"], str) and ev["doi"].startswith("https://doi.org/"):
-            ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        # if "doi" in ev and isinstance(ev["doi"], str) and ev["doi"].startswith("https://doi.org/"):
+        #     ev["doi"] = ev["doi"].replace("https://doi.org/", "")
         final_evs.append(ev)
 
     # Only update if changed
@@ -1928,30 +1872,57 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         else:
             non_handle_non_doi_links.append(link)
 
-    # Determine the single canonical handle to use
-    canonical_handle = None
-    if uri_str:
-        dspace_handles = extract_handles_from_uri(uri_str)
-        if dspace_handles:
-            canonical_handle = dspace_handles[0]  # DSpace takes precedence; use first only
+    existing_handle_urls = [normalize_handle(l.get("url", "")) for l in existing_handle_links]
+    dspace_handles = extract_handles_from_uri(uri_str) if uri_str else []
+    dspace_handle_urls = [normalize_handle(h) for h in dspace_handles]
 
-    if canonical_handle is None and existing_handle_links:
-        # No DSpace handle available — fall back to Pure's existing handle
-        canonical_handle = existing_handle_links[0].get("url")
-        print(f"  ℹ️ No handle in DSpace URI — keeping existing Pure handle: {canonical_handle}")
+    final_handle_links = []
 
-    # Build the final links list: canonical handle first, then other non-DOI links
-    updated_links = []
-    if canonical_handle:
-        updated_links.append(build_link(canonical_handle, alias="Handle", description="Repository Handle"))
-    updated_links.extend(non_handle_non_doi_links)
+    if dspace_handles:
+        # Find which DSpace handles match any existing Pure handle
+        matching_dspace = [h for h in dspace_handles if normalize_handle(h) in existing_handle_urls]
+
+        if len(matching_dspace) == 1:
+            # Exactly one DSpace handle matches Pure — use it
+            canonical_handle = matching_dspace[0]
+            print(f"  ℹ️ Handle matched between DSpace and Pure: {canonical_handle}")
+        elif len(matching_dspace) > 1:
+            # Multiple DSpace handles match Pure — take first, warn
+            canonical_handle = matching_dspace[0]
+            print(f"  ⚠️ Multiple DSpace handles match Pure handles — using first: {canonical_handle}")
+        else:
+            # No DSpace handle matches Pure — take first DSpace handle
+            canonical_handle = dspace_handles[0]
+            if existing_handle_urls:
+                print(f"  ℹ️ No DSpace handle matches existing Pure handles — using first DSpace handle: {canonical_handle}")
+
+        # Check Pure side: how many existing Pure handles match any DSpace handle
+        matching_pure = [l for l in existing_handle_links if normalize_handle(l.get("url", "")) in dspace_handle_urls]
+
+        if len(matching_pure) > 1:
+            # Multiple Pure handles match DSpace — keep all, flag for review
+            print(f"  ⚠️ MANUAL REVIEW REQUIRED: multiple Pure handles match DSpace handles "
+                  f"for record {pure_record.get('uuid')} — keeping all matching Pure handles")
+            final_handle_links = matching_pure
+        else:
+            final_handle_links = [build_link(canonical_handle, alias="Handle", description="Repository Handle")]
+
+    else:
+        # No DSpace handles — preserve all existing Pure handles and flag for review
+        if existing_handle_links:
+            print(f"  ⚠️ MANUAL REVIEW REQUIRED: no handle found in DSpace URI for record "
+                  f"{pure_record.get('uuid')} — preserving {len(existing_handle_links)} existing "
+                  f"Pure handle(s): {[l.get('url') for l in existing_handle_links]}")
+            final_handle_links = existing_handle_links
+        else:
+            print(f"  ℹ️ No handles found in DSpace or Pure for record {pure_record.get('uuid')}")
+
+    # Build the final links list: handles first, then other non-DOI links
+    updated_links = final_handle_links + non_handle_non_doi_links
 
     if updated_links != existing_links:
         updated_record["links"] = updated_links
-    
-    # Update links only if changed
-    if updated_links != existing_links:
-        updated_record["links"] = updated_links
+
 
     # --- 6. Language (dc.language.iso) > fill if blank ---
     lang = dspace_row.get("dc.language.iso", "").strip()
@@ -2302,7 +2273,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
 
     # Validate and fix organizations BEFORE assigning to record
     print("  🔍 Validating organization UUIDs...")
-    mapped_contributors = validate_and_fix_organizations(mapped_contributors, API_KEY, BASE_URL)
+    mapped_contributors = validate_and_fix_organizations(mapped_contributors, API_KEY, BASE_URL, collect_external_orgs=COLLECT_EXTERNAL_ORGS)
 
     # Always ensure contributor info is present (post-validation list)
     record["contributors"] = mapped_contributors
@@ -2564,8 +2535,14 @@ def main():
         # Index by links (including handles from links)
         for link in item.get("links", []):
             url = link.get("url", "")
-            if url and "hdl.handle.net" in url:
+            if not url:
+                continue
+            if "hdl.handle.net" in url:
                 pure_by_handle[normalize_handle(url)].append(item)
+            elif "10.13025" in url:
+                pure_by_repo_doi[normalize_doi(url)].append(item)
+            elif url.startswith("https://doi.org/") or url.startswith("http://doi.org/"):
+                pure_by_doi[normalize_doi(url)].append(item)
         
         # Index by combined title (title + subtitle)
         title = item.get("title", {}).get("value", "").strip()
