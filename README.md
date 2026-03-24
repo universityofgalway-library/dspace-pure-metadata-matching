@@ -317,7 +317,7 @@ If no `dc.description.sponsorship` text is available and there are unmatched fun
  
 #### DOI Normalisation
  
-All DOIs throughout the script are normalised to the canonical form `https://doi.org/10.xxxx` before any comparison or storage, stripping `doi:`, `http://doi.org/`, and bare `10.` prefixes.
+All DOIs throughout the script are normalised to the canonical form `https://doi.org/10.xxxx` by the `normalize_doi` function, which strips any existing prefix (`https://doi.org/`, `http://doi.org/`, `doi:`, or no prefix) and replaces it with `https://doi.org/`. This normalised form is used consistently for both matching and storage — DOIs are written to `electronicVersions` in the full `https://doi.org/10.xxxx` form.
  
 #### Embargo Handling
  
@@ -331,14 +331,16 @@ The script distinguishes DOIs by prefix:
  
 #### Handle Links
  
-Exactly one Handle link is written to the Pure `links` array per record, with `alias: "Handle"`. The selection logic is:
- 
-1. **DSpace takes precedence.** The first Handle URL extracted from `dc.identifier.uri` is used as the canonical handle, replacing any handle(s) already present in Pure.
-2. **Fallback to Pure.** If DSpace supplies no handle, the first existing handle from the Pure record is preserved unchanged.
-3. **Surplus handles are dropped.** Any additional handles from either source are discarded, ensuring the links array never accumulates multiple Handle entries across runs.
- 
-All DOI links that may exist in the Pure `links` array are removed unconditionally — DOIs belong in `electronicVersions`, not `links`. All other non-handle, non-DOI links are preserved as-is.
+Handle links are written to the Pure `links` array with `alias: "Handle"`. All DOI links that may exist in the Pure `links` array are removed unconditionally — DOIs belong in `electronicVersions`, not links. All other non-handle, non-DOI links are preserved as-is. The handle selection logic depends on what is available in DSpace and Pure for a particular record:
 
+**DSpace handles present:**
+1. Each DSpace handle is compared against existing Pure handles (normalised before comparison).
+   - If exactly one DSpace handle matches a Pure handle, that handle is used as the canonical handle.
+   - If multiple DSpace handles match Pure handles, the first matching one is used and a warning is written to the processing log.
+   - If no DSpace handle matches any Pure handle, the first DSpace handle is used. If Pure had existing handles, this is noted in the processing log.
+2. On the Pure side, if multiple existing Pure handles match DSpace handles, all matching Pure handles are preserved and the record is flagged in the processing log for manual review.
+
+**No DSpace handles present:** all existing Pure handles are preserved unchanged and the record is flagged in the processing log for manual review, since the absence of a DSpace handle may indicate a metadata gap requiring human judgement.
  
 ## Deduplication Strategies
  
