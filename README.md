@@ -212,11 +212,11 @@ Matching is attempted in a strict priority cascade. The script stops at the firs
  
 #### Strategy 1: Publisher DOI
  
-The `dc.identifier.doi` field is normalised to a canonical `https://doi.org/10.xxxx` form and looked up against an index of Pure records keyed by their electronic version DOIs (excluding repository DOIs in the `10.13025` namespace).
+The `dc.identifier.doi` field is normalised to a canonical `https://doi.org/10.xxxx` form and looked up against an index of Pure records keyed by their their publisher DOIs. Publisher DOIs are indexed from two sources in Pure records: the `electronicVersions` array and the `links` array (excluding repository DOIs in the `10.13025` namespace).
  
 #### Strategy 2: Repository DOI
  
-DOIs in the `10.13025` namespace are extracted from `dc.identifier.uri` (which may contain multiple semicolon-separated values) and looked up against a separate index of Pure records keyed by their repository electronic version DOIs.
+DOIs in the `10.13025` namespace are extracted from `dc.identifier.uri` (which may contain multiple semicolon-separated values) and looked up against a separate index of Pure records keyed by their repository DOIs. Repository DOIs are indexed from two sources in Pure records: the `electronicVersions` array and the `links` array.
  
 #### Strategy 3: Handle
  
@@ -232,6 +232,7 @@ Applied only when strategies 1–3 all fail. Two sub-strategies are tried in ord
 - DSpace title vs Pure title
 - DSpace title+subtitle combined vs Pure title
 - DSpace title vs Pure title+subtitle combined
+- DSpace title+subtitle combined vs Pure title+subtitle combined
  
 The best score across the three variants must meet the `TITLE_SIMILARITY_THRESHOLD` (default 90%) to be accepted. A short-circuit length check (>50% relative length difference) skips clearly mismatched pairs before fuzzy comparison. If the query title contains no indexable tokens (e.g. it consists entirely of stop words or very short words), the candidate set is empty and no fuzzy match is attempted.
  
