@@ -66,7 +66,7 @@ All configuration is set via constants at the top of the script. Key settings:
  
 | Constant | Purpose | Default |
 |---|---|---|
-| `OVERRIDE_MODE` | When `True`, DSpace data overwrites existing Pure data in all fields. When `False`, Pure data takes precedence for non-empty fields. | `False` |
+| `OVERRIDE_MODE` | When `True`, DSpace data overwrites existing Pure data in all fields. When `False`, metadata is updated according to the precedence rules. | `False` |
 | `COLLECT_EXTERNAL_ORGS` | When `True`, external organisations are collected from external authors and attached to contributors and records. | `False` |
 | `TITLE_SIMILARITY_THRESHOLD` | Minimum fuzzy match score (0–1) for title-based matching to be accepted. | `0.9` |
 | `DSPACE_CSV` | Path to the DSpace metadata export. | Configurable |
@@ -148,12 +148,12 @@ A list of person objects, each with:
 - `externalOrganizations`: a list of external organisation UUIDs associated with any person
 - `orcid`: person's ORCID number (if available)
 - `scopusId`: person's Scopus ID (if available)
-- `papers`: a list of known papers (`doi`, `handle`, `title`) used for disambiguation
+- `papers`: a list of known papers (`doi`, `handle`, `title`) used for person disambiguation
 - `paperCount`: the number of papers associated with this person
 - `dspaceMerge` (bool): if the record is a result of the merge of 2+ DSpace authors
 - `sourceAuthorIds`: a list of DSpace author IDs that were merged *(these IDs are assigned by the DSpace author merging script and aren't present in DSpace)*
 
-**NB!** An person can have both internal & external UUIDs and both internal & external duplicates. This is a reflection of the duplicates that exist in Pure. 
+**NB!** A person can have both internal & external UUIDs and both internal & external duplicates. This reflects the duplicates that exist in Pure. 
  
 #### Organisation Mapping JSON
  
@@ -165,7 +165,7 @@ A list of organisation objects, each with:
  
 ### Output Files
  
-All outputs are written to a date-stamped directory under `OUTPUT_DIR`.
+All outputs are written to a date-stamped directory (`OUTPUT_DIR`).
  
 | Path | Content |
 |---|---|
@@ -184,20 +184,23 @@ Records in the matched and unmatched directories are partitioned by Pure type ke
 #### Directory Layout
 
 ```
-test_output/
+test_output_<date>/
 ├── matched/
-│   ├── contributiontojournal_2025-12-06.json
-│   ├── contributiontoconference_2025-12-06.json
+│   ├── contributiontojournal_<date>.json
+│   ├── contributiontoconference_<date>.json
 │   └── ...
 ├── unmatched/
-│   ├── contributiontojournal_2025-12-06.json
-│   ├── contributiontoconference_2025-12-06.json
+│   ├── contributiontojournal_<date>.json
+│   ├── contributiontoconference_<date>.json
 │   └── ...
-└── logs/
-    ├── status_log_2025-12-06.json
-    ├── status_log_2025-12-06.csv
-    ├── error_log_2025-12-06.log
-    └── processing_log_2025-12-06.log
+├── logs/
+    ├── status_log_<date>.json
+    ├── error_log_<date>.log
+    └── processing_log_<date>.log
+├── matched_records_before_updates_<date>.json
+├── unmatched_contributors_<date>.csv
+├── unmatched_funders_<date>.csv
+└── no_author_records_<date>.csv
 ```
 
 
@@ -359,7 +362,7 @@ The person's pre-indexed set of known papers (`_paper_dois`, `_paper_handles`, `
  
 | Match type | Score |
 |---|---|
-| DOI match | 3 |
+| DOI match | 2 |
 | Handle match | 2 |
 | Title match | 1 |
 | No match | 0 |
@@ -382,10 +385,10 @@ For internal persons, the visibility of their UUID record is used:
  
 | Visibility | Score |
 |---|---|
-| `FREE` or `CAMPUS` | 2 |
-| `BACKEND` or `CONFIDENTIAL` | 1 |
+| `FREE` or `CAMPUS` | 1 |
+| `BACKEND` or `CONFIDENTIAL` | 0 |
  
-**Level 4: Metadata richness (lowest priority)**
+**Level 4: Metadata richness**
  
 If an API key is available, the number of populated fields on the person record is fetched from the Pure API and used as a tiebreaker. Results are cached to avoid repeated API calls for the same UUID.
  
@@ -394,7 +397,7 @@ If an API key is available, the number of populated fields on the person record 
 When a funder name matches more than one organisation, the best candidate is selected by:
  
 1. Internal organisations are preferred over external (type score: 2 vs 1).
-2. Within each type, visibility `FREE` > `CAMPUS` > `BACKEND`/`CONFIDENTIAL` > other.
+2. Within each type, visibility `FREE` > `CAMPUS` > other.
  
 ### Contributor Deduplication Within a Record
  
@@ -444,21 +447,22 @@ Precedence rules govern which system's data takes priority for each field. All r
  
 ### Field-Level Precedence
 
-| DSpace Field | Pure Target Field | Rule | Notes |
-|--------------|-------------------|------|-------|
-| `dc.contributor.author` | `contributors[]` | **Append** (no duplicates) | Map to Person/ExternalPerson; preserve existing authors and order of the authors |
-| `dc.contributor.funder` | `fundingDetails.organizations[]` | **Fill if blank** | Prefer Pure when already authority-linked. Not implemented (requires funder matching)  |
-| `dc.date.embargo` | `electronicVersions[].embargoPeriod.endDate` | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; repository is authoritative for OA timing. |
-| `dc.date.issued` | `publicationStatuses[].publicationDate` | **Fill if blank, upgrade only** | Flag year conflicts; don't overwrite existing year |
-| `dc.description.abstract` | `abstract.en_GB` | **Fill if blank** | Do not overwrite Pure curated abstracts.|
-| `dc.description.sponsorship` | `fundingText.en_GB` | **Fill if blank** | Prefer Pure's funding info where present.|
-| `dc.identifier.doi` | `electronicVersions[]` | **Add if missing** | Create new electronic version (publisher version) if missing. Never overwrite a different DOI without review. |
-| `dc.identifier.uri` (DOI) | `electronicVersions[]` | **Always add** | Create new electronic version as author's accepted manuscript (open access) |
-| `dc.identifier.uri` (Handle) | `links[].url` | **Always add** | Add as link, never as an electronic version |
-| `dc.language.iso` | `language.uri` | **Fill if blank** | Map ISO 639 codes to Pure codes |
-| `dc.publisher` | `managingOrganization` | **Fill if blank** | Prefer authority-linked value in Pure. Not implemented (requires publisher matching) |
-| `dc.rights` | `electronicVersions[].licenseType` | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; OA licence is repository-authoritative |
-| `dc.title` | `title.value` | **Fill if blank** | Preserve existing Pure titles |
+| DSpace Field | Pure Target Field | OpenAIRE | Rule | Notes |
+|--------------|-------------------|----------|------|-------|
+| `dc.contributor.author` | `contributors[]` | M | **Append** (no duplicates) | Map to Person/ExternalPerson by UUID/ORCID/email/name; create External Persons if no match; preserve existing authors and order of the authors |
+| `dc.contributor.editor` | `contributors[]` |  | **Append** (no duplicates) | Map to Person/ExternalPerson by UUID/ORCID/email/name; create External Persons if no match; preserve existing authors and order of the authors |
+| `dc.contributor.funder` | `fundingDetails.organizations[]` | MA | **Fill if blank** | Prefer Pure when already authority-linked.  Create External Organisation if no match  |
+| `dc.date.embargo` | `electronicVersions[].embargoPeriod.endDate` | MA | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; repository is authoritative for OA timing. |
+| `dc.date.issued` | `publicationStatuses[].publicationDate` | M | **Fill if blank, upgrade only** | Flag year conflicts; don't overwrite existing year |
+| `dc.description.abstract` | `abstract.en_GB` | MA |  **Fill if blank** | Do not overwrite Pure curated abstracts.|
+| `dc.description.sponsorship` | `fundingText.en_GB` | MA | **Fill if blank** | Prefer Pure's funding info where present.|
+| `dc.identifier.doi` | `electronicVersions[]` | M | **Add if missing** | Create new electronic version (publisher version) if missing. Never overwrite a different DOI without review. |
+| `dc.identifier.uri` (DOI) | `electronicVersions[]` | M | **Always add** | Add repository DOI by creating a new electronic version as author's accepted manuscript (open access); set repository DOI first in CRIS display.  |
+| `dc.identifier.uri` (Handle) | `links[].url` | R | **Always add** | Add as link, never as an electronic version |
+| `dc.language.iso` | `language.uri` | MA | **Fill if blank** | Map ISO 639 codes to Pure codes |
+| `dc.publisher` | `managingOrganization` | MA | **Fill if blank** | Prefer authority-linked value in Pure. Create Publisher if no match, link to Journal entity. |
+| `dc.rights` | `electronicVersions[].licenseType` | M | **Overwrite** (repo version only) | Only for DOIs starting with `10.13025`; OA licence is repository-authoritative |
+| `dc.title` | `title.value` | **Fill if blank** | M | Preserve existing Pure titles; check for overlaps with Pure subtitle to avoid duplication within display title |
 
 ### Author Keyword Group
  
@@ -516,7 +520,7 @@ Tracks each DSpace record's matching status:
  
 ### 2. Console / Processing Log (`processing_log_YYYY-MM-DD.log`)
 
-Console outputmirrored to `logs/processing_log_<date>.log`, including:
+Console output mirrored to `logs/processing_log_<date>.log`, including:
 - Data loading progress
 - Author matching details
 - Record processing status
@@ -548,6 +552,6 @@ Lookup indices (`person_index`, `org_index`, `pure_by_doi`, `pure_by_handle`, `p
  
 ## Known Limitations & Edge Cases
  
-- **Date parsing and `dayfirst` convention:** Date parsing is handled by `python-dateutil`, which supports ISO 8601 and most common formats robustly. For ambiguous formats (e.g. `01/02/03`), the `dayfirst` parameter controls interpretation — it defaults to `False` (ISO/US order). If your DSpace export uses European day-first dates, set `dayfirst=True` at the two `parse_date` call sites in `update_record_from_dspace` and `create_new_record_from_dspace`. Strings that cannot be parsed at all fall back to a year-extraction regex, and ultimately to `(1970, 1, 1)` if no four-digit year is found.
+- **Date parsing and `dayfirst` convention:** Date parsing is handled by `python-dateutil`, which supports ISO 8601 and most common formats robustly. For ambiguous formats (e.g. `01/02/03`), the `dayfirst` parameter controls interpretation — it defaults to `True` (European order). If you need to parse US month-first dates, set `dayfirst=False` in the `parse_date` calls. Strings that cannot be parsed at all fall back to a year-extraction regex, and ultimately to `(1970, 1, 1)` if no four-digit year is found.
 - **Irish-language abstracts:** Records with `dc.language.iso: gle` have their abstract written to both the `en_IE` and `ga` keys as a workaround for a display limitation. This means the abstract will appear under both languages in Pure.
 - **Re-run behaviour for output files:** Output JSON files are deduplicated on `uuid` before writing. If a record with the same `uuid` already exists in the output file from a previous run, it is replaced rather than appended, making re-runs idempotent for matched records. New (unmatched) records created from DSpace have no `uuid` yet, so they are keyed under `None` and will overwrite each other if the script is re-run on the same unmatched set — consider clearing the unmatched output directory between runs if this is a concern.
