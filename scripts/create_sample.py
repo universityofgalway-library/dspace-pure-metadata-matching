@@ -13,7 +13,7 @@ doc_types = [
     "review",
     # "doctoral thesis",
     # "master thesis",
-    # "data management plan",
+    "data management plan",
     "conference paper",
     "conference output",
     "conference poster",
@@ -129,18 +129,18 @@ def main():
     )
     parser.add_argument(
         '--input-file',
-        default='./matching_test/enriched_dspace_test_all_2026-01-21.csv',
-        help='Path to input CSV file (default: ./matching_test/enriched_dspace_test_all_2026-01-21.csv)'
+        default='./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv',
+        help='Path to input CSV file (default: ./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv)'
     )
     parser.add_argument(
         '--output-file',
-        default=f'./matching_test/dspace_test_sample_{TODAY}.csv',
-        help='Path to output CSV file (default: ./matching_test/dspace_test_sample.csv)'
+        default=f'./dspace_data/test_samples/dspace_test_sample_{TODAY}.csv',
+        help='Path to output CSV file (default: ./dspace_data/test_samples/dspace_test_sample.csv)'
     )
     parser.add_argument(
         '--authors-json',
-        default='./matching_test/matched_authors/updated_merged_authors_20260119.json',
-        help='Path to authors JSON file (default: ./matching_test/matched_authors/updated_merged_authors_20260119.json)'
+        default='./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json',
+        help='Path to authors JSON file (default: ./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json)'
     )
     parser.add_argument(
         '--random-state',
