@@ -1,4 +1,4 @@
-# get_pure_data.py
+# Pure API Data Fetcher
 
 A command-line tool for extracting data from the Elsevier Pure research information system via its REST API. Supports paginated bulk fetching of all major entity types, with optional splitting of research outputs by subtype.
 
