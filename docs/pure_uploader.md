@@ -1,6 +1,6 @@
 # Pure API Uploader
 
-Uploads JSON records to the University of Galway's Pure research information system via its REST API. Supports creating new records and updating existing ones, across multiple data types, in either the staging (UAT) or production environment.
+Uploads JSON records to Pure via its REST API. Supports creating new records and updating existing ones, across multiple data types, in either the staging (UAT) or production environment. Provides detailed logging.
 
 ## Requirements
 
