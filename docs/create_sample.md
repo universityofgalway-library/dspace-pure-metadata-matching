@@ -1,12 +1,6 @@
-# create_sample.py
+# DSpace Data Sampler
 
-A command-line tool that samples records from a DSpace metadata CSV file by document type, with optional author validation against a JSON author registry.
-
----
-
-## Overview
-
-This script reads an enriched DSpace metadata CSV, filters records by document type, optionally validates authors against a known-authors JSON file, and writes a stratified sample to a new CSV. It is designed to support QA workflows by producing representative, reproducible subsets of large metadata exports.
+A command-line tool that samples records from a DSpace metadata CSV file by research output type, with optional author validation against a JSON author registry.
 
 ---
 
