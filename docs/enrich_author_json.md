@@ -1,6 +1,6 @@
 # enrich_author_json.py
 
-Injects UUIDs from a `pure_uploader.py` log into an authors JSON file. For each author
+Injects UUIDs from a creation log into an authors JSON file. For each author
 who is neither internal nor external, it looks for an exact name match in an uploader
 log and, on a hit, sets `external: true` and appends the UUID to `externalUUIDs`.
 
@@ -15,7 +15,7 @@ Python 3.9+ — no third-party dependencies.
 ## Usage
 
 ```bash
-python enrich_authors.py --authors-file <path> --log-file <path> [--entity-type <type>]
+python enrich_author_json.py --authors-file <path> --log-file <path> [--entity-type <type>]
 ```
 
 ### Arguments
@@ -112,7 +112,7 @@ Authors with no match and authors that were skipped are left unchanged.
 ## Example
 
 ```bash
-python enrich_authors.py \
+python enrich_author_json.py \
   --authors-file data/persons.json \
   --log-file data/creation_log.json
 ```

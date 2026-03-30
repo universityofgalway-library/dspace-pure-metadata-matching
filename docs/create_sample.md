@@ -26,7 +26,7 @@ pip install pandas
 ## Usage
 
 ```bash
-python sample_csv.py [OPTIONS]
+python screate_sample.py [OPTIONS]
 ```
 
 All arguments are optional and fall back to sensible defaults.
@@ -34,13 +34,13 @@ All arguments are optional and fall back to sensible defaults.
 ### Example: basic run with defaults
 
 ```bash
-python sample_csv.py
+python create_sample.py
 ```
 
 ### Example: custom input/output with author filtering disabled
 
 ```bash
-python sample_csv.py \
+python create_sample.py \
   --input-file ./data/my_metadata.csv \
   --output-file ./output/sample.csv \
   --no-filter-authors \
@@ -50,7 +50,7 @@ python sample_csv.py \
 ### Example: require specific fields to be non-empty
 
 ```bash
-python sample_csv.py \
+python create_sample.py \
   --required-fields dc.title dc.date.issued dc.description.abstract \
   --sample-size 3
 ```

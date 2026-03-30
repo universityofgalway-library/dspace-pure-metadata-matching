@@ -1,4 +1,4 @@
-# DSpace CSV Author Extraction Script
+# extract_dspace_authors.py
 
 ## Overview
 
@@ -175,44 +175,44 @@ Output: ("Sarah Jane", "O'Brien")
 
 ### Basic Usage:
 ```bash
-python extract_authors.py input.csv output.json
+python enrich_author_json.py input.csv output.json
 ```
 
 ### With Options:
 
 **Strict name filtering**:
 ```bash
-python extract_authors.py input.csv output.json --strict-names
+python extract_dspace_authors.py input.csv output.json --strict-names
 ```
 
 **Disable name normalization** (keep exact name variations separate):
 ```bash
-python extract_authors.py input.csv output.json --no-normalization
+python extract_dspace_authors.py input.csv output.json --no-normalization
 ```
 
 **Custom DC type exclusions**:
 ```bash
-python extract_authors.py input.csv output.json --exclude-types "conference paper" "book review"
+python extract_dspace_authors.py input.csv output.json --exclude-types "conference paper" "book review"
 ```
 
 **No DC type exclusions**:
 ```bash
-python extract_authors.py input.csv output.json --no-exclusions
+python extract_dspace_authors.py input.csv output.json --no-exclusions
 ```
 
 **Custom stopwords**:
 ```bash
-python extract_authors.py input.csv output.json --stopwords "corporation" "foundation" "council"
+python extract_dspace_authors.py input.csv output.json --stopwords "corporation" "foundation" "council"
 ```
 
 **Disable stopword filtering**:
 ```bash
-python extract_authors.py input.csv output.json --no-stopword-filter
+python extract_dspace_authors.py input.csv output.json --no-stopword-filter
 ```
 
 **Combine multiple options**:
 ```bash
-python extract_authors.py input.csv output.json \
+python extract_dspace_authors.py input.csv output.json \
   --strict-names \
   --exclude-types "thesis" "dissertation" \
   --stopwords "test" "example"

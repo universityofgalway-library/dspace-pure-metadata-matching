@@ -1,6 +1,6 @@
-# Pure API Uploader
+# pure_uploader.py
 
-Uploads JSON records to Pure via its REST API. Supports creating new records and updating existing ones, across multiple data types, in either the staging (UAT) or production environment. Provides detailed logging.
+Uploads JSON records to the University of Galway's Pure research information system via its REST API. Supports creating new records and updating existing ones, across multiple data types, in either the staging (UAT) or production environment.
 
 ## Requirements
 
@@ -16,16 +16,16 @@ PURE_ROOT_API_KEY=your_api_key_here
 
 ```bash
 # Upload a folder of JSON files (mode inferred from folder name)
-python uploader.py --folder path/to/matched_records/ --data research-outputs
+python pure_uploader.py --folder path/to/matched_records/ --data research-outputs
 
 # Upload a single JSON file with an explicit mode
-python uploader.py --file path/to/record.json --mode create --data persons
+python pure_uploader.py --file path/to/record.json --mode create --data persons
 
 # Target the production environment instead of UAT
-python uploader.py --folder path/to/matched/ --data research-outputs --test False
+python pure_uploader.py --folder path/to/matched/ --data research-outputs --test False
 
 # Write logs to a custom directory
-python uploader.py --folder path/to/matched/ --data journals --log-dir /custom/log/dir
+python pure_uploader.py --folder path/to/matched/ --data journals --log-dir /custom/log/dir
 ```
 
 ## Arguments
