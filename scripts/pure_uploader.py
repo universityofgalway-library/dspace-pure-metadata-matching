@@ -10,6 +10,7 @@ from tqdm import tqdm
 from datetime import datetime
 from dotenv import load_dotenv
 
+
 TODAY = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 TODAY_DATE = datetime.now().strftime('%Y-%m-%d')
 
@@ -53,7 +54,7 @@ def extract_name_from_response(response_data, data_type):
         name_obj = response_data.get("name", {})
         first_name = name_obj.get("firstName", "")
         last_name = name_obj.get("lastName", "")
-        return f"{first_name};{last_name}".strip()
+        return f"{last_name}, {first_name}".strip()
     
     # For research-outputs, events: use "title"
     if data_type in ["research-outputs", "events"]:
@@ -111,7 +112,7 @@ def log_record(mode, data_type, response_data, log_dir, is_test):
 
     # Create record entry
     record_entry = {
-        "type": data_type,
+        "data": data_type,
         "name": name,
         "uuid": uuid,
         "createdDate": created_date,
