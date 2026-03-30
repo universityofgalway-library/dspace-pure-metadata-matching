@@ -1,10 +1,11 @@
-# get_ids.py
+# DSpace–Pure Handle Matcher & UUID Extractor
 
 A command-line tool that matches records between a DSpace CSV export and a Pure JSON export by Handle URL, producing a joined CSV of identifiers from both systems with duplicate detection.
 
 The script reads a DSpace CSV (keyed by `handle`) and a Pure JSON export (keyed by links of type `Handle`), joins them, and writes a CSV containing the DSpace UUID, Pure UUID, Pure ID, and handle for each matched pair. Rows involving duplicate handles or DSpace UUIDs are flagged in an extra column.
 
-It is intended to be sent over to Elsevier to establish a connection between individual Pure and DSpace records for the Pure > DSpace connector to work.
+It is intended to produce a CSV to be sent over to Elsevier to establish a connection between individual Pure and DSpace records for the Pure > DSpace connector to work.
+
 ---
 
 ## Requirements
