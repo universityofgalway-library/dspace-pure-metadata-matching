@@ -37,7 +37,7 @@ No arguments are required. The output directory is created automatically if it d
 
 ## Input Format
 
-Both input files are JSON arrays produced by the Pure API (e.g. via the [Pure API Data Fetcher](pure_api_fetcher_docs.md)). Each element is an organization object.
+Both input files are JSON arrays produced by the Pure API (e.g. via the [Pure API Data Fetcher](/docs/get_pure_data.md)). Each element is an organization object.
 
 ### Name extraction
 

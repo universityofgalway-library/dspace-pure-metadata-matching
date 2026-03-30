@@ -26,7 +26,7 @@ pip install pandas
 ## Usage
 
 ```bash
-python create_sample.py [OPTIONS]
+python screate_sample.py [OPTIONS]
 ```
 
 All arguments are optional and fall back to sensible defaults.
