@@ -1,12 +1,6 @@
-# delete_records.py
+# Pure API Record Deleter
 
-A command-line tool for deleting records from the Elsevier Pure API based on JSON log files, with optional date filtering, dry-run preview, and detailed deletion logging.
-
----
-
-## Overview
-
-This script reads one or more JSON log files containing Pure entity records, optionally filters them by modification date, and deletes the matching records via the Pure REST API. Before any deletions are made, the script prints a summary of what will be deleted and asks for interactive confirmation. Results are saved to categorised log files.
+A command-line tool for deleting records from the Elsevier Pure API based on JSON log files, with optional date filtering, dry-run preview, and detailed deletion logging. Before any deletions are made, the script prints a summary of what will be deleted and asks for interactive confirmation. Results are saved to categorised log files.
 
 ---
 
