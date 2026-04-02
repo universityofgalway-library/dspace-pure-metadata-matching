@@ -28,11 +28,12 @@ COLLECT_EXTERNAL_ORGS = False
 
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
+DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-03-24.csv"
+# DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-03.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
-OUTPUT_DIR = f"./record_matching/full_test_output_{TODAY}"
+OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -554,177 +555,6 @@ def parse_author_names(author_str):
     return [a.strip() for a in author_str.split(";") if a.strip()] 
 
 
-def parse_contributors_by_role(dspace_row):
-    """Parse all contributor types from DSpace and return dict by role.
-    
-    Handles two special cases:
-    1. Same name appears in both author and editor fields — keep only one role
-       based on dc.type (editor preferred for book/interactive resource/conference
-       proceedings, author preferred for everything else).
-    2. Metadata correction: if dc.type is NOT a book-like type but the record has
-       editors and no authors, treat those editors as authors instead.
-    """
-    # Types where editor role takes precedence over author role
-    EDITOR_PREFERRED_TYPES = {"book", "interactive resource", "conference proceedings"}
-    dspace_type = dspace_row.get("dc.type", "").strip().lower()
-    prefer_editor = dspace_type in EDITOR_PREFERRED_TYPES
-
-    contributors_by_role = {}
-
-    # Parse all roles
-    authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
-    editors = parse_author_names(dspace_row.get("dc.contributor.editor", ""))
-    translators = parse_author_names(dspace_row.get("dc.contributor.translator", ""))
-    illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
-
-    # Resolve author/editor overlap for the same name
-    author_set = {normalize(n) for n in authors}
-    editor_set = {normalize(n) for n in editors}
-    overlap = author_set & editor_set
-
-    if overlap:
-        if prefer_editor:
-            # Remove overlapping names from authors, keep in editors
-            authors = [n for n in authors if normalize(n) not in overlap]
-            print(f"  ℹ️ Duplicate author/editor names — keeping as editor for type '{dspace_type}': "
-                  f"{[n for n in editors if normalize(n) in overlap]}")
-        else:
-            # Remove overlapping names from editors, keep in authors
-            editors = [n for n in editors if normalize(n) not in overlap]
-            print(f"  ℹ️ Duplicate author/editor names — keeping as author for type '{dspace_type}': "
-                  f"{[n for n in authors if normalize(n) in overlap]}")
-
-    # Metadata correction: non-book type with editors but no authors
-    # → those editors are almost certainly authors mislabelled in DSpace
-    if not prefer_editor and editors and not authors:
-        print(f"  ⚠️ Metadata correction: dc.type='{dspace_type}' has editors but no authors "
-              f"— treating editors as authors: {editors}")
-        authors = editors
-        editors = []
-
-    if authors:
-        contributors_by_role["author"] = authors
-    if editors:
-        contributors_by_role["editor"] = editors
-    if translators:
-        contributors_by_role["translator"] = translators
-    if illustrators:
-        contributors_by_role["illustrator"] = illustrators
-
-    return contributors_by_role
-
-
-def build_contributor(matched_person, role, pure_type_key, collect_external_orgs=True):
-    """Build a contributor object from matched person and role.
-
-    Args:
-        matched_person: Person dict from the person mapping.
-        role: Contributor role string (e.g. 'author', 'editor').
-        pure_type_key: Lower-cased Pure type key used to construct role URIs.
-        collect_external_orgs: When False, external organisation data is omitted
-            from the built contributor even if present in the person mapping.
-    """
-    first = matched_person.get("firstName", "")
-    last = matched_person.get("lastName", "")
-    
-    has_valid_internal = matched_person.get("internal", False) and matched_person.get("internalUUIDs")
-    has_valid_external = matched_person.get("external", False) and matched_person.get("externalUUIDs")
-    
-    if not has_valid_internal and not has_valid_external:
-        return None
-    
-    # Map role to URI - use pure_type_key for dynamic type
-    role_uri_map = {
-        "author": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/author",
-        "editor": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/editor",
-        "translator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/translator",
-        "illustrator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/illustrator"
-    }
-    
-    role_term_map = {
-        "author": "Author",
-        "editor": "Editor",
-        "translator": "Translator",
-        "illustrator": "Illustrator"
-    }
-    
-    uuid_value = None
-    if has_valid_internal:
-        uuid_value = extract_uuid(matched_person.get("internalUUIDs")[0])
-        contributor = {
-            "typeDiscriminator": "InternalContributorAssociation",
-            "name": {
-                "firstName": first,
-                "lastName": last
-            },
-            "role": {
-                "uri": role_uri_map.get(role, role_uri_map["author"]),
-                "term": {"en_IE": role_term_map.get(role, "Author")}
-            },
-            "person": {
-                "systemName": "Person",
-                "uuid": uuid_value
-            }
-        }
-        # For internal authors, prefer primaryInternalOrganization,
-        # fall back to any available internal organisation
-        primary_org = matched_person.get("primaryInternalOrganization")
-        if not primary_org:
-            internal_orgs = matched_person.get("internalOrganizations", [])
-            if internal_orgs:
-                primary_org = internal_orgs[0] if isinstance(internal_orgs[0], str) else internal_orgs[0].get("uuid")
-                print(f"        ℹ️ No primaryInternalOrganization for {first} {last} — using fallback org: {primary_org}")
-
-        if primary_org:
-            contributor["organizations"] = [
-                {"systemName": "Organization", "uuid": primary_org}
-            ]
-        else:
-            print(f"        ⚠️ Internal person {first} {last} has no primaryInternalOrganization and no internalOrganizations in mapping")
-
-        return contributor
-    
-    elif has_valid_external:
-        uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
-        contributor = {
-            "typeDiscriminator": "ExternalContributorAssociation",
-            "name": {
-                "firstName": first,
-                "lastName": last
-            },
-            "role": {
-                "uri": role_uri_map.get(role, role_uri_map["author"]),
-                "term": {"en_IE": role_term_map.get(role, "Author")}
-            },
-            "externalPerson": {
-                "systemName": "ExternalPerson",
-                "uuid": uuid_value
-            }
-        }
-        # Only attach external organisations when the feature is enabled
-        if collect_external_orgs and "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
-            external_orgs = matched_person["externalOrganizations"]
-            
-            # Filter out ignored organizations — always, even if it's the only one
-            filtered_external_orgs = [
-                org_uuid for org_uuid in external_orgs
-                if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
-            ]
-            
-            if filtered_external_orgs:
-                contributor["externalOrganizations"] = [
-                    {
-                        "systemName": "ExternalOrganization",
-                        "uuid": org_uuid
-                    }
-                    for org_uuid in filtered_external_orgs
-                ]
-        
-        return contributor
-    
-    return None
-
-
 def build_person_name_index(person_mapping):
     """Build a comprehensive index of all person name variations for O(1) lookup"""
     person_index = {}
@@ -931,6 +761,338 @@ def resolve_author_duplicate(matches, paper_dois=None, paper_handles=None, paper
     return sorted_matches[0]
 
 
+def parse_contributors_by_role(dspace_row):
+    """Parse all contributor types from DSpace and return dict by role.
+    
+    Handles two special cases:
+    1. Same name appears in both author and editor fields — keep only one role
+       based on dc.type (editor preferred for book/interactive resource/conference
+       proceedings, author preferred for everything else).
+    2. Metadata correction: if dc.type is NOT a book-like type but the record has
+       editors and no authors, treat those editors as authors instead.
+    """
+    # Types where editor role takes precedence over author role
+    EDITOR_PREFERRED_TYPES = {"book", "interactive resource", "conference proceedings"}
+    dspace_type = dspace_row.get("dc.type", "").strip().lower()
+    prefer_editor = dspace_type in EDITOR_PREFERRED_TYPES
+
+    contributors_by_role = {}
+
+    # Parse all roles
+    authors = parse_author_names(dspace_row.get("dc.contributor.author", ""))
+    editors = parse_author_names(dspace_row.get("dc.contributor.editor", ""))
+    translators = parse_author_names(dspace_row.get("dc.contributor.translator", ""))
+    illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
+
+    # Resolve author/editor overlap for the same name
+    author_set = {normalize(n) for n in authors}
+    editor_set = {normalize(n) for n in editors}
+    overlap = author_set & editor_set
+
+    if overlap:
+        if prefer_editor:
+            # Remove overlapping names from authors, keep in editors
+            authors = [n for n in authors if normalize(n) not in overlap]
+            print(f"  ℹ️ Duplicate author/editor names — keeping as editor for type '{dspace_type}': "
+                  f"{[n for n in editors if normalize(n) in overlap]}")
+        else:
+            # Remove overlapping names from editors, keep in authors
+            editors = [n for n in editors if normalize(n) not in overlap]
+            print(f"  ℹ️ Duplicate author/editor names — keeping as author for type '{dspace_type}': "
+                  f"{[n for n in authors if normalize(n) in overlap]}")
+
+    # Metadata correction: non-book type with editors but no authors
+    # → those editors are almost certainly authors mislabelled in DSpace
+    if not prefer_editor and editors and not authors:
+        print(f"  ⚠️ Metadata correction: dc.type='{dspace_type}' has editors but no authors "
+              f"— treating editors as authors: {editors}")
+        authors = editors
+        editors = []
+
+    if authors:
+        contributors_by_role["author"] = authors
+    if editors:
+        contributors_by_role["editor"] = editors
+    if translators:
+        contributors_by_role["translator"] = translators
+    if illustrators:
+        contributors_by_role["illustrator"] = illustrators
+
+    return contributors_by_role
+
+
+def build_contributor(matched_person, role, pure_type_key, collect_external_orgs=True):
+    """Build a contributor object from matched person and role.
+
+    Args:
+        matched_person: Person dict from the person mapping.
+        role: Contributor role string (e.g. 'author', 'editor').
+        pure_type_key: Lower-cased Pure type key used to construct role URIs.
+        collect_external_orgs: When False, external organisation data is omitted
+            from the built contributor even if present in the person mapping.
+    """
+    first = matched_person.get("firstName", "")
+    last = matched_person.get("lastName", "")
+    
+    has_valid_internal = matched_person.get("internal", False) and matched_person.get("internalUUIDs")
+    has_valid_external = matched_person.get("external", False) and matched_person.get("externalUUIDs")
+    
+    if not has_valid_internal and not has_valid_external:
+        return None
+    
+    # Map role to URI - use pure_type_key for dynamic type
+    role_uri_map = {
+        "author": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/author",
+        "editor": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/editor",
+        "translator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/translator",
+        "illustrator": f"/dk/atira/pure/researchoutput/roles/{pure_type_key.lower()}/illustrator"
+    }
+    
+    role_term_map = {
+        "author": "Author",
+        "editor": "Editor",
+        "translator": "Translator",
+        "illustrator": "Illustrator"
+    }
+    
+    uuid_value = None
+    if has_valid_internal:
+        uuid_value = extract_uuid(matched_person.get("internalUUIDs")[0])
+        contributor = {
+            "typeDiscriminator": "InternalContributorAssociation",
+            "name": {
+                "firstName": first,
+                "lastName": last
+            },
+            "role": {
+                "uri": role_uri_map.get(role, role_uri_map["author"]),
+                "term": {"en_IE": role_term_map.get(role, "Author")}
+            },
+            "person": {
+                "systemName": "Person",
+                "uuid": uuid_value
+            }
+        }
+        # For internal authors, prefer primaryInternalOrganization,
+        # fall back to any available internal organisation
+        primary_org = matched_person.get("primaryInternalOrganization")
+        if not primary_org:
+            internal_orgs = matched_person.get("internalOrganizations", [])
+            if internal_orgs:
+                primary_org = internal_orgs[0] if isinstance(internal_orgs[0], str) else internal_orgs[0].get("uuid")
+                print(f"        ℹ️ No primaryInternalOrganization for {first} {last} — using fallback org: {primary_org}")
+
+        if primary_org:
+            contributor["organizations"] = [
+                {"systemName": "Organization", "uuid": primary_org}
+            ]
+        else:
+            print(f"        ⚠️ Internal person {first} {last} has no primaryInternalOrganization and no internalOrganizations in mapping")
+
+        return contributor
+    
+    elif has_valid_external:
+        uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
+        contributor = {
+            "typeDiscriminator": "ExternalContributorAssociation",
+            "name": {
+                "firstName": first,
+                "lastName": last
+            },
+            "role": {
+                "uri": role_uri_map.get(role, role_uri_map["author"]),
+                "term": {"en_IE": role_term_map.get(role, "Author")}
+            },
+            "externalPerson": {
+                "systemName": "ExternalPerson",
+                "uuid": uuid_value
+            }
+        }
+        # Only attach external organisations when the feature is enabled
+        if collect_external_orgs and "externalOrganizations" in matched_person and matched_person["externalOrganizations"]:
+            external_orgs = matched_person["externalOrganizations"]
+            
+            # Filter out ignored organizations — always, even if it's the only one
+            filtered_external_orgs = [
+                org_uuid for org_uuid in external_orgs
+                if org_uuid not in EXTERNAL_ORGS_TO_IGNORE
+            ]
+            
+            if filtered_external_orgs:
+                contributor["externalOrganizations"] = [
+                    {
+                        "systemName": "ExternalOrganization",
+                        "uuid": org_uuid
+                    }
+                    for org_uuid in filtered_external_orgs
+                ]
+        
+        return contributor
+    
+    return None
+
+
+def process_contributors(
+    contributors_by_role,
+    person_index,
+    dspace_row,
+    pure_type_key,
+    existing_contributors=None,
+    pure_uuid=None,
+):
+    """
+    Resolve DSpace contributor names to Pure person entities.
+
+    Args:
+        contributors_by_role: Dict of {role: [name, ...]} from parse_contributors_by_role.
+        person_index:         Pre-built person name index.
+        dspace_row:           The current DSpace CSV row.
+        pure_type_key:        Lower-cased Pure type key for role URI construction.
+        existing_contributors: List of existing Pure contributor dicts. When provided,
+                               contributors already present (by UUID or name) are reused
+                               rather than rebuilt. Pass None or [] to skip this check
+                               (i.e. for new records or override mode).
+        pure_uuid:            UUID of the matched Pure record, used in unmatched contributor
+                              log entries. Pass None for new records.
+
+    Returns:
+        (final_contributors, unmatched_contributors)
+        final_contributors:    List of resolved contributor dicts ready for Pure.
+        unmatched_contributors: List of dicts describing contributors that could not be resolved.
+    """
+    existing_contributors = existing_contributors or []
+
+    # Build fast lookup structures from existing contributors
+    existing_by_uuid = {}
+    existing_by_name = {}
+    for contrib in existing_contributors:
+        if not contrib:
+            continue
+        name = contrib.get("name", {}) or {}
+        first = name.get("firstName", "") or ""
+        last = name.get("lastName", "") or ""
+        all_first_names = [first] if first else []
+        all_last_names = [last] if last else []
+        for name_entry in contrib.get("names", []):
+            name_obj = name_entry.get("name", {})
+            if f := name_obj.get("firstName", ""):
+                all_first_names.append(f)
+            if l := name_obj.get("lastName", ""):
+                all_last_names.append(l)
+        for pair in list(product(all_first_names, all_last_names)) + list(product(all_last_names, all_first_names)):
+            key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
+            existing_by_name[key] = contrib
+        for ref_key in ("person", "externalPerson"):
+            ref = contrib.get(ref_key)
+            if ref:
+                uuid = ref.get("uuid")
+                if uuid:
+                    existing_by_uuid[uuid] = contrib
+
+    # Pre-compute record-level identifiers for paper-evidence scoring
+    record_paper_dois = set()
+    record_paper_handles = set()
+    record_paper_title = normalize(dspace_row.get("dc.title", "").strip())
+
+    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
+    if publisher_doi_raw:
+        record_paper_dois.add(normalize_doi(publisher_doi_raw))
+    for doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        record_paper_dois.add(normalize_doi(doi))
+    for handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        record_paper_handles.add(normalize_handle(handle))
+
+    final_contributors = []
+    unmatched_contributors = []
+
+    # Helper to build an unmatched entry
+    handles = extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))
+    handle_for_log = handles[0] if handles else None
+
+    for role, contributor_names in contributors_by_role.items():
+        print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
+
+        for contributor_name in contributor_names:
+            print(f"    ➤ Checking match for {role}: '{contributor_name}'")
+            matches = find_person_match(contributor_name, person_index)
+
+            if not matches:
+                print(f"        ⚠️ No matches found — adding to unmatched")
+                unmatched_contributors.append({
+                    "name": contributor_name,
+                    "role": role,
+                    "handle": handle_for_log,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_uuid,
+                })
+                continue
+
+            print(f"      ✅ Found {len(matches)} matches")
+            matched_person = resolve_author_duplicate(
+                matches,
+                paper_dois=record_paper_dois,
+                paper_handles=record_paper_handles,
+                paper_title=record_paper_title,
+            )
+
+            if not matched_person:
+                print(f"        ❌ ERROR: resolve_author_duplicate returned None for {len(matches)} matches!")
+                unmatched_contributors.append({
+                    "name": contributor_name,
+                    "role": role,
+                    "handle": handle_for_log,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_uuid,
+                })
+                continue
+
+            has_valid_internal = matched_person.get("internal", False) and matched_person.get("internalUUIDs")
+            has_valid_external = matched_person.get("external", False) and matched_person.get("externalUUIDs")
+
+            if not has_valid_internal and not has_valid_external:
+                print(f"        ⚠️ Matched person has no valid UUIDs — adding to unmatched")
+                unmatched_contributors.append({
+                    "name": contributor_name,
+                    "role": role,
+                    "handle": handle_for_log,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_uuid,
+                })
+                continue
+
+            uuid_value = None
+            if has_valid_internal:
+                uuid_value = extract_uuid(matched_person.get("internalUUIDs")[0])
+            elif has_valid_external:
+                uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
+
+            first = matched_person.get("firstName", "")
+            last = matched_person.get("lastName", "")
+            name_key = (normalize(first), normalize(last))
+
+            # Reuse existing contributor if present (skip when existing_contributors is empty,
+            # i.e. for new records or override mode)
+            if existing_contributors:
+                if uuid_value in existing_by_uuid:
+                    print(f"        ℹ️ Contributor already exists (by UUID), using existing: {first} {last}")
+                    final_contributors.append(existing_by_uuid[uuid_value])
+                    continue
+                if name_key in existing_by_name:
+                    print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
+                    final_contributors.append(existing_by_name[name_key])
+                    continue
+
+            contributor = build_contributor(
+                matched_person, role, pure_type_key,
+                collect_external_orgs=COLLECT_EXTERNAL_ORGS,
+            )
+            if contributor:
+                final_contributors.append(contributor)
+                print(f"        ✅ Added {role}: {first} {last}")
+
+    return final_contributors, unmatched_contributors
+
+
 def resolve_record_duplicate(records):
     """Choose record with most metadata or updated by real user"""
     if not records:
@@ -1000,6 +1162,44 @@ def build_link(url, alias="", description=""):
         "description": {"en_IE": description}
         }
 
+
+def build_dspace_identifier(dspace_uuid):
+    """Build a DSpace PrimaryId identifier object."""
+    if not dspace_uuid:
+        return None
+    return {
+        "typeDiscriminator": "PrimaryId",
+        "idSource": "DSpace",
+        "value": dspace_uuid.strip()
+    }
+
+
+def merge_identifiers(existing_identifiers, dspace_uuid):
+    """
+    Merge DSpace UUID into identifiers array as PrimaryId.
+    Demotes any existing PrimaryId entries to Id.
+    Returns the updated identifiers list.
+    """
+    if not dspace_uuid:
+        return existing_identifiers
+
+    # Demote any existing PrimaryId to Id
+    updated = []
+    for ident in existing_identifiers:
+        if ident.get("typeDiscriminator") == "PrimaryId":
+            updated.append({**ident, "typeDiscriminator": "Id"})
+        else:
+            updated.append(ident)
+
+    # Add the DSpace PrimaryId (avoid duplicate if already present)
+    already_present = any(
+        i.get("idSource") == "DSpace" and i.get("value", "").strip() == dspace_uuid.strip()
+        for i in updated
+    )
+    if not already_present:
+        updated.insert(0, build_dspace_identifier(dspace_uuid))
+
+    return updated
 
 
 def batch_validate_organizations(org_uuids, api_key, base_url):
@@ -1291,177 +1491,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     pure_type = pure_record.get("typeDiscriminator", "")
 
-    # --- 1. Contributors (authors, editors, translators, illustrators) > add new mapped contributors from DSpace
+# --- 1. Contributors (authors, editors, translators, illustrators) > add new mapped contributors from DSpace
     contributors_by_role = parse_contributors_by_role(dspace_row)
-    
-    # Get existing contributors from Pure record (if any)
-    existing_contributors = [c for c in pure_record.get("contributors", []) if c is not None]
 
-    # Track unmatched contributors for this record
-    record_unmatched_contributors = []
+    # Get existing contributors from Pure record (if any).
+    # In override mode, pass an empty list so process_contributors skips deduplication entirely.
+    existing_contributors = [] if override_mode else [c for c in pure_record.get("contributors", []) if c is not None]
 
-    # If override mode is on, ignore existing contributors
-    if override_mode:
-        existing_contributors = []
-        existing_author_keys = set()
-        existing_uuids = set()
-        existing_by_uuid = {}
-        existing_by_name = {}
-    else:
-        # Create a set of existing contributor keys for fast lookup
-        existing_author_keys = set()
-        existing_uuids = set()
-        existing_by_uuid = {}
-        existing_by_name = {}
+    final_contributors, record_unmatched_contributors = process_contributors(
+        contributors_by_role=contributors_by_role,
+        person_index=person_index,
+        dspace_row=dspace_row,
+        pure_type_key=pure_type.lower(),
+        existing_contributors=existing_contributors,
+        pure_uuid=pure_record.get("uuid"),
+    )
 
-        for contrib in existing_contributors:
-            if not contrib:
-                continue
-
-            # Extract name
-            name = contrib.get("name", {}) or {}
-            first = name.get("firstName", "") or ""
-            last = name.get("lastName", "") or ""
-            all_first_names = [first] if first else []
-            all_last_names = [last] if last else []
-
-            # Add alternatives from 'names' array
-            for name_entry in contrib.get("names", []):
-                name_obj = name_entry.get("name", {})
-                if first := name_obj.get("firstName", ""):
-                    all_first_names.append(first)
-                if last := name_obj.get("lastName", ""):
-                    all_last_names.append(last)
-
-            # Generate all name combinations
-            normal_order = list(product(all_first_names, all_last_names))
-            reverse_order = list(product(all_last_names, all_first_names))
-            all_combinations = normal_order + reverse_order
-
-            for pair in all_combinations:
-                name_key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
-                existing_author_keys.add(name_key)
-                existing_by_name[name_key] = contrib
-
-            # Extract UUID (internal or external)
-            if "person" in contrib:
-                person_obj = contrib["person"]
-                if person_obj:
-                    uuid = person_obj.get("uuid")
-                    if uuid:
-                        existing_uuids.add(uuid)
-                        existing_by_uuid[uuid] = contrib
-            elif "externalPerson" in contrib:
-                ext_person_obj = contrib["externalPerson"]
-                if ext_person_obj:
-                    uuid = ext_person_obj.get("uuid")
-                    if uuid:
-                        existing_uuids.add(uuid)
-                        existing_by_uuid[uuid] = contrib
-
-    # Process DSpace contributors by role and build final contributors list
-    final_contributors = []
-    
-    # Collect record-level identifiers for paper-evidence scoring
-    _record_paper_dois    = set()
-    _record_paper_handles = set()
-    _record_paper_title   = normalize(dspace_row.get("dc.title", "").strip())
-
-    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
-    if publisher_doi_raw:
-        _record_paper_dois.add(normalize_doi(publisher_doi_raw))
-
-    for _doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
-        _record_paper_dois.add(normalize_doi(_doi))
-
-    for _handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
-        _record_paper_handles.add(normalize_handle(_handle))
-
-    # Contributor processing 
-    for role, contributor_names in contributors_by_role.items():
-        print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
-        
-        for contributor_name in contributor_names:
-            print(f"    ➤ Checking match for {role}: '{contributor_name}'")
-            matches = find_person_match(contributor_name, person_index)
-            
-            if matches:
-                print(f"      ✅ Found {len(matches)} matches")
-                matched_person = resolve_author_duplicate(
-                    matches,
-                    paper_dois=_record_paper_dois,
-                    paper_handles=_record_paper_handles,
-                    paper_title=_record_paper_title,
-                )
-                
-                if not matched_person:
-                    print(f"        ❌ ERROR: resolve_author_duplicate returned None for {len(matches)} matches!")
-                    record_unmatched_contributors.append({
-                        "name": contributor_name,
-                        "role": role,
-                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                        "title": dspace_row.get("dc.title", ""),
-                        "pure_uuid": pure_record.get("uuid")
-                    })
-                    continue
-                
-                # Get UUID to check if already exists
-                has_valid_internal = matched_person.get("internal", False) and matched_person.get("internalUUIDs")
-                has_valid_external = matched_person.get("external", False) and matched_person.get("externalUUIDs")
-                
-                if not has_valid_internal and not has_valid_external:
-                    print(f"        ⚠️ Matched person has no valid UUIDs — adding to unmatched")
-                    record_unmatched_contributors.append({
-                        "name": contributor_name,
-                        "role": role,
-                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                        "title": dspace_row.get("dc.title", ""),
-                        "pure_uuid": pure_record.get("uuid")
-                    })
-                    continue
-                
-                uuid_value = None
-                if has_valid_internal:
-                    uuid_value = extract_uuid(matched_person.get("internalUUIDs")[0])
-                elif has_valid_external:
-                    uuid_value = extract_uuid(matched_person.get("externalUUIDs")[0])
-                
-                # Check if this contributor already exists (only if not in override mode)
-                first = matched_person.get("firstName", "")
-                last = matched_person.get("lastName", "")
-                name_key = (normalize(first), normalize(last))
-                
-                # If override mode is on, always create new contributor
-                # If contributor already exists and not in override mode, use existing one
-                if not override_mode and uuid_value in existing_by_uuid:
-                    print(f"        ℹ️ Contributor already exists (by UUID), using existing: {first} {last}")
-                    final_contributors.append(existing_by_uuid[uuid_value])
-                elif not override_mode and name_key in existing_by_name:
-                    print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
-                    final_contributors.append(existing_by_name[name_key])
-                else:
-                    # Create new contributor, passing the global COLLECT_EXTERNAL_ORGS flag
-                    contributor = build_contributor(
-                        matched_person, role, pure_type.lower(),
-                        collect_external_orgs=COLLECT_EXTERNAL_ORGS
-                    )
-                    if contributor:
-                        final_contributors.append(contributor)
-                        action = "Overriding" if override_mode else "Added new"
-                        print(f"        ✅ {action} {role}: {first} {last}")
-            else:
-                print(f"        ⚠️ No matches found — adding to unmatched")
-                record_unmatched_contributors.append({
-                    "name": contributor_name,
-                    "role": role,
-                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                    "title": dspace_row.get("dc.title", ""),
-                    "pure_uuid": pure_record.get("uuid")
-                })
+    if record_unmatched_contributors:
+        log_entry["unmatchedContributors"] = record_unmatched_contributors
+        _unmatched_contributors.extend(record_unmatched_contributors)
 
     # Only update contributors if we have any
     if final_contributors:
-        # Validate and fix organizations
         print("  🔍 Validating organization UUIDs...")
         final_contributors = validate_and_fix_organizations(final_contributors, API_KEY, BASE_URL, collect_external_orgs=COLLECT_EXTERNAL_ORGS)
         updated_record["contributors"] = final_contributors
@@ -1824,32 +1875,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others ---
     final_evs = []
-    
+
     # Add repository DOI first (if exists)
     if repo_ev:
-        # Strip https://doi.org/ prefix from DOI
-        # if "doi" in repo_ev and repo_ev["doi"].startswith("https://doi.org/"):
-        #     repo_ev["doi"] = repo_ev["doi"].replace("https://doi.org/", "")
+        if "doi" in repo_ev and isinstance(repo_ev["doi"], str):
+            repo_ev["doi"] = normalize_doi(repo_ev["doi"])
         final_evs.append(repo_ev)
-    
+
     # Add publisher DOIs second
     for ev in existing_publisher_evs:
-        # Strip https://doi.org/ prefix from DOI
-        # if "doi" in ev and ev["doi"].startswith("https://doi.org/"):
-        #     ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        if "doi" in ev and isinstance(ev["doi"], str):
+            ev["doi"] = normalize_doi(ev["doi"])
         final_evs.append(ev)
-    
+
     if new_publisher_ev:
-        # Strip https://doi.org/ prefix from DOI
-        # if "doi" in new_publisher_ev and new_publisher_ev["doi"].startswith("https://doi.org/"):
-        #     new_publisher_ev["doi"] = new_publisher_ev["doi"].replace("https://doi.org/", "")
+        if "doi" in new_publisher_ev and isinstance(new_publisher_ev["doi"], str):
+            new_publisher_ev["doi"] = normalize_doi(new_publisher_ev["doi"])
         final_evs.append(new_publisher_ev)
-    
+
     # Add other electronic versions last
     for ev in existing_other_evs:
-        # Strip https://doi.org/ prefix from DOI if present
-        # if "doi" in ev and isinstance(ev["doi"], str) and ev["doi"].startswith("https://doi.org/"):
-        #     ev["doi"] = ev["doi"].replace("https://doi.org/", "")
+        if "doi" in ev and isinstance(ev["doi"], str):
+            ev["doi"] = normalize_doi(ev["doi"])
         final_evs.append(ev)
 
     # Only update if changed
@@ -1997,7 +2044,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             # No journal UUID in DSpace and no existing journal - this shouldn't be a journal contribution
             print(f"    ⚠️ No journal UUID found for {type_disc} - record may need type change")
 
-    # --- 10. Set workflow step ---
+    
+    # --- 10. Identifiers — set DSpace UUID as PrimaryId ---
+    dspace_uuid = dspace_row.get("uuid", "").strip()
+    if dspace_uuid:
+        existing_identifiers = pure_record.get("identifiers", [])
+        updated_record["identifiers"] = merge_identifiers(existing_identifiers, dspace_uuid)
+    else:
+        print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
+    # --- 11. Set workflow step ---
     updated_record["workflow"] = {
         "step": "validated"
     }
@@ -2183,101 +2238,31 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     contributors_by_role = parse_contributors_by_role(dspace_row)
     print(f"✅ Processing contributors: {sum(len(names) for names in contributors_by_role.values())} total")
 
-    mapped_contributors = []
-    record_unmatched_contributors = []  
-
-    # Collect record-level identifiers for paper-evidence scoring 
-    _record_paper_dois    = set()
-    _record_paper_handles = set()
-    _record_paper_title   = normalize(dspace_row.get("dc.title", "").strip())
-
-    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
-    if publisher_doi_raw:
-        _record_paper_dois.add(normalize_doi(publisher_doi_raw))
-
-    for _doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
-        _record_paper_dois.add(normalize_doi(_doi))
-
-    for _handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
-        _record_paper_handles.add(normalize_handle(_handle))
-
     # Process each role and its contributors
-    for role, contributor_names in contributors_by_role.items():
-        print(f"  ➤ Processing {len(contributor_names)} {role}(s)")
-        
-        for contributor_name in contributor_names:
-            print(f"    ➤ Checking match for {role}: '{contributor_name}'")
-            matches = find_person_match(contributor_name, person_index)
-            
-            if matches:
-                print(f"      ✅ Found {len(matches)} matches")
-                matched_person = resolve_author_duplicate(
-                    matches,
-                    paper_dois=_record_paper_dois,
-                    paper_handles=_record_paper_handles,
-                    paper_title=_record_paper_title,
-                )
-                
-                if not matched_person:
-                    print(f"        ❌ ERROR: resolve_author_duplicate returned None!")
-                    record_unmatched_contributors.append({
-                        "name": contributor_name,
-                        "role": role,
-                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                        "title": dspace_row.get("dc.title", ""),
-                        "pure_uuid": None
-                    })
-                    continue
-                
-                # Check if person has valid UUIDs
-                has_valid_internal = matched_person.get("internal", False) and matched_person.get("internalUUIDs")
-                has_valid_external = matched_person.get("external", False) and matched_person.get("externalUUIDs")
-                
-                if not has_valid_internal and not has_valid_external:
-                    print(f"        ⚠️ Matched person has no valid UUIDs — adding to unmatched")
-                    record_unmatched_contributors.append({
-                        "name": contributor_name,
-                        "role": role,
-                        "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                        "title": dspace_row.get("dc.title", ""),
-                        "pure_uuid": None
-                    })
-                    continue
-                
-                # Build contributor using helper function, passing the global flag
-                contributor = build_contributor(
-                    matched_person, role, pure_type_key,
-                    collect_external_orgs=COLLECT_EXTERNAL_ORGS
-                )
-                if contributor:
-                    mapped_contributors.append(contributor)
-                    print(f"        ✅ Added {role}: {matched_person.get('firstName')} {matched_person.get('lastName')}")
-            else:
-                print(f"        ⚠️ No matches found — adding to unmatched")
-                record_unmatched_contributors.append({
-                    "name": contributor_name,
-                    "role": role,
-                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
-                    "title": dspace_row.get("dc.title", ""),
-                    "pure_uuid": None
-                })
+    final_contributors, record_unmatched_contributors = process_contributors(
+        contributors_by_role=contributors_by_role,
+        person_index=person_index,
+        dspace_row=dspace_row,
+        pure_type_key=pure_type_key,
+        existing_contributors=[],   # always empty for new records
+        pure_uuid=None,
+    )
 
-    # Add to global tracker
     if record_unmatched_contributors:
         _unmatched_contributors.extend(record_unmatched_contributors)
 
     # Check if we have any contributors - if not, skip this record
-    if not mapped_contributors:
+    if not final_contributors:
         print(f"❌ No matched contributors found for record {dspace_row.get('dc.title', '')} - skipping")
         return None
 
     # Validate and fix organizations BEFORE assigning to record
     print("  🔍 Validating organization UUIDs...")
-    mapped_contributors = validate_and_fix_organizations(mapped_contributors, API_KEY, BASE_URL, collect_external_orgs=COLLECT_EXTERNAL_ORGS)
+    final_contributors = validate_and_fix_organizations(final_contributors, API_KEY, BASE_URL, collect_external_orgs=COLLECT_EXTERNAL_ORGS)
 
     # Always ensure contributor info is present (post-validation list)
-    record["contributors"] = mapped_contributors
-    print(f"✅ Added {len(mapped_contributors)} contributors")
+    record["contributors"] = final_contributors
+    print(f"✅ Added {len(final_contributors)} contributors")
 
     # Collect ALL validated organizations from ALL contributors
     # Internal contributors -> "organizations" (primaryInternalOrganization)
@@ -2287,7 +2272,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     seen_internal = set()
     seen_external = set()
 
-    for contributor in mapped_contributors:
+    for contributor in final_contributors:
         if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
             for org in contributor.get("organizations", []):
                 uuid = org.get("uuid")
@@ -2319,7 +2304,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
 
     # Set managingOrganization from first internal contributor's primary organization
     first_internal_org_uuid = None
-    for contributor in mapped_contributors:
+    for contributor in final_contributors:
         if contributor.get("typeDiscriminator") == "InternalContributorAssociation":
             orgs = contributor.get("organizations", [])
             if orgs:
@@ -2457,6 +2442,13 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             repo_ev["licenseType"] = {
                 "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
             }
+
+    # Set DSpace UUID as PrimaryId identifier
+    dspace_uuid = dspace_row.get("uuid", "").strip()
+    if dspace_uuid:
+        record["identifiers"] = [build_dspace_identifier(dspace_uuid)]
+    else:
+        print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
 
     return record
 
