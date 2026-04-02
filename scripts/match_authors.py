@@ -16,8 +16,8 @@ IRISH_SURNAMES_JSON = "./author_matching/irish_surnames.json"  # New file with c
 OUTPUT_DIR = f"./author_matching/{TODAY}"
 HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
 
-GENERATE_INITIAL_VARIANTS = False  # Generate variants from existing initials (e.g., "J." -> "J", "J P", etc.)
-GENERATE_INITIALS_FROM_NAMES = False  # Generate initials from full names (e.g., "John" -> "J", "J.")
+# GENERATE_INITIAL_VARIANTS = False  # Generate variants from existing initials (e.g., "J." -> "J", "J P", etc.)
+# GENERATE_INITIALS_FROM_NAMES = False  # Generate initials from full names (e.g., "John" -> "J", "J.")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -519,7 +519,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
         internal_organizations = []
         external_organizations = []
         internal_uuids_with_visibility = []
-        primary_internal_organisation = ""
+        primary_internal_organization = ""
 
         for uuid in internal_matches:
             if internal_internal_orgs and uuid in internal_internal_orgs:
@@ -532,25 +532,25 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
                     "uuid": uuid,
                     "visibility": visibility
                 })
-            if not primary_internal_organisation and internal_primary_org_by_uuid and uuid in internal_primary_org_by_uuid:
-                primary_internal_organisation = internal_primary_org_by_uuid[uuid]
+            if not primary_internal_organization and internal_primary_org_by_uuid and uuid in internal_primary_org_by_uuid:
+                primary_internal_organization = internal_primary_org_by_uuid[uuid]
 
-            # Collect ORCID and Scopus ID from internal matches
-            orcid_values = set()
-            scopus_id_values = set()
-            for uuid in internal_matches:
-                if internal_orcid_by_uuid and uuid in internal_orcid_by_uuid:
-                    orcid_values.add(internal_orcid_by_uuid[uuid])
-                if internal_scopus_id_by_uuid and uuid in internal_scopus_id_by_uuid:
-                    scopus_id_values.add(internal_scopus_id_by_uuid[uuid])
+        # Collect ORCID and Scopus ID from internal matches
+        orcid_values = set()
+        scopus_id_values = set()
+        for uuid in internal_matches:
+            if internal_orcid_by_uuid and uuid in internal_orcid_by_uuid:
+                orcid_values.add(internal_orcid_by_uuid[uuid])
+            if internal_scopus_id_by_uuid and uuid in internal_scopus_id_by_uuid:
+                scopus_id_values.add(internal_scopus_id_by_uuid[uuid])
 
-            if len(orcid_values) > 1:
-                print(f"⚠️ WARNING: Multiple distinct ORCIDs for author '{first} {last}': {orcid_values}")
-            if len(scopus_id_values) > 1:
-                print(f"⚠️ WARNING: Multiple distinct Scopus IDs for author '{first} {last}': {scopus_id_values}")
+        if len(orcid_values) > 1:
+            print(f"⚠️ WARNING: Multiple distinct ORCIDs for author '{first} {last}': {orcid_values}")
+        if len(scopus_id_values) > 1:
+            print(f"⚠️ WARNING: Multiple distinct Scopus IDs for author '{first} {last}': {scopus_id_values}")
 
-            orcid_out = next(iter(orcid_values), "")
-            scopus_id_out = next(iter(scopus_id_values), "")
+        orcid_out = next(iter(orcid_values), "")
+        scopus_id_out = next(iter(scopus_id_values), "")
 
         for uuid in external_matches:
             if external_internal_orgs and uuid in external_internal_orgs:
@@ -591,7 +591,7 @@ def enrich_authors(authors, internal_index, external_index, irish_surname_index,
             "externalUUIDs": external_matches,
             "internalOrganizations": internal_organizations,
             "externalOrganizations": external_organizations,
-            "primaryInternalOrganisation": primary_internal_organisation,
+            "primaryInternalOrganization": primary_internal_organization,
             "alternativeFirstName": list(alternative_firstnames),
             "alternativeLastName": list(alternative_lastnames)
         }
