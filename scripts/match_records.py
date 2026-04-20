@@ -38,8 +38,23 @@ MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 NO_AUTHOR_CSV = os.path.join(OUTPUT_DIR, f"no_author_records_{TODAY}.csv")
-API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
-BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
+FAULTY_PDF_CSV = os.path.join(OUTPUT_DIR, f"faulty_pdf_records_{TODAY}.csv")
+
+USE_TEST_ENV = True  # Set to False to use production environment
+
+API_KEY = os.getenv("PURE_ROOT_API_KEY_TEST", "") if USE_TEST_ENV else os.getenv("PURE_ROOT_API_KEY", "")
+BASE_URL = (
+    "https://galway-staging.elsevierpure.com/ws/api/"
+    if USE_TEST_ENV else
+    "https://research.universityofgalway.ie/ws/api/"
+)
+
+DSPACE_BITSTREAM_BASE = (
+    "https://galway.dspace7-test.openrepository.com/bitstreams"
+    if USE_TEST_ENV else
+    "https://researchrepository.universityofgalway.ie/bitstreams"
+)
+PURE_FILE_UPLOAD_URL = f"{BASE_URL}research-outputs/file-uploads"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
@@ -141,11 +156,20 @@ LANG_MAP = {
         # Add more as needed
     }
 
+LICENSE_MAP = {
+    "CC BY-NC-ND":       "cc_by_nc_nd",
+    "CC BY":             "cc_by",
+    "CC BY-SA":          "cc_by_sa",
+    "CC BY-NC":          "cc_by_nc",
+    "CC BY-NC-SA":       "cc_by_nc_sa",
+    "Public Domain":     "public_domain",
+    "All rights reserved": "all_rights_reserved",
+}
 
 if not API_KEY:
-    print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
+    env_var = "PURE_ROOT_API_KEY_TEST" if USE_TEST_ENV else "PURE_ROOT_API_KEY"
+    print(f"⚠️ WARNING: {env_var} not found in environment variables.")
     print("   External person duplicate resolution will be skipped.")
-
 
 os.makedirs(MATCHED_DIR, exist_ok=True)
 os.makedirs(UNMATCHED_DIR, exist_ok=True)
@@ -157,7 +181,7 @@ _org_validation_cache = {}
 
 _unmatched_contributors = []
 _unmatched_funders = []
-
+_faulty_pdf_records = []
 
 # --- LOGGER SETUP --- #
 
@@ -1156,6 +1180,167 @@ def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
     return ev
 
 
+def resolve_license_uri(rights_str):
+    """
+    Map a dc.rights string to a Pure license URI.
+    Falls back to CC BY-NC-ND if the value is absent or unrecognised.
+    """
+    key = LICENSE_MAP.get(rights_str.strip(), "cc_by_nc_nd") if rights_str else "cc_by_nc_nd"
+    return f"/dk/atira/pure/core/document/licenses/{key}"
+
+
+def resolve_embargo_and_access(dspace_row):
+    """
+    Derive embargo period and access type from DSpace embargo fields.
+
+    Returns:
+        embargo_date_iso (str | None): ISO date string if a future embargo exists,
+                                       else None.
+        embargo_active   (bool):       True if embargo_date_iso is set.
+        access_uri       (str):        Pure access type URI.
+        embargo_period   (dict | None): Ready-made embargoPeriod dict for Pure,
+                                        or None if no active embargo.
+    """
+    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
+    embargo_desc     = dspace_row.get("dc.description.embargo", "").strip()
+
+    embargo_date_iso = None
+    embargo_active   = False
+
+    if embargo_date_str:
+        year, month, day = parse_date(embargo_date_str)
+        candidate = f"{year:04d}-{month:02d}-{day:02d}"
+        if candidate > TODAY:
+            embargo_date_iso = candidate
+            embargo_active   = True
+
+    if not embargo_active and embargo_desc and embargo_desc > TODAY:
+        embargo_date_iso = embargo_desc
+        embargo_active   = True
+
+    access_uri = (
+        "/dk/atira/pure/core/openaccesspermission/embargoed"
+        if embargo_active else
+        "/dk/atira/pure/core/openaccesspermission/open"
+    )
+    embargo_period = {"endDate": embargo_date_iso} if embargo_active else None
+
+    return embargo_date_iso, embargo_active, access_uri, embargo_period
+
+
+def upload_pdf_electronic_version(dspace_row):
+    """
+    Upload a PDF file from DSpace to Pure as a FileElectronicVersion.
+
+    Streams the file directly from the DSpace bitstream URL to the Pure
+    file-upload endpoint without saving to disk.
+
+    Args:
+        dspace_row:       The current DSpace CSV row.
+
+    Returns:
+        A FileElectronicVersion dict ready to append to electronicVersions,
+        or None if no PDF path is present or on error.
+    """
+    pdf_path = dspace_row.get("pdf_handle_paths", "").strip()
+    if not pdf_path:
+        return None  # No PDF — perfectly fine, not an error
+
+    dspace_uuid  = dspace_row.get("uuid", "").strip()
+    title        = dspace_row.get("dc.title", "").strip()
+    handle_str   = dspace_row.get("handle", "").strip()
+    full_pdf_url = f"{DSPACE_BITSTREAM_BASE}{pdf_path}"
+    file_name    = pdf_path.rstrip("/").split("/")[-1]
+
+    print(f"  📎 Uploading PDF: {full_pdf_url}")
+
+    # --- Stream DSpace → Pure file-upload endpoint ---
+    try:
+        src_response = requests.get(full_pdf_url, stream=True, timeout=60)
+        if src_response.status_code != 200:
+            msg = (f"  ❌ PDF download failed (HTTP {src_response.status_code}): "
+                   f"{full_pdf_url}")
+            print(msg)
+            _faulty_pdf_records.append({
+                "uuid":          dspace_uuid,
+                "title":         title,
+                "handle":        handle_str,
+                "full_pdf_path": full_pdf_url,
+            })
+            return None
+
+        upload_response = requests.put(
+            PURE_FILE_UPLOAD_URL,
+            data=src_response.iter_content(chunk_size=8192),
+            headers={
+                "accept":       "application/json",
+                "api-key":      API_KEY,
+                "content-type": "*/*",
+            },
+            timeout=120,
+        )
+    except requests.RequestException as exc:
+        print(f"  ❌ PDF upload request error: {exc}")
+        _faulty_pdf_records.append({
+            "uuid":          dspace_uuid,
+            "title":         title,
+            "handle":        handle_str,
+            "full_pdf_path": full_pdf_url,
+        })
+        return None
+
+    if upload_response.status_code not in (200, 201):
+        print(f"  ❌ Pure file-upload failed (HTTP {upload_response.status_code}): "
+              f"{upload_response.text[:200]}")
+        _faulty_pdf_records.append({
+            "uuid":          dspace_uuid,
+            "title":         title,
+            "handle":        handle_str,
+            "full_pdf_path": full_pdf_url,
+        })
+        return None
+
+    try:
+        upload_data = upload_response.json()
+    except ValueError:
+        print(f"  ❌ Could not parse Pure file-upload response as JSON")
+        _faulty_pdf_records.append({
+            "uuid":          dspace_uuid,
+            "title":         title,
+            "handle":        handle_str,
+            "full_pdf_path": full_pdf_url,
+        })
+        return None
+
+    print(f"  ✅ PDF uploaded successfully. Key: {upload_data.get('key')}")
+
+    license_uri                                    = resolve_license_uri(dspace_row.get("dc.rights", ""))
+    _, _, access_uri, embargo_period               = resolve_embargo_and_access(dspace_row)
+
+    file_ev = {
+        "typeDiscriminator": "FileElectronicVersion",
+        "accessType":  {"uri": access_uri},
+        "licenseType": {"uri": license_uri},
+        "file": {
+            "fileName": file_name,
+            "mimeType": upload_data.get("mimeType", "*/*"),
+            "size":     upload_data.get("size", 0),
+            "uploadedFile": {
+                "digest":     upload_data.get("digest"),
+                "digestType": upload_data.get("digestType"),
+                "mimeType":   upload_data.get("mimeType", "*/*"),
+                "size":       upload_data.get("size", 0),
+                "key":        upload_data.get("key"),
+            },
+        },
+    }
+
+    if embargo_period:
+        file_ev["embargoPeriod"] = embargo_period
+
+    return file_ev
+
+
 def build_link(url, alias="", description=""):
     return {
         "url": url,
@@ -1776,18 +1961,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
     # --- 5a. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
-    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
-    embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
-    
-    # Parse embargo date using same function as publication date
-    embargo_date = None
-    if embargo_date_str:
-        year, month, day = parse_date(embargo_date_str)
-        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
-    
-    embargo_active = bool(embargo_date and embargo_date > TODAY)
+    embargo_date, embargo_active, _, embargo_period = resolve_embargo_and_access(dspace_row)
 
-    # --- 5a. Publisher DOI (dc.identifier.doi) > add if blank ---
+    # --- 5b. Publisher DOI (dc.identifier.doi) > add if blank ---
   
     publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
     new_publisher_ev = None
@@ -1796,15 +1972,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         # Check if it's actually a repository DOI
         if "10.13025" in publisher_doi:
             if publisher_doi not in existing_repo_dois:
-                access_type = "EMBARGOED" if embargo_active else "OPEN"
                 ev = build_electronic_version(
                     doi=publisher_doi,
                     version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type=access_type,
-                    license_type="CC_BY_NC_ND"
+                    access_type="EMBARGOED" if embargo_active else "OPEN",
+                    license_type="CC_BY_NC"
                 )
-                if embargo_active and ev:
-                    ev["embargoPeriod"] = {"endDate": embargo_date}
+                if embargo_period and ev:
+                    ev["embargoPeriod"] = embargo_period
                 if ev:
                     repo_ev = ev
         elif publisher_doi not in existing_publisher_dois:
@@ -1817,17 +1992,21 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     if repo_ev:
         # Update existing repo version
-        if embargo_date or embargo_desc:
-            repo_ev["embargoPeriod"] = {"endDate": embargo_date}
-            if embargo_active:
-                repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
+        if embargo_period:
+            repo_ev["embargoPeriod"] = embargo_period
+            repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
+        elif embargo_date:
+            # Embargo date exists but is in the past — clear any stale embargo
+            repo_ev.pop("embargoPeriod", None)
+            repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
+
 
         # Always enforce version type + license
         repo_ev["versionType"] = {
             "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
         }
         repo_ev["licenseType"] = {
-            "uri": "/dk/atira/pure/core/document/licenses/cc_by_nc_nd"
+            "uri": "/dk/atira/pure/core/document/licenses/cc_by_nc"
         }
 
     # --- 5c. Repository DOI & Handle (dc.identifier.uri) > always add ---
@@ -1845,11 +2024,11 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                         doi=doi,
                         version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
                         access_type=access_type,
-                        license_type="CC_BY_NC_ND"
+                        license_type="CC_BY_NC"
                     )
 
-                    if embargo_active and ev:
-                        ev["embargoPeriod"] = {"endDate": embargo_date}
+                    if embargo_period and ev:
+                        ev["embargoPeriod"] = embargo_period
 
                     if ev:
                         repo_ev = ev
@@ -1858,21 +2037,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # --- 5d. Rights (dc.rights.uri) > overwrite for repo version ---
     rights = dspace_row.get("dc.rights", "").strip()
-    if rights and repo_ev:
-        # Map rights to license type
-        license_map = {
-            "CC BY-NC-ND": "CC_BY_NC_ND",
-            "CC BY": "CC_BY",
-            "CC BY-SA": "CC_BY_SA",
-            "CC BY-NC": "CC_BY_NC",
-            "CC BY-NC-SA": "CC_BY_NC_SA",
-            "Public Domain": "PUBLIC_DOMAIN",
-            "All rights reserved": "ALL_RIGHTS_RESERVED"
-        }
-        license_type = license_map.get(rights, "CC_BY_NC_ND")
-        repo_ev["licenseType"] = {
-            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-        }
+    if repo_ev:
+        repo_ev["licenseType"] = {"uri": resolve_license_uri(rights)}
 
     # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others ---
     final_evs = []
@@ -1900,11 +2066,17 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             ev["doi"] = normalize_doi(ev["doi"])
         final_evs.append(ev)
 
+    # --- 5f. Upload PDF as FileElectronicVersion (append last) ---
+    file_ev = upload_pdf_electronic_version(dspace_row)
+    if file_ev:
+        final_evs.append(file_ev)
+        print(f"  ✅ FileElectronicVersion added: {file_ev['file']['fileName']}")
+
     # Only update if changed
     if final_evs != existing_evs:
         updated_record["electronicVersions"] = final_evs
 
-    # --- 5f. Add Handles as links and remove DOI links ---
+    # --- 5g. Add Handles as links and remove DOI links ---
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
     existing_links = pure_record.get("links", [])
 
@@ -2329,17 +2501,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
     electronic_versions = []
     
-    # First, add repository DOI if exists
-    embargo_date_str = dspace_row.get("dc.date.embargo", "").strip()
-    embargo_desc = dspace_row.get("dc.description.embargo", "").strip()
-    
-    # Parse embargo date using same function as publication date
-    embargo_date = None
-    if embargo_date_str:
-        year, month, day = parse_date(embargo_date_str)
-        embargo_date = f"{year:04d}-{month:02d}-{day:02d}"
-    
-    embargo_active = bool(embargo_date and embargo_date > TODAY) or bool(embargo_desc and embargo_desc > TODAY)
+    embargo_date, embargo_active, _, embargo_period = resolve_embargo_and_access(dspace_row)
 
     uri_str = dspace_row.get("dc.identifier.uri", "").strip()
     if uri_str:
@@ -2355,30 +2517,15 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     doi=doi,
                     version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
                     access_type=access_type,
-                    license_type="CC_BY_NC_ND"
+                    license_type="CC_BY_NC"
                 )
 
-                if embargo_active and ev and embargo_date:
-                    ev["embargoPeriod"] = {"endDate": embargo_date}
+                if embargo_period and ev:
+                    ev["embargoPeriod"] = embargo_period
                 
                 if ev:
                     # Apply rights if specified
-                    rights = dspace_row.get("dc.rights", "").strip()
-                    if rights:
-                        license_map = {
-                            "CC BY-NC-ND": "CC_BY_NC_ND",
-                            "CC BY": "CC_BY",
-                            "CC BY-SA": "CC_BY_SA",
-                            "CC BY-NC": "CC_BY_NC",
-                            "CC BY-NC-SA": "CC_BY_NC_SA",
-                            "Public Domain": "PUBLIC_DOMAIN",
-                            "All rights reserved": "ALL_RIGHTS_RESERVED"
-                        }
-                        license_type = license_map.get(rights, "CC_BY_NC_ND")
-                        ev["licenseType"] = {
-                            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-                        }
-                    
+                    ev["licenseType"] = {"uri": resolve_license_uri(dspace_row.get("dc.rights", ""))}
                     electronic_versions.append(ev)
                     break  # only one repo DOI expected
     
@@ -2395,11 +2542,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                     publisher_doi,
                     "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
                     access_type=access_type,
-                    license_type="CC_BY_NC_ND"
+                    license_type="CC_BY_NC"
                 )
-                if embargo_active and ev and embargo_date:
-                    ev["embargoPeriod"] = {"endDate": embargo_date}
+                if embargo_period and ev:
+                    ev["embargoPeriod"] = embargo_period
                 if ev:
+                    ev["licenseType"] = {"uri": resolve_license_uri(dspace_row.get("dc.rights", ""))}
                     electronic_versions.insert(0, ev)
         else:
             ev = build_electronic_version(
@@ -2409,40 +2557,20 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             if ev:
                 electronic_versions.append(ev)
     
-    # Set electronic versions on record
+    # Set electronic versions on record (DOIs)
     if electronic_versions:
         record["electronicVersions"] = electronic_versions
+
+    file_ev = upload_pdf_electronic_version(dspace_row)
+    if file_ev:
+        record.setdefault("electronicVersions", []).append(file_ev)
+        print(f"✅ FileElectronicVersion added: {file_ev['file']['fileName']}")
 
     # Add only the first Handle from DSpace to links to avoid duplication
     if uri_str:
         handles = extract_handles_from_uri(uri_str)
         if handles:
             record["links"] = [build_link(handles[0], alias="Handle", description="Repository Handle")]
-
-    # Set rights
-    rights = dspace_row.get("dc.rights", "").strip()
-    if rights:
-        # Look for repo electronic version
-        repo_ev = None
-        for ev in record.get("electronicVersions", []):
-            doi = normalize_doi(ev.get("doi", ""))
-            if doi and doi.startswith("https://doi.org/10.13025"):
-                repo_ev = ev
-                break
-        if repo_ev:
-            license_map = {
-                "CC BY-NC-ND": "CC_BY_NC_ND",
-                "CC BY": "CC_BY",
-                "CC BY-SA": "CC_BY_SA",
-                "CC BY-NC": "CC_BY_NC",
-                "CC BY-NC-SA": "CC_BY_NC_SA",
-                "Public Domain": "PUBLIC_DOMAIN",
-                "All rights reserved": "ALL_RIGHTS_RESERVED"
-            }
-            license_type = license_map.get(rights, "CC_BY_NC_ND")
-            repo_ev["licenseType"] = {
-                "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-            }
 
     # Set DSpace UUID as PrimaryId identifier
     dspace_uuid = dspace_row.get("uuid", "").strip()
@@ -2774,6 +2902,18 @@ def main():
             writer.writerows(_unmatched_funders)
         print(f"✅ Unmatched funders saved to: {unmatched_funders_csv}")
 
+
+    # Write faulty PDF records CSV
+    if _faulty_pdf_records:
+        print(f"\n📝 Writing {len(_faulty_pdf_records)} faulty PDF records to CSV...")
+        with open(FAULTY_PDF_CSV, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['uuid', 'title', 'handle', 'full_pdf_path']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_faulty_pdf_records)
+        print(f"✅ Faulty PDF records saved to: {FAULTY_PDF_CSV}")
+
+
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
     hours = int(elapsed_time // 3600)
@@ -2799,6 +2939,7 @@ def main():
     print(f"     ↳ Other errors: {error_count}")
     print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
     print(f"   Unmatched funders: {len(_unmatched_funders)}")
+    print(f"   Faulty PDF records: {len(_faulty_pdf_records)}")
     print(f"   Logs saved to: {LOG_DIR}")
     print(f"\n⏱️  Total time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
