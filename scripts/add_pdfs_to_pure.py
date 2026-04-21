@@ -12,7 +12,7 @@ Records are processed one at a time to ensure each uploaded file is linked befor
 the 2-hour Pure expiry window. Multiple PDFs per DSpace row are all processed.
 
 Usage:
-    python upload_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
+    python add_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
 
 .env file must contain:
     PURE_ROOT_API_KEY_TEST=your_key_here   (UAT)
