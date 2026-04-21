@@ -111,7 +111,7 @@ For each DSpace row that has a `pdf_handle_paths` value, the script:
 1. **Filters** to rows in a Publications collection with a `pdf_handle_paths` value.
 2. **Matches** the row to a Pure record using (in priority order): Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
 3. **Parses all PDF paths** from `pdf_handle_paths` (semicolon-separated). Each path is processed independently through the steps below.
-4. **Checks for duplicates** (if `--skip-existing`): skips a file only if a `FileElectronicVersion` with the **same filename and size** already exists in Pure. To determine size without a full download, the script checks the local file on disk if available, otherwise sends an HTTP HEAD request to DSpace. If the filename matches but size differs or is unknown, the file is uploaded and appended alongside the existing version. After each successful PUT, the in-memory Pure record is updated so subsequent files in the same row correctly see the newly added `FileElectronicVersion`.
+4. **Checks for duplicates** (if `--skip-existing`): skips a file only if a `FileElectronicVersion` with the **same filename and size** already exists in Pure. When a match is found, the script also checks whether the existing FileEV's metadata is up to date — specifically `licenseType`, `accessType`, `versionType`, `visibleOnPortalDate`, and `embargoPeriod`. If any field is missing or differs from the DSpace-derived values, the Pure record is PUTted with the corrected metadata without re-uploading the file. If size differs or is unknown, the file is uploaded and appended alongside the existing version.
 5. **Gets the PDF** — either streams it from DSpace (`--source dspace`) or reads it from `--pdf-dir` (`--source local`). When `--save-locally` is set, each file is written to disk and a `BytesIO` buffer simultaneously in a single pass; the buffer is used for the Pure upload with no second read or file re-open. When using `--source local`, filenames are matched using the URL-decoded form; if not found, the script also tries the URL-encoded variant as a fallback.
 6. **Uploads** each PDF to Pure's temporary file-upload endpoint.
 7. **PUTs** the Pure record immediately with the new `FileElectronicVersion` appended to `electronicVersions`.
@@ -150,8 +150,9 @@ All log files are written to `--log-dir` and timestamped with the run start time
 |---|---|
 | `success` | All PDFs uploaded and Pure record updated. |
 | `partial_success` | At least one PDF uploaded successfully, but one or more failed. |
+| `metadata_updated` | File already existed with the same filename and size, but one or more metadata fields (license, access type, version type, visible on portal date, or embargo period) were missing or out of date and have been updated. |
 | `no_match` | No Pure record could be matched to this DSpace row. |
-| `skipped_existing_fev` | All files for this row already exist in Pure with the same filename and size. |
+| `skipped_existing_fev` | All files for this row already exist in Pure with the same filename and size. Metadata may have been updated silently. |
 | `pdf_upload_failed` | All PDF uploads failed (not found locally, or download/upload error). |
 | `put_failed` | File uploaded but the subsequent PUT to Pure failed. |
 | `dry_run` | Dry-run mode — no action taken. |

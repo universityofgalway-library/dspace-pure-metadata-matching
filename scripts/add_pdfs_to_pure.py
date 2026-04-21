@@ -22,7 +22,7 @@ Options:
     --test / --no-test      Use UAT (default) or Production environment
     --source                Where to get PDFs: 'dspace' (default) or 'local'
     --save-locally          Also save downloaded PDFs to disk (dspace source only)
-    --pdf-dir               Save/read directory for PDFs (default: ./downloaded_dspace_pdfs)
+    --pdf-dir               Save/read directory for PDFs (default: ./dspace_pdfs)
     --log-dir               Directory for logs (default: ./pdf_upload_logs)
     --dry-run               Match records and report what would be done, but do not upload/PUT
     --skip-existing /
@@ -148,7 +148,7 @@ def remove_nulls(obj):
 # ---------------------------------------------------------------------------
 
 def resolve_license_uri(rights_str: str) -> str:
-    key = LICENSE_MAP.get(rights_str.strip(), "cc_by_nc_nd") if rights_str else "cc_by_nc_nd"
+    key = LICENSE_MAP.get(rights_str.strip(), "cc_by_nc") if rights_str else "cc_by_nc"
     return f"/dk/atira/pure/core/document/licenses/{key}"
 
 
@@ -199,6 +199,56 @@ def already_has_file_ev(pure_record: dict, file_name: str = None, file_size: int
             return True
     return False
 
+def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
+    """
+    Compare a FileElectronicVersion's metadata against DSpace-derived values.
+    Returns (needs_update bool, updated_ev dict).
+    Checks: licenseType, accessType, versionType, visibleOnPortalDate, embargoPeriod.
+    """
+    _, embargo_active, embargo_period = resolve_embargo_and_access(dspace_row)
+    license_uri = resolve_license_uri(dspace_row.get("dc.rights", "").strip())
+    access_uri  = (
+        "/dk/atira/pure/core/openaccesspermission/embargoed"
+        if embargo_active else
+        "/dk/atira/pure/core/openaccesspermission/open"
+    )
+    version_uri        = "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
+    visible_on_portal  = TODAY
+
+    changed = False
+    updated = dict(ev)  # shallow copy to modify
+
+    # License
+    if ev.get("licenseType", {}).get("uri") != license_uri:
+        updated["licenseType"] = {"uri": license_uri}
+        changed = True
+
+    # Access type
+    if ev.get("accessType", {}).get("uri") != access_uri:
+        updated["accessType"] = {"uri": access_uri}
+        changed = True
+
+    # Version type — update if missing
+    if not ev.get("versionType"):
+        updated["versionType"] = {"uri": version_uri}
+        changed = True
+
+    # Visible on portal date — update if missing
+    if not ev.get("visibleOnPortalDate"):
+        updated["visibleOnPortalDate"] = visible_on_portal
+        changed = True
+
+    # Embargo period — update if DSpace has one and Pure doesn't, or end dates differ
+    pure_embargo_end = ev.get("embargoPeriod", {}).get("endDate")
+    dspace_embargo_end = embargo_period.get("endDate") if embargo_period else None
+    if dspace_embargo_end != pure_embargo_end:
+        if embargo_period:
+            updated["embargoPeriod"] = embargo_period
+        elif "embargoPeriod" in updated:
+            del updated["embargoPeriod"]
+        changed = True
+
+    return changed, updated
 
 # ---------------------------------------------------------------------------
 # Matching: build lookup indices from Pure JSON
@@ -400,8 +450,12 @@ def build_file_electronic_version(
 
     fev = {
         "typeDiscriminator": "FileElectronicVersion",
+        "visibleOnPortalDate": TODAY,
         "accessType":  {"uri": access_uri},
         "licenseType": {"uri": license_uri},
+                "versionType": {
+            "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
+                },
         "file": {
             "fileName": file_name,
             "mimeType": upload_data.get("mimeType", "*/*"),
@@ -500,7 +554,8 @@ def put_pure_record(
     cleaned = remove_nulls(cleaned)
 
     evs = cleaned.get("electronicVersions", [])
-    evs.append(file_ev)
+    if file_ev is not None:
+        evs.append(file_ev)
     cleaned["electronicVersions"] = evs
 
     url = f"{base_url}research-outputs/{uuid}"
@@ -588,7 +643,7 @@ def main():
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     parser.add_argument("--source",           choices=["dspace", "local"], default="dspace",
                         help="Where to get PDFs from: 'dspace' (default) or 'local'.")
-    parser.add_argument("--pdf-dir",          default="./downloaded_dspace_pdfs",
+    parser.add_argument("--pdf-dir",          default="./dspace_pdfs",
                         help="If --source dspace: directory to save PDFs locally (only with --save-locally). "
                              "If --source local: directory to read PDFs from.")
     args = parser.parse_args()
@@ -697,6 +752,7 @@ def main():
         "total":           len(rows_with_pdf),
         "no_match":        0,
         "already_has_fev": 0,
+        "metadata_updated": 0,
         "pdf_fail":        0,
         "put_fail":        0,
         "success":         0,
@@ -767,6 +823,7 @@ def main():
         # Steps 2-6: process each PDF path individually
         any_success   = False
         any_fail      = False
+        metadata_update_handled = False
         uploaded_keys = []
         skipped_paths = []
         failed_paths  = []
@@ -805,12 +862,59 @@ def main():
                                 known_size = None
 
                     if already_has_file_ev(pure_record, file_name=safe_file_name, file_size=known_size):
-                        print(f"    ℹ️  Same filename and size — skipping")
-                        counters["already_has_fev"] += 1
-                        skipped_paths.append(safe_file_name)
+                        # Find the matching FileEV in the record
+                        matching_ev = next(
+                            (ev for ev in pure_record.get("electronicVersions", [])
+                             if ev.get("typeDiscriminator") == "FileElectronicVersion"
+                             and ev.get("file", {}).get("fileName") == safe_file_name),
+                            None
+                        )
+                        changed, updated_ev = needs_metadata_update(matching_ev, row) if matching_ev else (False, None)
+
+                        if changed and not args.dry_run:
+                            print(f"    ℹ️  Same filename and size — updating metadata")
+                            updated_record = dict(pure_record)
+                            updated_record["electronicVersions"] = [
+                                updated_ev if (
+                                    ev.get("typeDiscriminator") == "FileElectronicVersion"
+                                    and ev.get("file", {}).get("fileName") == safe_file_name
+                                ) else ev
+                                for ev in pure_record.get("electronicVersions", [])
+                            ]
+                            success, detail, pure_id = put_pure_record(
+                                pure_record=updated_record,
+                                file_ev=None,
+                                api_key=api_key,
+                                base_url=base_url,
+                                session=session,
+                            )
+                            entry["pure_id"] = pure_id
+                            if success:
+                                print(f"    ✅ Metadata updated ({detail})")
+                                counters["metadata_updated"] += 1
+                                entry["status"] = "metadata_updated"
+                                entry["detail"] = f"Metadata updated for: {safe_file_name}"
+                                results.append(entry)
+                                success_rows.append(entry)
+                                metadata_update_handled = True
+                            else:
+                                print(f"    ❌ Metadata update PUT failed: {detail}")
+                                counters["put_fail"] += 1
+                                entry["status"] = "put_failed"
+                                entry["detail"] = f"Metadata update failed: {detail}"
+                                results.append(entry)
+                                failed_rows.append(entry)
+                                metadata_update_handled = True
+                            continue  # skip the rest of the per-file loop and status consolidation
+                        elif changed and args.dry_run:
+                            print(f"    🔍 DRY RUN — metadata would be updated")
+                            counters["already_has_fev"] += 1
+                            skipped_paths.append(safe_file_name)
+                        else:
+                            print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
+                            counters["already_has_fev"] += 1
+                            skipped_paths.append(safe_file_name)
                         continue
-                    else:
-                        print(f"    ℹ️  Same filename but different/unknown size — uploading alongside existing")
 
             # 3. Dry run
             if args.dry_run:
@@ -818,11 +922,11 @@ def main():
                 counters["dry_run_would"] += 1
                 continue
 
-            # Rate limit: ensure at least 10 seconds between DSpace downloads
+            # Rate limit: ensure at least 5 seconds between DSpace downloads
             if args.source == "dspace" and not args.dry_run:
                 elapsed_since_last = time.time() - last_dspace_request
-                if elapsed_since_last < 10:
-                    wait = 10 - elapsed_since_last
+                if elapsed_since_last < 5:
+                    wait = 5 - elapsed_since_last
                     print(f"    ⏳ Rate limiting — waiting {wait:.1f}s before next download...")
                     time.sleep(wait)
 
@@ -885,6 +989,9 @@ def main():
                 any_fail = True
                 failed_paths.append(safe_file_name)
 
+        if metadata_update_handled and not uploaded_keys and not skipped_paths and not failed_paths:
+            continue
+
         # Consolidate entry status across all paths for this row
         entry["upload_key"] = "; ".join(uploaded_keys) if uploaded_keys else None
 
@@ -928,15 +1035,16 @@ def main():
     print(f"\n{'='*70}")
     print(f"SUMMARY — {RUN_TS}")
     print(f"{'='*70}")
-    print(f"  Total rows with PDF     : {counters['total']}")
-    print(f"  No Pure match           : {counters['no_match']}")
-    print(f"  Already had FileEV      : {counters['already_has_fev']}")
-    print(f"  PDF upload failed       : {counters['pdf_fail']}")
-    print(f"  PUT failed              : {counters['put_fail']}")
-    print(f"  Successfully uploaded   : {counters['success']}")
+    print(f"  Total rows with PDF           : {counters['total']}")
+    print(f"  No Pure match                 : {counters['no_match']}")
+    print(f"  Already had FileEV            : {counters['already_has_fev']}")
+    print(f"  Only file metadata updated    : {counters['metadata_updated']}")
+    print(f"  PDF upload failed             : {counters['pdf_fail']}")
+    print(f"  PUT failed                    : {counters['put_fail']}")
+    print(f"  Successfully uploaded         : {counters['success']}")
     if args.dry_run:
-        print(f"  Would have processed    : {counters['dry_run_would']}")
-    print(f"  Time elapsed            : {h:02d}:{m:02d}:{s:02d}")
+        print(f"  Would have processed      : {counters['dry_run_would']}")
+    print(f"  Time elapsed                  : {h:02d}:{m:02d}:{s:02d}")
     print(f"{'='*70}")
 
     write_json_log(results, results_json)
