@@ -36,7 +36,7 @@ ADD_FILE_ELECTRONIC_VERSIONS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv"
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-04-21.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
