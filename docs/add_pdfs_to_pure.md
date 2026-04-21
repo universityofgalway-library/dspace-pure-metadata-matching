@@ -41,6 +41,7 @@ PURE_ROOT_API_KEY=your_production_key_here
 | Column | Description |
 |---|---|
 | `pdf_handle_paths` | Semicolon-separated handle-based paths to PDFs, e.g. `/10379/4728/1/file.pdf` or `/10379/4728/1/cover.pdf ; /10379/4728/2/fulltext.pdf`. Rows without this value are skipped. All paths are processed. |
+| `pdf_links` | Semicolon-separated direct download URLs for the PDFs, e.g. `https://…/bitstreams/uuid/content`. Positionally aligned with `pdf_handle_paths`. Used as the actual download source. |
 | `handle` | The item handle, e.g. `http://hdl.handle.net/10379/4728`. Used as the primary handle source for matching and for the file references output. |
 | `uuid` | DSpace item UUID. |
 | `dc.identifier.uri` | Semicolon-separated URIs (handles and DOIs). Used as fallback for matching when `handle` is empty. |
@@ -112,7 +113,7 @@ For each DSpace row that has a `pdf_handle_paths` value, the script:
 2. **Matches** the row to a Pure record using (in priority order): Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
 3. **Parses all PDF paths** from `pdf_handle_paths` (semicolon-separated). Each path is processed independently through the steps below.
 4. **Checks for duplicates** (if `--skip-existing`): skips a file only if a `FileElectronicVersion` with the **same filename and size** already exists in Pure. When a match is found, the script also checks whether the existing FileEV's metadata is up to date — specifically `licenseType`, `accessType`, `versionType`, `visibleOnPortalDate`, and `embargoPeriod`. If any field is missing or differs from the DSpace-derived values, the Pure record is PUTted with the corrected metadata without re-uploading the file. If size differs or is unknown, the file is uploaded and appended alongside the existing version.
-5. **Gets the PDF** — either streams it from DSpace (`--source dspace`) or reads it from `--pdf-dir` (`--source local`). When `--save-locally` is set, each file is written to disk and a `BytesIO` buffer simultaneously in a single pass; the buffer is used for the Pure upload with no second read or file re-open. When using `--source local`, filenames are matched using the URL-decoded form; if not found, the script also tries the URL-encoded variant as a fallback.
+5. **Gets the PDF** — either streams it from the direct bitstream URL in `pdf_links` (`--source dspace`) or reads it from `--pdf-dir` (`--source local`). When `--save-locally` is set, each file is written to disk and a `BytesIO` buffer simultaneously in a single pass; the buffer is used for the Pure upload with no second read or file re-open. When using `--source local`, filenames are matched using the URL-decoded form; if not found, the script also tries the URL-encoded variant as a fallback.
 6. **Uploads** each PDF to Pure's temporary file-upload endpoint.
 7. **PUTs** the Pure record immediately with the new `FileElectronicVersion` appended to `electronicVersions`.
 

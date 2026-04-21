@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-add_pdfs_to_pure.py
+upload_pdfs_to_pure.py
 
 For each record in the Pure JSON that has a matching DSpace row with a PDF path:
   1. Downloads the PDF from DSpace (or reads from local disk)
@@ -12,7 +12,7 @@ Records are processed one at a time to ensure each uploaded file is linked befor
 the 2-hour Pure expiry window. Multiple PDFs per DSpace row are all processed.
 
 Usage:
-    python add_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
+    python upload_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
 
 .env file must contain:
     PURE_ROOT_API_KEY_TEST=your_key_here   (UAT)
@@ -81,6 +81,18 @@ def safe_path(path: str) -> str:
     if sys.platform == "win32" and not path.startswith("\\\\?\\"):
         return "\\\\?\\" + os.path.abspath(path)
     return path
+
+
+def is_valid_pdf(content: bytes) -> bool:
+    """Return True if content starts with the PDF magic bytes and is larger than 1kb."""
+    return len(content) > 1024 and content[:4] == b'%PDF'
+
+
+def _prepend_chunk(first_chunk: bytes, rest):
+    """Yield first_chunk followed by the rest of an iterator."""
+    yield first_chunk
+    yield from rest
+
 
 def normalize_doi(value: str) -> str:
     if not isinstance(value, str):
@@ -351,18 +363,29 @@ def upload_pdf_to_pure(
     local_path = os.path.abspath(os.path.join(pdf_save_dir, file_name)) if save_locally else None
 
     try:
-        src = session.get(full_pdf_url, stream=True, timeout=60)
+        src = session.get(full_pdf_url, stream=True, timeout=60, allow_redirects=True)
         if src.status_code != 200:
             print(f"    ❌ PDF download failed (HTTP {src.status_code}): {full_pdf_url}")
+            return None
+        content_type = src.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            print(f"    ❌ DSpace returned HTML instead of PDF (possible auth redirect): {full_pdf_url}")
+            return None
+
+        # Read first chunk to validate content
+        first_chunk = next(src.iter_content(chunk_size=8192), b"")
+        if not is_valid_pdf(first_chunk):
+            print(f"    ❌ Content is not a valid PDF or is under 1kb "
+                  f"(first bytes: {first_chunk[:8]!r}, size so far: {len(first_chunk)})")
             return None
 
         if save_locally:
             os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
-            local_path = os.path.abspath(local_path)  # resolve to absolute path
             if not os.path.exists(local_path):
-                # Write to disk and buffer simultaneously — single pass, no re-open
                 buffer = io.BytesIO()
+                buffer.write(first_chunk)
                 with open(safe_path(local_path), "wb") as fh:
+                    fh.write(first_chunk)
                     for chunk in src.iter_content(chunk_size=8192):
                         fh.write(chunk)
                         buffer.write(chunk)
@@ -371,9 +394,10 @@ def upload_pdf_to_pure(
                 upload_content = buffer
             else:
                 print(f"    ♻️  Local backup already exists: {local_path}")
-                upload_content = src.iter_content(chunk_size=8192)
+                # Prepend first_chunk back into an iterator for upload
+                upload_content = _prepend_chunk(first_chunk, src.iter_content(chunk_size=8192))
         else:
-            upload_content = src.iter_content(chunk_size=8192)
+            upload_content = _prepend_chunk(first_chunk, src.iter_content(chunk_size=8192))
 
     except requests.RequestException as exc:
         # Primary download failed — fall back to local file if available
@@ -658,11 +682,7 @@ def main():
         if args.test else
         "https://research.universityofgalway.ie/ws/api/"
     )
-    dspace_bitstream_base = (
-        "https://galway.dspace7-test.openrepository.com/bitstreams"
-        if args.test else
-        "https://researchrepository.universityofgalway.ie/bitstreams"
-    )
+
     pure_file_upload_url = f"{base_url}research-outputs/file-uploads"
 
     # ---- Logging setup -----------------------------------------------------
@@ -773,6 +793,9 @@ def main():
 
         # Parse all PDF paths — semicolon-separated
         pdf_paths = [p.strip() for p in pdf_path.split(";") if p.strip()]
+        pdf_links_raw = row.get("pdf_links", "").strip()
+        pdf_links     = [p.strip() for p in pdf_links_raw.split(";") if p.strip()]
+        pdf_link_map  = dict(zip(pdf_paths, pdf_links))
 
         # Prefer the dedicated 'handle' column; fall back to dc.identifier.uri
         handle_str = row.get("handle", "").strip()
@@ -785,7 +808,7 @@ def main():
         print(f"  Handle         : {handle_str}")
         print(f"  DSpace file ID : {pdf_path}")
         if args.source == "dspace":
-            print(f"  PDF URLs       : {'; '.join(f'{dspace_bitstream_base}{p}' for p in pdf_paths)}")
+            print(f"  PDF URLs       : {'; '.join(pdf_links)}")
 
         entry = {
             "dspace_uuid":    dspace_uuid,
@@ -793,7 +816,7 @@ def main():
             # Prefix handle for the log if not already a full URL
             "handle":         f"https://hdl.handle.net/{handle_str}" if handle_str and not handle_str.startswith("http") else handle_str,
             "dspace_file_id": pdf_path,   # original semicolon-separated paths, as-is
-            "pdf_url":        "; ".join(f"{dspace_bitstream_base}{p}" for p in pdf_paths) if args.source == "dspace" else "",
+            "pdf_url": "; ".join(pdf_links) if args.source == "dspace" else "",
             "pure_uuid":      None,
             "pure_id":        None,
             "match_type":     None,
@@ -819,6 +842,7 @@ def main():
         entry["pure_id"]    = str(pure_record.get("pureId", ""))
         entry["match_type"] = match_type
         print(f"  ✅ Matched Pure record ({match_type}): {pure_uuid}  pureId: {entry['pure_id']}")
+        
 
         # Steps 2-6: process each PDF path individually
         any_success   = False
@@ -831,7 +855,39 @@ def main():
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
             safe_file_name = unquote(file_name)                       # decoded — used in Pure and on disk
-            full_pdf_url   = f"{dspace_bitstream_base}{single_path}" if args.source == "dspace" else ""
+            full_pdf_url = pdf_link_map.get(single_path, "") if args.source == "dspace" else ""
+
+            # Pre-download from DSpace for local saving (always, regardless of skip check)
+            if args.source == "dspace" and args.save_locally and not args.dry_run:
+                local_path = os.path.abspath(os.path.join(args.pdf_dir, safe_file_name))
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                if not os.path.exists(local_path):
+                    # Rate limit before download
+                    elapsed_since_last = time.time() - last_dspace_request
+                    if elapsed_since_last < 5:
+                        wait = 5 - elapsed_since_last
+                        print(f"    ⏳ Rate limiting — waiting {wait:.1f}s...")
+                        time.sleep(wait)
+                    print(f"    💾 Pre-downloading for local save: {safe_file_name}")
+                    try:
+                        presrc = session.get(full_pdf_url, stream=True, timeout=60, allow_redirects=True)
+                        if presrc.status_code == 200 and "text/html" not in presrc.headers.get("Content-Type", ""):
+                            first_chunk = next(presrc.iter_content(chunk_size=8192), b"")
+                            if not is_valid_pdf(first_chunk):
+                                print(f"    ❌ Pre-download content is not a valid PDF or under 1kb — skipping save")
+                            else:
+                                with open(safe_path(local_path), "wb") as fh:
+                                    fh.write(first_chunk)
+                                    for chunk in presrc.iter_content(chunk_size=8192):
+                                        fh.write(chunk)
+                                last_dspace_request = time.time()
+                                print(f"    💾 Saved: {local_path}")
+                        else:
+                            print(f"    ⚠️  Pre-download failed (HTTP {presrc.status_code})")
+                    except requests.RequestException as exc:
+                        print(f"    ⚠️  Pre-download error: {exc}")
+                else:
+                    print(f"    ℹ️  Already saved locally: {local_path}")
 
             print(f"  📄 Processing file: {safe_file_name}")
 
@@ -921,14 +977,6 @@ def main():
                 print(f"    🔍 DRY RUN — would upload {safe_file_name}")
                 counters["dry_run_would"] += 1
                 continue
-
-            # Rate limit: ensure at least 5 seconds between DSpace downloads
-            if args.source == "dspace" and not args.dry_run:
-                elapsed_since_last = time.time() - last_dspace_request
-                if elapsed_since_last < 5:
-                    wait = 5 - elapsed_since_last
-                    print(f"    ⏳ Rate limiting — waiting {wait:.1f}s before next download...")
-                    time.sleep(wait)
 
             # 4. Upload PDF to Pure
             print(f"    📎 Uploading: {safe_file_name}")
