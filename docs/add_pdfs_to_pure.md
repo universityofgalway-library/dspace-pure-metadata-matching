@@ -57,17 +57,18 @@ PURE_ROOT_API_KEY=your_production_key_here
 | Flag | Default | Description |
 |---|---|---|
 | `--test` / `--no-test` | `--test` | Use UAT (`--test`) or Production (`--no-test`) API and bitstream base URL. |
-| `--save-locally` | `False` | Also write downloaded PDFs to disk before uploading to Pure. PDFs are saved for **all matched records**, including those whose Pure record already has a `FileElectronicVersion`. If a file already exists locally it is reused rather than re-downloaded. |
-| `--pdf-dir` | `./downloaded_dspace_pdfs` | Directory for locally saved PDFs. Only used when `--save-locally` is set. |
+| `--source` | `dspace` | Where to get PDFs from: `dspace` (download from DSpace) or `local` (read from disk). |
+| `--pdf-dir` | `./downloaded_dspace_pdfs` | If `--source dspace`: directory to save PDFs locally (only used with `--save-locally`). If `--source local`: directory to read PDFs from. Must exist when using `--source local`. |
+| `--save-locally` | `False` | Only applicable when `--source dspace`. Write downloaded PDFs to disk as a backup. PDFs are saved for **all matched records**, including those skipped due to an existing `FileElectronicVersion`. If a file already exists locally it is reused rather than re-downloaded. |
 | `--log-dir` | `./pdf_upload_logs` | Directory where all log files are written. |
-| `--skip-existing` / `--no-skip-existing` | `--skip-existing` | Skip Pure records that already have a `FileElectronicVersion`. Prevents duplicates on re-runs. |
+| `--skip-existing` / `--no-skip-existing` | `--skip-existing` | Skip Pure records that already have a `FileElectronicVersion` with the **same filename and size**. If filename matches but size differs or cannot be determined, the file is uploaded alongside the existing one. |
 | `--dry-run` | `False` | Match records and report what would be done without making any API calls. |
 
 ---
 
 ## Usage
 
-**Standard run against UAT:**
+**Standard run against UAT (download from DSpace):**
 ```bash
 python upload_pdfs_to_pure.py \
   --dspace-csv ./dspace_data/export.csv \
@@ -81,6 +82,15 @@ python upload_pdfs_to_pure.py \
   --pure-json  ./pure_research_outputs/outputs.json \
   --no-test \
   --save-locally \
+  --pdf-dir ./downloaded_pdfs
+```
+
+**Upload from local directory instead of DSpace:**
+```bash
+python upload_pdfs_to_pure.py \
+  --dspace-csv ./dspace_data/export.csv \
+  --pure-json  ./pure_research_outputs/outputs.json \
+  --source local \
   --pdf-dir ./downloaded_pdfs
 ```
 
@@ -98,17 +108,20 @@ python upload_pdfs_to_pure.py \
 
 For each DSpace row that has a `pdf_handle_paths` value, the script:
 
-1. **Matches** the row to a Pure record using (in priority order): Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
-2. **Skips** the record if it already has a `FileElectronicVersion` (when `--skip-existing` is on).
-3. **Downloads** the PDF from the DSpace bitstream URL. If `--save-locally` is set, the PDF is downloaded and saved to `--pdf-dir` immediately after a Pure match is found, before any skip checks. This means local copies are saved even for records that are subsequently skipped due to an existing `FileElectronicVersion`. If the file already exists locally from a previous run, it is reused without re-downloading.
-4. **Uploads** the PDF to Pure's temporary file-upload endpoint.
-5. **PUTs** the Pure record immediately with the new `FileElectronicVersion` appended to `electronicVersions`.
+1. **Filters** to rows in a Publications collection and with a `pdf_handle_paths` value.
+2. **Matches** the row to a Pure record using (in priority order): Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
+3. **Saves locally** (if `--source dspace` and `--save-locally`): the PDF is downloaded and saved to `--pdf-dir` immediately after a Pure match is found, before any skip checks. Local copies are therefore saved even for records subsequently skipped. If the file already exists locally it is not re-downloaded.
+4. **Checks for duplicates** (if `--skip-existing`): skips the record only if a `FileElectronicVersion` with the **same filename and size** already exists. To determine size without a full download, the script checks the local file on disk if available, otherwise sends an HTTP HEAD request to DSpace. If the filename matches but size differs or is unknown, the file is uploaded and appended alongside the existing version.
+5. **Gets the PDF** — either streams it from DSpace (`--source dspace`) or reads it from `--pdf-dir` (`--source local`). When using `--source local`, filenames are matched using the URL-decoded form; if not found, the script also tries the URL-encoded variant as a fallback.
+6. **Uploads** the PDF to Pure's temporary file-upload endpoint.
+7. **PUTs** the Pure record immediately with the new `FileElectronicVersion` appended to `electronicVersions`.
 
-Steps 4 and 5 happen back-to-back for each record to stay well within Pure's **2-hour temporary file expiry window**. System/read-only fields (`pureId`, `createdBy`, `modifiedDate`, etc.) are stripped from the record before the PUT.
+Steps 6 and 7 happen back-to-back for each record to stay well within Pure's **2-hour temporary file expiry window**. System/read-only fields (`pureId`, `createdBy`, `modifiedDate`, etc.) are stripped from the record before the PUT.
 
 The `FileElectronicVersion` is built with:
 - **Access type** — `open` or `embargoed`, derived from `dc.date.embargo` / `dc.description.embargo`.
 - **License** — mapped from `dc.rights` (falls back to `CC BY-NC-ND`).
+- **Filename** — URL-decoded form of the filename from `pdf_handle_paths` (e.g. `My File.pdf` not `My%20File.pdf`).
 - **Embargo period** — set if a future embargo date is found.
 
 ---
@@ -146,8 +159,8 @@ Possible `status` values in `results_<timestamp>.json` and all CSVs:
 |---|---|
 | `success` | PDF uploaded and Pure record updated. |
 | `no_match` | No Pure record could be matched to this DSpace row. |
-| `skipped_existing_fev` | Pure record already has a `FileElectronicVersion`. |
-| `pdf_upload_failed` | PDF download from DSpace or upload to Pure failed. |
+| `skipped_existing_fev` | Pure record already has a `FileElectronicVersion` with the same filename and size. |
+| `pdf_upload_failed` | PDF not found locally, or download from DSpace / upload to Pure failed. |
 | `put_failed` | File uploaded but the subsequent PUT to Pure failed. |
 | `dry_run` | Dry-run mode — no action taken. |
 
@@ -156,6 +169,7 @@ Possible `status` values in `results_<timestamp>.json` and all CSVs:
 ## Notes
 
 - The script only modifies `electronicVersions`. All other fields on the Pure record are preserved as-is.
-- Re-runs are safe when `--skip-existing` is on — records already updated will be skipped.
+- Re-runs are safe when `--skip-existing` is on — records with an identical filename and size already in Pure will be skipped.
 - If a PUT fails after a successful upload, the uploaded file will be orphaned in Pure and deleted automatically after 2 hours. The failed row is written to `failed_<timestamp>.csv` for manual follow-up.
 - The Pure JSON input does not need to be regenerated between runs; the script reads it once at startup.
+- Filenames saved to disk and sent to Pure are always URL-decoded. The original encoded path from `pdf_handle_paths` is preserved as-is in `dspace_file_id` in all log outputs.
