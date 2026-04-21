@@ -28,7 +28,6 @@ Options:
     --skip-existing /
     --no-skip-existing      Skip files already in Pure with same name and size (default: skip)
 """
-import io
 import os
 import re
 import sys
@@ -77,21 +76,17 @@ NESTED_SYSTEM_FIELDS = {"pureId", "systemModified", "current"}
 # ---------------------------------------------------------------------------
 
 def safe_path(path: str) -> str:
-    """Prefix with \\?\ on Windows to support paths longer than MAX_PATH."""
-    if sys.platform == "win32" and not path.startswith("\\\\?\\"):
-        return "\\\\?\\" + os.path.abspath(path)
+    if sys.platform == "win32":
+        abs_path = os.path.abspath(path)
+        if not abs_path.startswith("\\\\?\\"):
+            return "\\\\?\\" + abs_path
+        return abs_path
     return path
 
 
 def is_valid_pdf(content: bytes) -> bool:
     """Return True if content starts with the PDF magic bytes and is larger than 1kb."""
     return len(content) > 1024 and content[:4] == b'%PDF'
-
-
-def _prepend_chunk(first_chunk: bytes, rest):
-    """Yield first_chunk followed by the rest of an iterator."""
-    yield first_chunk
-    yield from rest
 
 
 def normalize_doi(value: str) -> str:
@@ -353,97 +348,53 @@ def upload_pdf_to_pure(
     pdf_save_dir: str,
     session: requests.Session,
 ) -> dict | None:
-    """
-    Download PDF from DSpace and upload to Pure's file-upload endpoint.
-    Streams directly from DSpace to Pure (primary path).
-    If save_locally is True, saves to disk simultaneously via BytesIO buffer,
-    and falls back to the local file if the stream fails.
-    Returns the upload response JSON dict, or None on any failure.
-    """
-    local_path = os.path.abspath(os.path.join(pdf_save_dir, file_name)) if save_locally else None
+    os.makedirs(safe_path(pdf_save_dir), exist_ok=True)
+    local_path = os.path.abspath(os.path.join(pdf_save_dir, file_name))
 
-    try:
-        src = session.get(full_pdf_url, stream=True, timeout=60, allow_redirects=True)
-        if src.status_code != 200:
-            print(f"    ❌ PDF download failed (HTTP {src.status_code}): {full_pdf_url}")
-            return None
-        content_type = src.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            print(f"    ❌ DSpace returned HTML instead of PDF (possible auth redirect): {full_pdf_url}")
-            return None
-
-        # Read first chunk to validate content
-        first_chunk = next(src.iter_content(chunk_size=8192), b"")
-        if not is_valid_pdf(first_chunk):
-            print(f"    ❌ Content is not a valid PDF or is under 1kb "
-                  f"(first bytes: {first_chunk[:8]!r}, size so far: {len(first_chunk)})")
-            return None
-
-        if save_locally:
-            os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
-            if not os.path.exists(local_path):
-                buffer = io.BytesIO()
-                buffer.write(first_chunk)
-                with open(safe_path(local_path), "wb") as fh:
-                    fh.write(first_chunk)
-                    for chunk in src.iter_content(chunk_size=8192):
-                        fh.write(chunk)
-                        buffer.write(chunk)
-                buffer.seek(0)
-                print(f"    💾 PDF saved locally: {local_path}")
-                upload_content = buffer
-            else:
-                print(f"    ♻️  Local backup already exists: {local_path}")
-                # Prepend first_chunk back into an iterator for upload
-                upload_content = _prepend_chunk(first_chunk, src.iter_content(chunk_size=8192))
-        else:
-            upload_content = _prepend_chunk(first_chunk, src.iter_content(chunk_size=8192))
-
-    except requests.RequestException as exc:
-        # Primary download failed — fall back to local file if available
-        if save_locally and local_path and os.path.exists(local_path):
-            print(f"    ⚠️  Download error: {exc} — falling back to local file: {local_path}")
-            upload_content = open(local_path, "rb")
-        else:
-            print(f"    ❌ PDF upload request error: {exc}")
-            return None
-
-    try:
-        upload_resp = session.put(
-            pure_file_upload_url,
-            data=upload_content,
-            headers={
-                "accept":       "application/json",
-                "api-key":      api_key,
-                "content-type": "*/*",
-            },
-            timeout=120,
-        )
-    except requests.RequestException as exc:
-        # Upload stream failed — fall back to local file if not already using one
-        if save_locally and local_path and os.path.exists(local_path) and not isinstance(upload_content, io.IOBase):
-            print(f"    ⚠️  Upload stream error: {exc} — retrying with local file: {local_path}")
-            try:
-                with open(local_path, "rb") as fh:
-                    upload_resp = session.put(
-                        pure_file_upload_url,
-                        data=fh,
-                        headers={
-                            "accept":       "application/json",
-                            "api-key":      api_key,
-                            "content-type": "*/*",
-                        },
-                        timeout=120,
-                    )
-            except requests.RequestException as exc2:
-                print(f"    ❌ Fallback upload also failed: {exc2}")
+    # Always download to disk first to ensure the complete file
+    if not os.path.exists(local_path):
+        try:
+            src = session.get(full_pdf_url, timeout=120, allow_redirects=True)
+            if src.status_code != 200:
+                print(f"    ❌ PDF download failed (HTTP {src.status_code}): {full_pdf_url}")
                 return None
-        else:
-            print(f"    ❌ PDF upload request error: {exc}")
+            content_type = src.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                print(f"    ❌ DSpace returned HTML instead of PDF: {full_pdf_url}")
+                return None
+            if not is_valid_pdf(src.content):
+                print(f"    ❌ Content is not a valid PDF or is under 1kb "
+                      f"(first bytes: {src.content[:8]!r}, size: {len(src.content)})")
+                return None
+            with open(safe_path(local_path), "wb") as fh:
+                fh.write(src.content)
+            print(f"    💾 PDF saved locally: {local_path} ({len(src.content):,} bytes)")
+        except requests.RequestException as exc:
+            print(f"    ❌ PDF download error: {exc}")
             return None
-    finally:
-        if hasattr(upload_content, "close"):
-            upload_content.close()
+    else:
+        print(f"    ♻️  Using existing local file: {local_path}")
+
+    # Upload from disk
+    try:
+        with open(safe_path(local_path), "rb") as fh:
+            upload_resp = session.put(
+                pure_file_upload_url,
+                data=fh,
+                headers={
+                    "accept":       "application/json",
+                    "api-key":      api_key,
+                    "content-type": "*/*",
+                },
+                timeout=120,
+            )
+    except requests.RequestException as exc:
+        print(f"    ❌ PDF upload error: {exc}")
+        return None
+
+    # Clean up unless --save-locally was requested
+    if not save_locally and os.path.exists(safe_path(local_path)):
+        os.remove(safe_path(local_path))
 
     if upload_resp.status_code not in (200, 201):
         print(f"    ❌ Pure file-upload failed (HTTP {upload_resp.status_code}): "
@@ -455,7 +406,7 @@ def upload_pdf_to_pure(
     except ValueError:
         print("    ❌ Could not parse Pure file-upload response as JSON")
         return None
-
+    
 
 def build_file_electronic_version(
     upload_data: dict,
@@ -516,11 +467,11 @@ def upload_local_pdf_to_pure(
     local_path = os.path.join(pdf_dir, safe_file_name)
 
     # If decoded filename not found, try URL-encoded variant
-    if not os.path.exists(local_path):
+    if not os.path.exists(safe_path(local_path)):
         from urllib.parse import quote
         encoded_name = quote(safe_file_name, safe="")
         encoded_path = os.path.join(pdf_dir, encoded_name)
-        if os.path.exists(encoded_path):
+        if os.path.exists(safe_path(encoded_path)):
             print(f"    ℹ️  Decoded filename not found, using encoded: {encoded_name}")
             local_path = encoded_path
         else:
@@ -529,7 +480,7 @@ def upload_local_pdf_to_pure(
 
     print(f"    📂 Reading local PDF: {local_path}")
     try:
-        with open(local_path, "rb") as fh:
+        with open(safe_path(local_path), "rb") as fh:
             upload_resp = session.put(
                 pure_file_upload_url,
                 data=fh,
@@ -860,7 +811,7 @@ def main():
             # Pre-download from DSpace for local saving (always, regardless of skip check)
             if args.source == "dspace" and args.save_locally and not args.dry_run:
                 local_path = os.path.abspath(os.path.join(args.pdf_dir, safe_file_name))
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                os.makedirs(safe_path(os.path.dirname(local_path)), exist_ok=True)
                 if not os.path.exists(local_path):
                     # Rate limit before download
                     elapsed_since_last = time.time() - last_dspace_request
@@ -870,18 +821,15 @@ def main():
                         time.sleep(wait)
                     print(f"    💾 Pre-downloading for local save: {safe_file_name}")
                     try:
-                        presrc = session.get(full_pdf_url, stream=True, timeout=60, allow_redirects=True)
+                        presrc = session.get(full_pdf_url, timeout=120, allow_redirects=True)
                         if presrc.status_code == 200 and "text/html" not in presrc.headers.get("Content-Type", ""):
-                            first_chunk = next(presrc.iter_content(chunk_size=8192), b"")
-                            if not is_valid_pdf(first_chunk):
+                            if not is_valid_pdf(presrc.content):
                                 print(f"    ❌ Pre-download content is not a valid PDF or under 1kb — skipping save")
                             else:
                                 with open(safe_path(local_path), "wb") as fh:
-                                    fh.write(first_chunk)
-                                    for chunk in presrc.iter_content(chunk_size=8192):
-                                        fh.write(chunk)
+                                    fh.write(presrc.content)
                                 last_dspace_request = time.time()
-                                print(f"    💾 Saved: {local_path}")
+                                print(f"    💾 Saved: {local_path} ({len(presrc.content):,} bytes)")
                         else:
                             print(f"    ⚠️  Pre-download failed (HTTP {presrc.status_code})")
                     except requests.RequestException as exc:
