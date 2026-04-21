@@ -3,13 +3,13 @@
 upload_pdfs_to_pure.py
 
 For each record in the Pure JSON that has a matching DSpace row with a PDF path:
-  1. Downloads the PDF from DSpace
+  1. Downloads the PDF from DSpace (or reads from local disk)
   2. Uploads it to Pure's file-upload endpoint (temporary file, valid for 2 hours)
   3. Immediately PUTs the Pure record with a FileElectronicVersion referencing the upload
   4. Logs all outcomes
 
 Records are processed one at a time to ensure each uploaded file is linked before
-the 2-hour Pure expiry window.
+the 2-hour Pure expiry window. Multiple PDFs per DSpace row are all processed.
 
 Usage:
     python upload_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
@@ -19,13 +19,14 @@ Usage:
     PURE_ROOT_API_KEY=your_key_here        (Production)
 
 Options:
-    --test / --no-test   Use UAT (default) or Production environment
-    --save-locally       Also save downloaded PDFs to disk
-    --pdf-dir            Directory for locally saved PDFs (default: ./downloaded_dspace_pdfs)
-    --log-dir            Directory for logs (default: ./pdf_upload_logs)
-    --dry-run            Match records and report what would be done, but do not upload/PUT
+    --test / --no-test      Use UAT (default) or Production environment
+    --source                Where to get PDFs: 'dspace' (default) or 'local'
+    --save-locally          Also save downloaded PDFs to disk (dspace source only)
+    --pdf-dir               Save/read directory for PDFs (default: ./downloaded_dspace_pdfs)
+    --log-dir               Directory for logs (default: ./pdf_upload_logs)
+    --dry-run               Match records and report what would be done, but do not upload/PUT
     --skip-existing /
-    --no-skip-existing   Skip Pure records that already have a FileElectronicVersion (default: skip)
+    --no-skip-existing      Skip files already in Pure with same name and size (default: skip)
 """
 import io
 import os
@@ -192,6 +193,7 @@ def already_has_file_ev(pure_record: dict, file_name: str = None, file_size: int
             return True
     return False
 
+
 # ---------------------------------------------------------------------------
 # Matching: build lookup indices from Pure JSON
 # ---------------------------------------------------------------------------
@@ -286,12 +288,11 @@ def upload_pdf_to_pure(
     """
     Download PDF from DSpace and upload to Pure's file-upload endpoint.
     Streams directly from DSpace to Pure (primary path).
-    If save_locally is True, also saves to disk as a backup — and falls back
-    to the local file if the in-memory stream cannot be used.
+    If save_locally is True, saves to disk simultaneously via BytesIO buffer,
+    and falls back to the local file if the stream fails.
     Returns the upload response JSON dict, or None on any failure.
     """
-    safe_file_name = unquote(file_name)  # decoded name used in Pure metadata
-    local_path     = os.path.join(pdf_save_dir, safe_file_name) if save_locally else None
+    local_path = os.path.join(pdf_save_dir, file_name) if save_locally else None
 
     try:
         src = session.get(full_pdf_url, stream=True, timeout=60)
@@ -299,10 +300,10 @@ def upload_pdf_to_pure(
             print(f"    ❌ PDF download failed (HTTP {src.status_code}): {full_pdf_url}")
             return None
 
-        # Save locally as backup if requested
         if save_locally:
             os.makedirs(pdf_save_dir, exist_ok=True)
             if not os.path.exists(local_path):
+                # Write to disk and buffer simultaneously — single pass, no re-open
                 buffer = io.BytesIO()
                 with open(local_path, "wb") as fh:
                     for chunk in src.iter_content(chunk_size=8192):
@@ -310,7 +311,7 @@ def upload_pdf_to_pure(
                         buffer.write(chunk)
                 buffer.seek(0)
                 print(f"    💾 PDF saved locally: {local_path}")
-                upload_content = buffer          # use in-memory buffer, no re-open
+                upload_content = buffer
             else:
                 print(f"    ♻️  Local backup already exists: {local_path}")
                 upload_content = src.iter_content(chunk_size=8192)
@@ -338,7 +339,7 @@ def upload_pdf_to_pure(
             timeout=120,
         )
     except requests.RequestException as exc:
-        # Upload stream failed — fall back to local file if available and not already using it
+        # Upload stream failed — fall back to local file if not already using one
         if save_locally and local_path and os.path.exists(local_path) and not isinstance(upload_content, io.IOBase):
             print(f"    ⚠️  Upload stream error: {exc} — retrying with local file: {local_path}")
             try:
@@ -568,13 +569,13 @@ def main():
     parser.add_argument("--no-test",          dest="test", action="store_false",
                         help="Use Production environment.")
     parser.add_argument("--save-locally",     action="store_true", default=False,
-                        help="Also save downloaded PDFs to disk.")
+                        help="Also save downloaded PDFs to disk (dspace source only).")
     parser.add_argument("--log-dir",          default="./pdf_upload_logs",
                         help="Directory for logs (default: ./pdf_upload_logs)")
     parser.add_argument("--dry-run",          action="store_true", default=False,
                         help="Match and report only — do not upload or PUT.")
     parser.add_argument("--skip-existing",    action="store_true", default=True,
-                        help="Skip Pure records that already have a FileElectronicVersion (default).")
+                        help="Skip files already in Pure with same name and size (default).")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     parser.add_argument("--source",           choices=["dspace", "local"], default="dspace",
                         help="Where to get PDFs from: 'dspace' (default) or 'local'.")
@@ -699,10 +700,13 @@ def main():
     print(f"{'='*70}\n")
 
     for i, row in enumerate(tqdm(rows_with_pdf, desc="Uploading PDFs", unit="record"), start=1):
-        # pdf_handle_paths is already in /10379/handle/seq/filename.pdf format
+        # pdf_handle_paths may contain multiple semicolon-separated paths
         pdf_path    = row.get("pdf_handle_paths", "").strip()
         title       = row.get("dc.title", "").strip()
         dspace_uuid = row.get("uuid", "").strip()
+
+        # Parse all PDF paths — semicolon-separated
+        pdf_paths = [p.strip() for p in pdf_path.split(";") if p.strip()]
 
         # Prefer the dedicated 'handle' column; fall back to dc.identifier.uri
         handle_str = row.get("handle", "").strip()
@@ -710,23 +714,20 @@ def main():
             uri_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
             handle_str  = uri_handles[0] if uri_handles else ""
 
-        full_pdf_url = f"{dspace_bitstream_base}{pdf_path}" if args.source == "dspace" else ""
-        file_name    = pdf_path.rstrip("/").split("/")[-1] # original encoded — used in dspace_file_id
-        safe_file_name = unquote(file_name)  # decoded — used in Pure metadata and local save
-
         print(f"\n[{i}/{len(rows_with_pdf)}] {title[:70]}")
         print(f"  DSpace UUID    : {dspace_uuid}")
         print(f"  Handle         : {handle_str}")
         print(f"  DSpace file ID : {pdf_path}")
         if args.source == "dspace":
-            print(f"  PDF URL        : {full_pdf_url}")
+            print(f"  PDF URLs       : {'; '.join(f'{dspace_bitstream_base}{p}' for p in pdf_paths)}")
 
         entry = {
             "dspace_uuid":    dspace_uuid,
             "title":          title,
+            # Prefix handle for the log if not already a full URL
             "handle":         f"https://hdl.handle.net/{handle_str}" if handle_str and not handle_str.startswith("http") else handle_str,
-            "dspace_file_id": pdf_path,         # e.g. /10379/4728/1/file.pdf
-            "pdf_url":        full_pdf_url if args.source == "dspace" else "",
+            "dspace_file_id": pdf_path,   # original semicolon-separated paths, as-is
+            "pdf_url":        "; ".join(f"{dspace_bitstream_base}{p}" for p in pdf_paths) if args.source == "dspace" else "",
             "pure_uuid":      None,
             "pure_id":        None,
             "match_type":     None,
@@ -736,7 +737,7 @@ def main():
             "timestamp":      datetime.now().isoformat(),
         }
 
-        # 1a. Match to Pure record
+        # 1. Match to Pure record
         pure_record, match_type = find_pure_record(row, pure_index)
         if pure_record is None:
             print(f"  ⚠️  No Pure record matched — skipping")
@@ -747,149 +748,158 @@ def main():
             skipped_rows.append(entry)
             continue
 
-        pure_uuid          = pure_record.get("uuid", "")
-        entry["pure_uuid"] = pure_uuid
-        entry["pure_id"]   = str(pure_record.get("pureId", ""))
+        pure_uuid           = pure_record.get("uuid", "")
+        entry["pure_uuid"]  = pure_uuid
+        entry["pure_id"]    = str(pure_record.get("pureId", ""))
         entry["match_type"] = match_type
         print(f"  ✅ Matched Pure record ({match_type}): {pure_uuid}  pureId: {entry['pure_id']}")
 
-        # 1b. Save PDF locally as backup if requested (dspace source only)
-        if args.source == "dspace" and args.save_locally and pdf_path and not args.dry_run:
-            os.makedirs(args.pdf_dir, exist_ok=True)
-            local_path = os.path.join(args.pdf_dir, safe_file_name)
-            if not os.path.exists(local_path):
-                print(f"  💾 Saving PDF locally: {safe_file_name}")
-                try:
-                    src = session.get(full_pdf_url, stream=True, timeout=60)
-                    if src.status_code == 200:
-                        with open(local_path, "wb") as fh:
-                            for chunk in src.iter_content(chunk_size=8192):
-                                fh.write(chunk)
-                        print(f"  💾 Saved: {local_path}")
+        # Steps 2-6: process each PDF path individually
+        any_success   = False
+        any_fail      = False
+        uploaded_keys = []
+        skipped_paths = []
+        failed_paths  = []
+
+        for single_path in pdf_paths:
+            file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
+            safe_file_name = unquote(file_name)                       # decoded — used in Pure and on disk
+            full_pdf_url   = f"{dspace_bitstream_base}{single_path}" if args.source == "dspace" else ""
+
+            print(f"  📄 Processing file: {safe_file_name}")
+
+            # 2. Skip check — filename match first, then size confirmation
+            if args.skip_existing:
+                existing_names = {
+                    ev.get("file", {}).get("fileName", "")
+                    for ev in pure_record.get("electronicVersions", [])
+                    if ev.get("typeDiscriminator") == "FileElectronicVersion"
+                }
+                if safe_file_name in existing_names:
+                    print(f"    ℹ️  Same filename found in Pure — checking size...")
+                    known_size = None
+                    if args.source == "local":
+                        lp = os.path.join(args.pdf_dir, safe_file_name)
+                        if os.path.exists(lp):
+                            known_size = os.path.getsize(lp)
                     else:
-                        print(f"  ⚠️  Could not download PDF for local save (HTTP {src.status_code})")
-                except requests.RequestException as exc:
-                    print(f"  ⚠️  Local save failed: {exc}")
+                        lp = os.path.join(args.pdf_dir, safe_file_name)
+                        if args.save_locally and os.path.exists(lp):
+                            known_size = os.path.getsize(lp)
+                        else:
+                            try:
+                                head = session.head(full_pdf_url, timeout=10)
+                                cl = head.headers.get("Content-Length")
+                                known_size = int(cl) if cl else None
+                            except Exception:
+                                known_size = None
+
+                    if already_has_file_ev(pure_record, file_name=safe_file_name, file_size=known_size):
+                        print(f"    ℹ️  Same filename and size — skipping")
+                        counters["already_has_fev"] += 1
+                        skipped_paths.append(safe_file_name)
+                        continue
+                    else:
+                        print(f"    ℹ️  Same filename but different/unknown size — uploading alongside existing")
+
+            # 3. Dry run
+            if args.dry_run:
+                print(f"    🔍 DRY RUN — would upload {safe_file_name}")
+                counters["dry_run_would"] += 1
+                continue
+
+            # 4. Upload PDF to Pure
+            print(f"    📎 Uploading: {safe_file_name}")
+            if args.source == "local":
+                upload_data = upload_local_pdf_to_pure(
+                    safe_file_name=safe_file_name,
+                    pdf_dir=args.pdf_dir,
+                    api_key=api_key,
+                    pure_file_upload_url=pure_file_upload_url,
+                    session=session,
+                )
             else:
-                print(f"  ℹ️  PDF already saved locally, skipping download: {local_path}")
+                upload_data = upload_pdf_to_pure(
+                    full_pdf_url=full_pdf_url,
+                    file_name=safe_file_name,
+                    api_key=api_key,
+                    pure_file_upload_url=pure_file_upload_url,
+                    save_locally=args.save_locally,
+                    pdf_save_dir=args.pdf_dir,
+                    session=session,
+                )
 
-        # 2. Quick name-only pre-check — skip if a FileEV with the same filename
-        #    already exists regardless of size (avoids unnecessary download).
-        #    Full name+size check happens after we know the file size.
-        if args.skip_existing:
-            existing_names = {
-                ev.get("file", {}).get("fileName", "")
-                for ev in pure_record.get("electronicVersions", [])
-                if ev.get("typeDiscriminator") == "FileElectronicVersion"
-            }
-            if safe_file_name in existing_names:
-                print(f"  ℹ️  Pure record already has FileElectronicVersion with same filename — checking size...")
-                # We need the actual size to decide — get it from local file or HTTP HEAD
-                known_size = None
-                if args.source == "local":
-                    local_path = os.path.join(args.pdf_dir, safe_file_name)
-                    if os.path.exists(local_path):
-                        known_size = os.path.getsize(local_path)
-                elif args.source == "dspace" and args.save_locally:
-                    local_path = os.path.join(args.pdf_dir, safe_file_name)
-                    if os.path.exists(local_path):
-                        known_size = os.path.getsize(local_path)
-                    else:
-                        try:
-                            head = session.head(full_pdf_url, timeout=10)
-                            cl = head.headers.get("Content-Length")
-                            known_size = int(cl) if cl else None
-                        except Exception:
-                            known_size = None
-                else:
-                    try:
-                        head = session.head(full_pdf_url, timeout=10)
-                        cl = head.headers.get("Content-Length")
-                        known_size = int(cl) if cl else None
-                    except Exception:
-                        known_size = None
+            if upload_data is None:
+                counters["pdf_fail"] += 1
+                failed_paths.append(safe_file_name)
+                any_fail = True
+                continue
 
-                if already_has_file_ev(pure_record, file_name=safe_file_name, file_size=known_size):
-                    print(f"  ℹ️  Same filename and size — skipping")
-                    counters["already_has_fev"] += 1
-                    entry["status"] = "skipped_existing_fev"
-                    entry["detail"] = "Record already has FileElectronicVersion with same name and size"
-                    results.append(entry)
-                    skipped_rows.append(entry)
-                    continue
-                else:
-                    print(f"  ℹ️  Same filename but different/unknown size — will upload alongside existing")
+            upload_key = upload_data.get("key", "")
+            uploaded_keys.append(upload_key)
+            print(f"    ✅ Uploaded — key: {upload_key}")
 
-        # 3. Dry run
+            # 5. Build FileElectronicVersion
+            file_ev = build_file_electronic_version(upload_data, safe_file_name, row)
+
+            # 6. PUT the Pure record immediately (within 2-hour window)
+            print(f"    📤 PUTting Pure record {pure_uuid}...")
+            success, detail, pure_id = put_pure_record(
+                pure_record=pure_record,
+                file_ev=file_ev,
+                api_key=api_key,
+                base_url=base_url,
+                session=session,
+            )
+            entry["pure_id"] = pure_id
+
+            if success:
+                print(f"    ✅ PUT succeeded ({detail})")
+                counters["success"] += 1
+                any_success = True
+                # Update in-memory record so subsequent files in this row
+                # see the newly added FileEV for the skip check
+                pure_record.setdefault("electronicVersions", []).append(file_ev)
+            else:
+                print(f"    ❌ PUT failed: {detail}")
+                counters["put_fail"] += 1
+                any_fail = True
+                failed_paths.append(safe_file_name)
+
+        # Consolidate entry status across all paths for this row
+        entry["upload_key"] = "; ".join(uploaded_keys) if uploaded_keys else None
+
         if args.dry_run:
-            print(f"  🔍 DRY RUN — would upload {file_name} and PUT {pure_uuid}")
-            counters["dry_run_would"] += 1
             entry["status"] = "dry_run"
-            entry["detail"] = f"Would upload {file_name}"
+            entry["detail"] = f"Would upload: {'; '.join(unquote(p.rstrip('/').split('/')[-1]) for p in pdf_paths)}"
             results.append(entry)
             continue
 
-        # 4. Upload PDF to Pure
-        print(f"  📎 Uploading PDF: {safe_file_name}")
-        if args.source == "local":
-            upload_data = upload_local_pdf_to_pure(
-                safe_file_name=safe_file_name,
-                pdf_dir=args.pdf_dir,
-                api_key=api_key,
-                pure_file_upload_url=pure_file_upload_url,
-                session=session,
-            )
-        else:
-            upload_data = upload_pdf_to_pure(
-                full_pdf_url=full_pdf_url,
-                file_name=safe_file_name,
-                api_key=api_key,
-                pure_file_upload_url=pure_file_upload_url,
-                save_locally=args.save_locally,
-                pdf_save_dir=args.pdf_dir,
-                session=session,
-            )
-
-        if upload_data is None:
-            counters["pdf_fail"] += 1
+        if not uploaded_keys and not skipped_paths:
+            # Every path failed to upload
             entry["status"] = "pdf_upload_failed"
-            entry["detail"] = "PDF download or Pure file-upload failed"
+            entry["detail"] = f"Failed: {'; '.join(failed_paths)}"
             results.append(entry)
             failed_rows.append(entry)
-            continue
-
-        upload_key          = upload_data.get("key", "")
-        entry["upload_key"] = upload_key
-        print(f"  ✅ PDF uploaded — key: {upload_key}")
-
-        # 5. Build FileElectronicVersion
-        file_ev = build_file_electronic_version(upload_data, safe_file_name, row)
-
-        # 6. PUT the Pure record immediately (within 2-hour window)
-        print(f"  📤 PUTting Pure record {pure_uuid}...")
-        success, detail, pure_id = put_pure_record(
-            pure_record=pure_record,
-            file_ev=file_ev,
-            api_key=api_key,
-            base_url=base_url,
-            session=session,
-        )
-        entry["pure_id"] = pure_id   # value captured inside function, before stripping
-
-        if success:
-            print(f"  ✅ PUT succeeded ({detail})")
-            counters["success"] += 1
-            entry["status"] = "success"
-            entry["detail"] = detail
+        elif any_fail and any_success:
+            entry["status"] = "partial_success"
+            entry["detail"] = (
+                f"Uploaded: {'; '.join(uploaded_keys)}"
+                + (f" | Failed: {'; '.join(failed_paths)}" if failed_paths else "")
+            )
             results.append(entry)
             success_rows.append(entry)
-        else:
-            print(f"  ❌ PUT failed: {detail}")
-            counters["put_fail"] += 1
-            entry["status"] = "put_failed"
-            entry["detail"] = detail
+        elif not uploaded_keys and skipped_paths:
+            # All paths skipped — existing FileEVs matched
+            entry["status"] = "skipped_existing_fev"
+            entry["detail"] = f"All files already exist in Pure with same name and size: {'; '.join(skipped_paths)}"
             results.append(entry)
-            failed_rows.append(entry)
+            skipped_rows.append(entry)
+        else:
+            entry["status"] = "success"
+            entry["detail"] = f"Uploaded {len(uploaded_keys)} file(s)"
+            results.append(entry)
+            success_rows.append(entry)
 
     # ---- Summary & logs ----------------------------------------------------
     elapsed = time.time() - start_time
@@ -934,6 +944,7 @@ def main():
         print(f"  Skipped CSV  : {skipped_csv}")
 
     # Matched records reference CSV (all records matched to a Pure record, with or without a file)
+    # dspace_file_id retains the original semicolon-separated paths as-is
     matched_ref_csv  = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
     matched_ref_rows = [r for r in results if r.get("pure_uuid")]
     if matched_ref_rows:
