@@ -2,6 +2,7 @@
 
 | Script | Docs | Description |
 |---|---|---|
+|[add_pdfs_to_pure.py](scripts/add_pdfs_to_pure.py)|[add_pdfs_to_pure.md](docs/add_pdfs_to_pure.md)|Downloads PDFs from a DSpace repository, uploads them to Pure's file-upload endpoint, and immediately attaches them to the matching Pure research output as a `FileElectronicVersion`. No other fields on the Pure record are modified.|
 | [create_sample.py](scripts/create_sample.py) | [create_sample.md](docs/create_sample.md) | A command-line tool that samples records from a DSpace metadata CSV file by research output type, with optional author validation against a JSON author registry. |
 | [delete_records.py](scripts/delete_records.py) | [delete_records.md](docs/delete_records.md) | A command-line tool for deleting records from the Elsevier Pure API based on JSON log files, with optional date filtering, dry-run preview, and detailed deletion logging. |
 | [enrich_author_json.py](scripts/enrich_author_json.py) | [enrich_author_json.md](docs/enrich_author_json.md) | Injects UUIDs from a `pure_uploader.py` log into an authors JSON file. For each author who is neither internal nor external, it looks for an exact name match in an uploader log and, on a hit, sets `external: true` and appends the UUID to `externalUUIDs`. |
