@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-upload_pdfs_to_pure.py
+add_pdfs_to_pure.py
 
 For each record in the Pure JSON that has a matching DSpace row with a PDF path:
   1. Downloads the PDF from DSpace (or reads from local disk)
