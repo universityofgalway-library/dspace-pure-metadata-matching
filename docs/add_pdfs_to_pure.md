@@ -57,7 +57,7 @@ PURE_ROOT_API_KEY=your_production_key_here
 | Flag | Default | Description |
 |---|---|---|
 | `--test` / `--no-test` | `--test` | Use UAT (`--test`) or Production (`--no-test`) API and bitstream base URL. |
-| `--save-locally` | `False` | Also write downloaded PDFs to disk before uploading to Pure. |
+| `--save-locally` | `False` | Also write downloaded PDFs to disk before uploading to Pure. PDFs are saved for **all matched records**, including those whose Pure record already has a `FileElectronicVersion`. If a file already exists locally it is reused rather than re-downloaded. |
 | `--pdf-dir` | `./downloaded_dspace_pdfs` | Directory for locally saved PDFs. Only used when `--save-locally` is set. |
 | `--log-dir` | `./pdf_upload_logs` | Directory where all log files are written. |
 | `--skip-existing` / `--no-skip-existing` | `--skip-existing` | Skip Pure records that already have a `FileElectronicVersion`. Prevents duplicates on re-runs. |
@@ -100,7 +100,7 @@ For each DSpace row that has a `pdf_handle_paths` value, the script:
 
 1. **Matches** the row to a Pure record using (in priority order): Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
 2. **Skips** the record if it already has a `FileElectronicVersion` (when `--skip-existing` is on).
-3. **Downloads** the PDF from the DSpace bitstream URL.
+3. **Downloads** the PDF from the DSpace bitstream URL. If `--save-locally` is set, the PDF is downloaded and saved to `--pdf-dir` immediately after a Pure match is found, before any skip checks. This means local copies are saved even for records that are subsequently skipped due to an existing `FileElectronicVersion`. If the file already exists locally from a previous run, it is reused without re-downloading.
 4. **Uploads** the PDF to Pure's temporary file-upload endpoint.
 5. **PUTs** the Pure record immediately with the new `FileElectronicVersion` appended to `electronicVersions`.
 
@@ -124,11 +124,11 @@ All log files are written to `--log-dir` and timestamped with the run start time
 | `success_<timestamp>.csv` | Rows where the PDF was uploaded and the PUT succeeded. |
 | `failed_<timestamp>.csv` | Rows where the PDF upload or PUT failed. |
 | `skipped_<timestamp>.csv` | Rows with no Pure match, or already having a `FileElectronicVersion`. |
-| `file_references_<timestamp>.csv` | Successful uploads only — see columns below. |
+| `matched_records_<timestamp>.csv` | All DSpace rows matched to a Pure record, regardless of whether a PDF was uploaded. `dspace_file_id` is blank for rows with no `pdf_handle_paths`. |
 
-### file_references CSV
+### matched_records CSV
 
-A compact reference file for successful uploads with the following columns:
+A reference file for all records successfully matched to Pure, with the following columns:
 
 | Column | Example | Description |
 |---|---|---|
@@ -136,7 +136,7 @@ A compact reference file for successful uploads with the following columns:
 | `pure_uuid` | `a1b2c3...` | Pure record UUID. |
 | `pure_id` | `12345678` | Pure internal numeric ID (`pureId`), captured before system fields are stripped. |
 | `handle` | `http://hdl.handle.net/10379/4728` | Item handle from the `handle` CSV column. |
-| `dspace_file_id` | `/10379/4728/1/file.pdf` | Handle-based file path from `pdf_handle_paths`, as-is. |
+| `dspace_file_id` | `/10379/4728/1/file.pdf` | Handle-based file path from `pdf_handle_paths`, as-is. Empty if the row had no PDF. |
 
 ### Status values
 

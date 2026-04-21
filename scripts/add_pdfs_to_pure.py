@@ -284,12 +284,15 @@ def upload_pdf_to_pure(
             return None
 
         if save_locally:
-            os.makedirs(pdf_save_dir, exist_ok=True)
             local_path = os.path.join(pdf_save_dir, file_name)
-            with open(local_path, "wb") as fh:
-                for chunk in src.iter_content(chunk_size=8192):
-                    fh.write(chunk)
-            print(f"    💾 PDF saved locally: {local_path}")
+            if os.path.exists(local_path):
+                print(f"    ♻️  Reusing locally saved PDF: {local_path}")
+            else:
+                os.makedirs(pdf_save_dir, exist_ok=True)
+                with open(local_path, "wb") as fh:
+                    for chunk in src.iter_content(chunk_size=8192):
+                        fh.write(chunk)
+                print(f"    💾 PDF saved locally: {local_path}")
             upload_content = open(local_path, "rb")
         else:
             upload_content = src.iter_content(chunk_size=8192)
@@ -497,7 +500,6 @@ def main():
     success_csv  = os.path.join(args.log_dir, f"success_{RUN_TS}.csv")
     failed_csv   = os.path.join(args.log_dir, f"failed_{RUN_TS}.csv")
     skipped_csv  = os.path.join(args.log_dir, f"skipped_{RUN_TS}.csv")
-    file_ref_csv = os.path.join(args.log_dir, f"file_references_{RUN_TS}.csv")
 
     logger     = RunLogger(run_log_path)
     sys.stdout = logger
@@ -618,7 +620,7 @@ def main():
             "timestamp":      datetime.now().isoformat(),
         }
 
-        # 1. Match to Pure record
+        # 1a. Match to Pure record
         pure_record, match_type = find_pure_record(row, pure_index)
         if pure_record is None:
             print(f"  ⚠️  No Pure record matched — skipping")
@@ -634,6 +636,26 @@ def main():
         entry["pure_id"]   = str(pure_record.get("pureId", ""))
         entry["match_type"] = match_type
         print(f"  ✅ Matched Pure record ({match_type}): {pure_uuid}  pureId: {entry['pure_id']}")
+
+        # 1b. Save PDF locally if requested, regardless of existing FileEV
+        if args.save_locally and pdf_path:
+            local_path = os.path.join(args.pdf_dir, file_name)
+            if not os.path.exists(local_path):
+                print(f"  💾 Saving PDF locally: {file_name}")
+                try:
+                    src = session.get(full_pdf_url, stream=True, timeout=60)
+                    if src.status_code == 200:
+                        os.makedirs(args.pdf_dir, exist_ok=True)
+                        with open(local_path, "wb") as fh:
+                            for chunk in src.iter_content(chunk_size=8192):
+                                fh.write(chunk)
+                        print(f"  💾 Saved: {local_path}")
+                    else:
+                        print(f"  ⚠️  Could not download PDF for local save (HTTP {src.status_code})")
+                except requests.RequestException as exc:
+                    print(f"  ⚠️  Local save failed: {exc}")
+            else:
+                print(f"  ℹ️  PDF already saved locally, skipping download: {local_path}")
 
         # 2. Skip if already has FileElectronicVersion
         if args.skip_existing and already_has_file_ev(pure_record):
@@ -749,15 +771,16 @@ def main():
         write_csv_log(skipped_rows, skipped_csv, csv_fields)
         print(f"  Skipped CSV  : {skipped_csv}")
 
-    # Dedicated file-reference CSV (successful uploads only)
-    file_ref_rows = [r for r in results if r.get("status") == "success"]
-    if file_ref_rows:
+    # Matched records reference CSV (all records matched to a Pure record, with or without a file)
+    matched_ref_csv  = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
+    matched_ref_rows = [r for r in results if r.get("pure_uuid")]
+    if matched_ref_rows:
         write_csv_log(
-            file_ref_rows,
-            file_ref_csv,
+            matched_ref_rows,
+            matched_ref_csv,
             ["dspace_uuid", "pure_uuid", "pure_id", "handle", "dspace_file_id"],
         )
-        print(f"  File refs CSV: {file_ref_csv}")
+        print(f"  Matched refs  : {matched_ref_csv}")
 
     logger.close()
     sys.stdout = logger._terminal
