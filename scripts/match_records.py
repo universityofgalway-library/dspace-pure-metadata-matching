@@ -26,10 +26,17 @@ TODAY = date.today().isoformat()
 # attached anywhere (external authors are still linked via their externalPerson UUID).
 COLLECT_EXTERNAL_ORGS = False
 
+# If True, PDFs downloaded from DSpace will be saved to disk locally as well as uploaded to Pure
+SAVE_PDFS_LOCALLY = False
+LOCAL_PDF_SAVE_DIR = "./downloaded_dspace_pdfs"  # Only used if SAVE_PDFS_LOCALLY is True
+
+# If True, FileElectronicVersions will be created and attached to records
+ADD_FILE_ELECTRONIC_VERSIONS = False
+
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
-# DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
+# DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-04-21.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
@@ -1229,22 +1236,13 @@ def resolve_embargo_and_access(dspace_row):
 
 
 def upload_pdf_electronic_version(dspace_row):
-    """
-    Upload a PDF file from DSpace to Pure as a FileElectronicVersion.
+    # Respect global config — skip entirely if file EVs are disabled
+    if not ADD_FILE_ELECTRONIC_VERSIONS:
+        return None
 
-    Streams the file directly from the DSpace bitstream URL to the Pure
-    file-upload endpoint without saving to disk.
-
-    Args:
-        dspace_row:       The current DSpace CSV row.
-
-    Returns:
-        A FileElectronicVersion dict ready to append to electronicVersions,
-        or None if no PDF path is present or on error.
-    """
     pdf_path = dspace_row.get("pdf_handle_paths", "").strip()
     if not pdf_path:
-        return None  # No PDF — perfectly fine, not an error
+        return None
 
     dspace_uuid  = dspace_row.get("uuid", "").strip()
     title        = dspace_row.get("dc.title", "").strip()
@@ -1254,7 +1252,6 @@ def upload_pdf_electronic_version(dspace_row):
 
     print(f"  📎 Uploading PDF: {full_pdf_url}")
 
-    # --- Stream DSpace → Pure file-upload endpoint ---
     try:
         src_response = requests.get(full_pdf_url, stream=True, timeout=60)
         if src_response.status_code != 200:
@@ -1269,9 +1266,22 @@ def upload_pdf_electronic_version(dspace_row):
             })
             return None
 
+        # Optionally save PDF to disk before streaming to Pure
+        if SAVE_PDFS_LOCALLY:
+            os.makedirs(LOCAL_PDF_SAVE_DIR, exist_ok=True)
+            local_path = os.path.join(LOCAL_PDF_SAVE_DIR, file_name)
+            with open(local_path, "wb") as pdf_file:
+                for chunk in src_response.iter_content(chunk_size=8192):
+                    pdf_file.write(chunk)
+            print(f"  💾 PDF saved locally to: {local_path}")
+            # Re-open for streaming to Pure
+            upload_content = open(local_path, "rb")
+        else:
+            upload_content = src_response.iter_content(chunk_size=8192)
+
         upload_response = requests.put(
             PURE_FILE_UPLOAD_URL,
-            data=src_response.iter_content(chunk_size=8192),
+            data=upload_content,
             headers={
                 "accept":       "application/json",
                 "api-key":      API_KEY,
@@ -1279,6 +1289,10 @@ def upload_pdf_electronic_version(dspace_row):
             },
             timeout=120,
         )
+
+        if SAVE_PDFS_LOCALLY and hasattr(upload_content, "close"):
+            upload_content.close()
+
     except requests.RequestException as exc:
         print(f"  ❌ PDF upload request error: {exc}")
         _faulty_pdf_records.append({
@@ -2256,8 +2270,6 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         "language": {
             "uri": "/dk/atira/pure/core/languages/en_IE"
         },
-        "electronicVersions": [],
-        "links": [],
         "managingOrganization": {
             "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # Default: Library Repository
             "systemName": "Organization"
