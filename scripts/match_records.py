@@ -36,7 +36,7 @@ ADD_FILE_ELECTRONIC_VERSIONS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv
 PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-04-21.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
@@ -2704,6 +2704,16 @@ def main():
             "matches": []
         }
 
+        # Filter: only process records that belong to a Publications collection
+        collection_names = row.get("collection_names", "").strip()
+        if not collection_names or collection_names.lower() != "publications":
+            log_entry["success"] = False
+            log_entry["error"] = "Skipped: not in a Publications collection"
+            log_entry["handle"] = extract_handles_from_uri(row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(row.get("dc.identifier.uri", "")) else None
+            log_entries.append(log_entry)
+            print(f"⚠️ Skipping record - not in Publications collection: {row.get('dc.title', '')[:50]}...")
+            continue
+
         # Check if ALL contributor fields are empty
         has_any_contributors = any([
             row.get("dc.contributor.author", "").strip(),
@@ -2934,6 +2944,7 @@ def main():
     
     # Count results
     matched_count = sum(1 for e in log_entries if e['matched'])
+    not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
     no_matched_authors_count = sum(1 for e in log_entries if e.get('error') == "No matched contributors")
     unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') not in ("No contributors found in any contributor field", "No matched contributors"))
@@ -2949,6 +2960,7 @@ def main():
     print(f"     ↳ No contributors in any field: {no_contributors_count}")
     print(f"     ↳ No contributors matched to Pure persons: {no_matched_authors_count}")
     print(f"     ↳ Other errors: {error_count}")
+    print(f"     ↳ Not in Publications collection: {not_publications_count}")
     print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
     print(f"   Unmatched funders: {len(_unmatched_funders)}")
     print(f"   Faulty PDF records: {len(_faulty_pdf_records)}")
