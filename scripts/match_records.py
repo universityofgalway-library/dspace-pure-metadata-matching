@@ -28,9 +28,9 @@ COLLECT_EXTERNAL_ORGS = False
 
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-# DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-03-24.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
-PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-03-03.json"
+DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
+# DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_metadata_2026-02-13.csv"
+PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-04-21.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
 OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"

@@ -370,10 +370,11 @@ if __name__ == "__main__":
     load_dotenv()
 
 
-    API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
+    api_key_var = "PURE_ROOT_API_KEY_TEST" if args.test else "PURE_ROOT_API_KEY"
+    API_KEY = os.getenv(api_key_var, "")
 
     if not API_KEY:
-        print("⚠️ WARNING: PURE_API_KEY not found in environment variables.")
+        print(f"⚠️ WARNING: {api_key_var} not found in environment variables.")
 
     PURE_BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/" if args.test == True else "https://research.universityofgalway.ie/ws/api/"
 

@@ -152,16 +152,6 @@ def fetch_and_save_data_type(data_type, api_key, test, output_dir, split_by_type
 
 if __name__ == "__main__":
 
-    # Load environment variables from .env file
-    load_dotenv()
-
-    # You need ROOT access API key to get all data
-    # For a regular user, some metadata fields, e.g. keywords, are not accessible
-    API_KEY = os.getenv("PURE_ROOT_API_KEY", "")
-
-    if not API_KEY:
-        print("⚠️ WARNING: PURE_ROOT_API_KEY not found in environment variables.")
-
     parser = argparse.ArgumentParser(description="Fetch data from Pure API")
     parser.add_argument(
         "--test", 
@@ -191,6 +181,18 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+
+
+    # Load environment variables from .env file
+    load_dotenv()
+
+    # You need ROOT access API key to get all data
+    # For a regular user, some metadata fields, e.g. keywords, are not accessible
+    api_key_var = "PURE_ROOT_API_KEY_TEST" if args.test else "PURE_ROOT_API_KEY"
+    API_KEY = os.getenv(api_key_var, "")
+
+    if not API_KEY:
+        print(f"⚠️ WARNING: {api_key_var} not found in environment variables.")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
