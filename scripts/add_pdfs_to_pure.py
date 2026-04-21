@@ -76,6 +76,12 @@ NESTED_SYSTEM_FIELDS = {"pureId", "systemModified", "current"}
 # Normalisation helpers
 # ---------------------------------------------------------------------------
 
+def safe_path(path: str) -> str:
+    """Prefix with \\?\ on Windows to support paths longer than MAX_PATH."""
+    if sys.platform == "win32" and not path.startswith("\\\\?\\"):
+        return "\\\\?\\" + os.path.abspath(path)
+    return path
+
 def normalize_doi(value: str) -> str:
     if not isinstance(value, str):
         return value
@@ -292,7 +298,7 @@ def upload_pdf_to_pure(
     and falls back to the local file if the stream fails.
     Returns the upload response JSON dict, or None on any failure.
     """
-    local_path = os.path.join(pdf_save_dir, file_name) if save_locally else None
+    local_path = os.path.abspath(os.path.join(pdf_save_dir, file_name)) if save_locally else None
 
     try:
         src = session.get(full_pdf_url, stream=True, timeout=60)
@@ -301,11 +307,12 @@ def upload_pdf_to_pure(
             return None
 
         if save_locally:
-            os.makedirs(pdf_save_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+            local_path = os.path.abspath(local_path)  # resolve to absolute path
             if not os.path.exists(local_path):
                 # Write to disk and buffer simultaneously — single pass, no re-open
                 buffer = io.BytesIO()
-                with open(local_path, "wb") as fh:
+                with open(safe_path(local_path), "wb") as fh:
                     for chunk in src.iter_content(chunk_size=8192):
                         fh.write(chunk)
                         buffer.write(chunk)
@@ -557,6 +564,8 @@ def write_csv_log(records: list, path: str, fieldnames: list):
 # ---------------------------------------------------------------------------
 
 def main():
+
+    # Parse command-line arguments
     parser = argparse.ArgumentParser(
         description="Download DSpace PDFs, upload to Pure, and attach as FileElectronicVersions"
     )
@@ -695,6 +704,7 @@ def main():
     }
 
     start_time = time.time()
+    last_dspace_request = 0.0  # epoch zero so first request is never delayed
 
     print(f"Processing {len(rows_with_pdf)} DSpace rows with PDFs...")
     print(f"{'='*70}\n")
@@ -808,6 +818,14 @@ def main():
                 counters["dry_run_would"] += 1
                 continue
 
+            # Rate limit: ensure at least 10 seconds between DSpace downloads
+            if args.source == "dspace" and not args.dry_run:
+                elapsed_since_last = time.time() - last_dspace_request
+                if elapsed_since_last < 10:
+                    wait = 10 - elapsed_since_last
+                    print(f"    ⏳ Rate limiting — waiting {wait:.1f}s before next download...")
+                    time.sleep(wait)
+
             # 4. Upload PDF to Pure
             print(f"    📎 Uploading: {safe_file_name}")
             if args.source == "local":
@@ -828,6 +846,7 @@ def main():
                     pdf_save_dir=args.pdf_dir,
                     session=session,
                 )
+                last_dspace_request = time.time()
 
             if upload_data is None:
                 counters["pdf_fail"] += 1
