@@ -115,6 +115,21 @@ def _load_orgs_json(path: Path) -> list[dict]:
     return orgs if isinstance(orgs, list) else [orgs]
 
 
+def _known_names_from_publishers(publishers: list[dict]) -> set[str]:
+    """
+    Build a normalised name lookup set from a Pure publishers JSON,
+    where each record has a plain string 'name' field.
+    """
+    def _normalise(s: str) -> str:
+        return s.strip().lower().translate(_COMPARISON_STRIP)
+
+    return {
+        _normalise(p["name"])
+        for p in publishers
+        if isinstance(p.get("name"), str)
+    }
+
+
 def _known_names_from_orgs(orgs: list[dict]) -> set[str]:
     """
     Build a normalised name lookup set from a list of organisation dicts.
@@ -464,22 +479,25 @@ def cmd_journals(args: argparse.Namespace) -> None:
 
 def run_publishers(
     csv_path: Path,
-    orgs_path: Path,
+    publishers_path: Path,
     output_path: Path | None = None,
     log_dir: Path | None = None,
     column: str = "dc.publisher",
     sample: bool = False,
 ) -> list[dict]:
-    output_path = output_path or orgs_path.parent / f"publishers_to_upload_{TODAY_ISO}.json"
+    output_path = output_path or publishers_path.parent / f"publishers_to_upload_{TODAY_ISO}.json"
     logger = _make_logger("publishers", output_path.parent, log_dir)
 
-    orgs = _load_orgs_json(orgs_path)
-    known_names = _known_names_from_orgs(orgs)
+    with open(publishers_path, encoding="utf-8") as fh:
+        publishers = json.load(fh)
+    publishers = publishers if isinstance(publishers, list) else [publishers]
+
+    known_names = _known_names_from_publishers(publishers)
     rows = _read_csv(csv_path)
     missing = _extract_missing_org_names(rows, column, known_names, logger)
 
     if not missing:
-        logger.info("✅  All publishers already exist in the organisation file.")
+        logger.info("✅  All publishers already exist in the publishers file.")
         return []
 
     records = [
@@ -504,7 +522,7 @@ def run_publishers(
 def cmd_publishers(args: argparse.Namespace) -> None:
     run_publishers(
         csv_path=Path(args.csv),
-        orgs_path=Path(args.organisations),
+        publishers_path=Path(args.publishers),
         output_path=Path(args.output) if args.output else None,
         log_dir=Path(args.log_dir) if getattr(args, "log_dir", None) else None,
         sample=getattr(args, "sample", False),
@@ -522,7 +540,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "funders":    [("csv",              "--csv"),
                        ("organisations",    "--organisations")],
         "publishers": [("csv",              "--csv"),
-                       ("organisations",    "--organisations")],
+                       ("publishers",       "--publishers")],
         "journals":   [("csv",              "--csv"),
                        ("journals_existing","--journals-existing")],
     }
@@ -554,7 +572,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if "publishers" in commands:
         run_publishers(
             csv_path=Path(args.csv),
-            orgs_path=Path(args.organisations),
+            publishers_path=Path(args.publishers),
             output_path=Path(args.publishers_output) if args.publishers_output else None,
             log_dir=log_dir,
             sample=getattr(args, "sample", False),
@@ -612,9 +630,9 @@ def _add_sample_arg(p: argparse.ArgumentParser) -> None:
 
 
 def _add_multi_args(p: argparse.ArgumentParser) -> None:
-    """Add the full set of optional arguments used by `run` and `all`."""
     p.add_argument("--csv", help="CSV file used by funders, publishers, and/or journals.")
-    p.add_argument("--organisations", help="Organisations JSON used by funders and/or publishers.")
+    p.add_argument("--organisations", help="Organisations JSON used by funders.")
+    p.add_argument("--publishers", help="Publishers JSON used by publishers command.")  # ← changed
     p.add_argument("--authors-input",  dest="authors_input",  help="Input authors JSON.")
     p.add_argument("--authors-output", dest="authors_output", help="Output path for authors.")
     p.add_argument("--funders-output",    dest="funders_output",    help="Output path for funders.")
@@ -701,21 +719,24 @@ def build_parser() -> argparse.ArgumentParser:
     # --------------------------------------------------------------- publishers
     p_pub = sub.add_parser(
         "publishers",
-        help="Find publishers in a CSV that are missing from an organisations JSON.",
+        help="Find publishers in a CSV that are missing from a publishers JSON.",
         description=(
             "Reads publisher names from a CSV column dc.publisher (semicolon-separated within cells), "
-            "compares them case-insensitively against an organisations JSON, strips names "
-            "containing punctuation, and writes missing ones as Publisher records ready "
-            "for upload. The CSV delimiter is auto-detected."
+            "compares them case-insensitively against a Pure publishers JSON, "
+            "and writes missing ones as Publisher records ready for upload. "
+            "The CSV delimiter is auto-detected."
         ),
     )
     _add_csv_arg(p_pub)
-    _add_orgs_arg(p_pub)
+    p_pub.add_argument(
+        "publishers",
+        help="Path to the existing Pure publishers JSON file used for name matching.",
+    )
     _add_log_dir_arg(p_pub)
-    _add_sample_arg(p_jour)
+    _add_sample_arg(p_pub)
     p_pub.add_argument(
         "-o", "--output",
-        help="Output path (default: <organisations_dir>/publishers_to_upload_<today>.json).",
+        help="Output path (default: <publishers_dir>/publishers_to_upload_<today>.json).",
     )
     p_pub.set_defaults(func=cmd_publishers)
 

@@ -5,8 +5,8 @@ from datetime import date
 # --- CONFIGURATION ---
 TODAY = date.today().isoformat()
 
-INTERNAL_ORG_JSON = "./pure_entities/2026-03-02/pure_test_organizations_2026-03-02.json"
-EXTERNAL_ORG_JSON = "./pure_entities/2026-03-02/pure_test_external-organizations_2026-03-02.json"
+INTERNAL_ORG_JSON = "./pure_entities/pure_organizations_2026-04-22.json"
+EXTERNAL_ORG_JSON = "./pure_entities/pure_external-organizations_2026-04-22.json"
 OUTPUT_JSON = f"./pure_entities/organizations_mapping_{TODAY}.json"
 
 def extract_names(org_data, is_internal):

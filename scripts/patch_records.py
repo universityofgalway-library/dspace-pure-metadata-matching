@@ -86,6 +86,15 @@ def _strip_system_fields(record: dict) -> dict:
     return {k: v for k, v in record.items() if k not in SYSTEM_FIELDS_TO_EXCLUDE}
 
 
+def _strip_pure_id(obj):
+    """Recursively remove pureId keys at any nesting level."""
+    if isinstance(obj, dict):
+        return {k: _strip_pure_id(v) for k, v in obj.items() if k != "pureId"}
+    if isinstance(obj, list):
+        return [_strip_pure_id(item) for item in obj]
+    return obj
+
+
 def _remove_null_list_items(obj):
     """Recursively remove None items from lists; leave None dict-values intact."""
     if isinstance(obj, dict):
@@ -168,7 +177,7 @@ def patch_nulls(records: list, output_dir: str) -> dict:
             "previousUuids":        record.get("previousUuids"),
         })
 
-        cleaned = _remove_null_list_items(_strip_system_fields(record))
+        cleaned = _strip_pure_id(_remove_null_list_items(_strip_system_fields(record)))
         cleaned.pop("uuid", None)
         create_patches.append(cleaned)
         patched += 1

@@ -1808,7 +1808,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             print(f"  ✅ Precedence: Set managingOrganization to: {first_internal_org_uuid}")
         else:
             updated_record["managingOrganization"] = {
-                "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
+                    "uuid": "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
+#                   "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
                 "systemName": "Organization"
             }
             print(f"  ✅ Precedence: Set managingOrganization to Library Repository (no internal authors)")
@@ -2271,7 +2272,8 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             "uri": "/dk/atira/pure/core/languages/en_IE"
         },
         "managingOrganization": {
-            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # Default: Library Repository
+            "uuid":  "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
+#            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
             "systemName": "Organization"
             }, 
         "visibility": {
@@ -2505,7 +2507,8 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
     else:
         record["managingOrganization"] = {
-            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
+            "uuid": "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
+#            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
             "systemName": "Organization"
         }
         print(f"✅ Set managingOrganization to Library Repository (no internal authors)")

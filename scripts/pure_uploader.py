@@ -347,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--folder", help="Folder containing JSON files to upload (matched/ or unmatched/)")
     parser.add_argument("--file", help="Single JSON file to upload")
     parser.add_argument("--mode", choices=["create", "update"], help="Mode for single file upload")
-    parser.add_argument("--test", action="store_true", default=False, help="Get data from UAT (--test) or Production (default)")
+    parser.add_argument("--test", action="store_true", default=False, help="Send data to UAT (--test) or Production (default)")
     parser.add_argument("--data", default= "research-outputs", choices=["research-outputs", "persons", "external-persons", 
                         "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to upload to Pure")
     parser.add_argument("--log-dir", default=None, help="Directory to save logs (default: ./logs/uploader_logs next to the input file or folder)")
