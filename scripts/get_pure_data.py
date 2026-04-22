@@ -21,7 +21,7 @@ ALL_DATA_TYPES = [
     "publishers"
 ]
 
-def fetch_all(data_type, api_key="", test=True):
+def fetch_all(data_type, api_key="", test=False):
     """
     Fetch all data from the Elsevier Pure API, handling pagination.
     Returns a list of all items.
@@ -126,7 +126,7 @@ def fetch_and_save_data_type(data_type, api_key, test, output_dir, split_by_type
     """
     # Determine filename prefix
     if not filename_prefix:
-        filename_prefix = f"pure_test_{data_type}"
+        filename_prefix = f"pure_{data_type}"
 
     try:
         # Fetch all data
@@ -155,8 +155,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch data from Pure API")
     parser.add_argument(
         "--test", 
-        type=bool, 
-        default=True, 
+        action="store_true",
+        default=False, 
         help="Get data from UAT (--test True) or Production (--test False)"
     )
     parser.add_argument(

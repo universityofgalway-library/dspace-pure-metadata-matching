@@ -183,9 +183,9 @@ def main():
     )
     parser.add_argument(
         "--test", 
-        type=bool, 
-        default=True, 
-        help="Use UAT (--test True) or Production (--test False)"
+        action="store_true",
+        default=False, 
+        help="Use UAT (--test) or Production (default)"
     )
     parser.add_argument(
         "--dry-run", 
