@@ -95,6 +95,17 @@ def sanitize_filename(file_name: str) -> str:
     return file_name
 
 
+def pure_normalize_filename(name: str) -> str:
+    """
+    Normalize a filename the same way Pure does when storing uploaded files.
+    Pure replaces characters that are not alphanumeric, hyphen, underscore,
+    dot, or space with underscores (e.g. commas become underscores).
+    Used to match DSpace-derived filenames against Pure-stored filenames in
+    the skip check, where an exact match on the original name is not reliable.
+    """
+    return re.sub(r'[^\w.\- ]', '_', name)
+
+
 def is_valid_pdf(content: bytes) -> bool:
     """Return True if content starts with the PDF magic bytes and is larger than 1kb."""
     return len(content) > 1024 and content[:4] == b'%PDF'
@@ -202,35 +213,29 @@ def resolve_embargo_and_access(dspace_row: dict):
 
 def already_has_file_ev(pure_record: dict, file_name: str = None, file_size: int = None) -> bool:
     """
-    Return True only if the record already has a FileElectronicVersion whose
-    nested file.fileName matches file_name AND file.size matches file_size.
-
-    The Pure JSON structure for a FileElectronicVersion is:
-        {
-            "typeDiscriminator": "FileElectronicVersion",
-            ...
-            "file": {
-                "fileName": "example.pdf",
-                "size": 282790,
-                ...
-            }
-        }
-
-    If file_name or file_size are not provided, returns False — cannot confirm
-    a match without both.
+    Return True if the record already has a FileElectronicVersion whose fileName
+    matches file_name after Pure-style normalization. Size is only used to
+    disambiguate when both sides have a known value — if either is unknown,
+    the filename match alone is sufficient.
     """
-    if file_name is None or file_size is None:
-        return False  # can't confirm match without both — don't skip
+    if file_name is None:
+        return False
+
+    norm_name = pure_normalize_filename(file_name)
 
     for ev in pure_record.get("electronicVersions", []):
         if ev.get("typeDiscriminator") != "FileElectronicVersion":
             continue
-        # Size and name are inside the nested "file" block, not on the EV itself
         file_block = ev.get("file", {})
         ev_name = file_block.get("fileName", "")
         ev_size = file_block.get("size", -1)
-        if ev_name == file_name and ev_size == file_size:
-            return True
+        if pure_normalize_filename(ev_name) != norm_name:
+            continue
+        # Normalized names match. Only reject if both sizes are known and differ.
+        if file_size is not None and ev_size != -1 and file_size != ev_size:
+            return False
+        return True
+
     return False
 
 
@@ -613,11 +618,9 @@ def get_file_info(
 ) -> tuple[str, str]:
     """
     GET a research output from Pure and return (fileId, fileName) for the
-    FileElectronicVersion that matches expected_file_name (if given), or the
-    first FileElectronicVersion found.
-
-    Returns ("", "") when no matching file electronic version is found or
-    the request fails.
+    FileElectronicVersion that matches expected_file_name (compared after
+    Pure-style normalization), or the first FileElectronicVersion found.
+    Returns ("", "") on failure or when no FileElectronicVersion exists.
     """
     url = f"{base_url}research-outputs/{uuid}"
     try:
@@ -633,6 +636,7 @@ def get_file_info(
     data = resp.json()
     first_file_id   = ""
     first_file_name = ""
+    norm_expected   = pure_normalize_filename(expected_file_name) if expected_file_name else None
 
     for ev in data.get("electronicVersions", []):
         if ev.get("typeDiscriminator") != "FileElectronicVersion":
@@ -643,8 +647,7 @@ def get_file_info(
         if not first_file_id and file_id:
             first_file_id   = file_id
             first_file_name = file_name
-        # If we know which file we just uploaded, prefer that one
-        if expected_file_name and file_name == expected_file_name:
+        if norm_expected and pure_normalize_filename(file_name) == norm_expected:
             return file_id, file_name
 
     return first_file_id, first_file_name
@@ -745,9 +748,9 @@ def main():
     # Open matched_ref CSV immediately so rows are written as we go,
     # surviving early termination or keyboard interrupt.
     MATCHED_REF_FIELDS = [
-        "dspace_uuid", "pure_uuid", "pure_id", "handle", "dspace_file_id",
-        "pure_file_id", "pure_file_name",
-    ]
+        "dspace_uuid", "pure_uuid", "pure_id", "title",
+        "dspace_file_id", "pure_file_id", "pure_file_name", "handle"
+            ]
     matched_ref_fh     = open(matched_ref_csv, "w", newline="", encoding="utf-8")
     matched_ref_writer = csv.DictWriter(
         matched_ref_fh, fieldnames=MATCHED_REF_FIELDS, extrasaction="ignore"
@@ -823,6 +826,7 @@ def main():
 
     # ---- Session -----------------------------------------------------------
     session = requests.Session()
+    session.headers.update({"api-key": api_key})
 
     # ---- Process -----------------------------------------------------------
     results      = []
@@ -967,14 +971,18 @@ def main():
 
             print(f"  📄 Processing file: {safe_file_name}")
 
-            # 2. Skip check — compare against safe_file_name (the Pure-side name)
+            # 2. Skip check — compare against Pure-normalized filename
             if args.skip_existing:
-                existing_names = {
-                    ev.get("file", {}).get("fileName", "")
-                    for ev in pure_record.get("electronicVersions", [])
-                    if ev.get("typeDiscriminator") == "FileElectronicVersion"
-                }
-                if safe_file_name in existing_names:
+                norm_safe_file_name = pure_normalize_filename(safe_file_name)
+                # Find the actual stored filename in Pure that normalizes to the same value
+                matched_ev_name = next(
+                    (ev.get("file", {}).get("fileName", "")
+                     for ev in pure_record.get("electronicVersions", [])
+                     if ev.get("typeDiscriminator") == "FileElectronicVersion"
+                     and pure_normalize_filename(ev.get("file", {}).get("fileName", "")) == norm_safe_file_name),
+                    None,
+                )
+                if matched_ev_name is not None:
                     print(f"    ℹ️  Same filename found in Pure — checking size...")
                     known_size = None
                     if args.source == "local":
@@ -993,12 +1001,12 @@ def main():
                             except Exception:
                                 known_size = None
 
-                    if already_has_file_ev(pure_record, file_name=safe_file_name, file_size=known_size):
-                        # Find the matching FileEV in the record
+                    if already_has_file_ev(pure_record, file_name=matched_ev_name, file_size=known_size):
+                        # Find the matching FileEV using the actual stored name
                         matching_ev = next(
                             (ev for ev in pure_record.get("electronicVersions", [])
                              if ev.get("typeDiscriminator") == "FileElectronicVersion"
-                             and ev.get("file", {}).get("fileName") == safe_file_name),
+                             and ev.get("file", {}).get("fileName") == matched_ev_name),
                             None
                         )
                         changed, updated_ev = needs_metadata_update(matching_ev, row) if matching_ev else (False, None)
@@ -1009,7 +1017,7 @@ def main():
                             updated_record["electronicVersions"] = [
                                 updated_ev if (
                                     ev.get("typeDiscriminator") == "FileElectronicVersion"
-                                    and ev.get("file", {}).get("fileName") == safe_file_name
+                                    and ev.get("file", {}).get("fileName") == matched_ev_name
                                 ) else ev
                                 for ev in pure_record.get("electronicVersions", [])
                             ]
@@ -1023,10 +1031,9 @@ def main():
                             entry["pure_id"] = pure_id
                             if success:
                                 print(f"    ✅ Metadata updated ({detail})")
-                                # GET the updated record to retrieve fileId/fileName
                                 p_file_id, p_file_name = get_file_info(
                                     session, base_url, pure_uuid,
-                                    expected_file_name=safe_file_name,
+                                    expected_file_name=matched_ev_name,
                                 )
                                 entry["pure_file_id"]   = p_file_id
                                 entry["pure_file_name"] = p_file_name
@@ -1034,7 +1041,7 @@ def main():
                                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
                                 counters["metadata_updated"] += 1
                                 entry["status"] = "metadata_updated"
-                                entry["detail"] = f"Metadata updated for: {safe_file_name}"
+                                entry["detail"] = f"Metadata updated for: {matched_ev_name}"
                                 results.append(entry)
                                 success_rows.append(entry)
                                 matched_ref_writer.writerow(entry)
@@ -1057,12 +1064,22 @@ def main():
                             skipped_paths.append(safe_file_name)
                         else:
                             print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
-                            # Capture existing fileId/fileName from in-memory record
                             if matching_ev:
                                 entry["pure_file_id"]   = matching_ev.get("file", {}).get("fileId", "")
                                 entry["pure_file_name"] = matching_ev.get("file", {}).get("fileName", "")
                             counters["already_has_fev"] += 1
                             skipped_paths.append(safe_file_name)
+                            matched_ref_writer.writerow({
+                                "handle":         entry["handle"],
+                                "dspace_uuid":    entry["dspace_uuid"],
+                                "pure_uuid":      pure_uuid,
+                                "pure_id":        entry["pure_id"],
+                                "title":          entry["title"],
+                                "dspace_file_id": single_path,
+                                "pure_file_id":   entry["pure_file_id"] or "",
+                                "pure_file_name": entry["pure_file_name"] or "",
+                            })
+                            matched_ref_fh.flush()
                         continue
 
             # 3. Dry run
@@ -1135,10 +1152,11 @@ def main():
                 any_success = True
                 # Write matched_ref row immediately (before the outer loop closes)
                 matched_ref_writer.writerow({
+                    "handle":         entry["handle"],
                     "dspace_uuid":    entry["dspace_uuid"],
                     "pure_uuid":      pure_uuid,
                     "pure_id":        entry["pure_id"],
-                    "handle":         entry["handle"],
+                    "title":          entry["title"],
                     "dspace_file_id": single_path,
                     "pure_file_id":   p_file_id,
                     "pure_file_name": p_file_name,
@@ -1188,12 +1206,11 @@ def main():
             matched_ref_fh.flush()
         elif not uploaded_keys and skipped_paths:
             # All paths skipped — existing FileEVs matched
+            # (matched_ref rows were already written per-file in the inner loop)
             entry["status"] = "skipped_existing_fev"
             entry["detail"] = f"All files already exist in Pure with same name and size: {'; '.join(skipped_paths)}"
             results.append(entry)
             skipped_rows.append(entry)
-            matched_ref_writer.writerow(entry)
-            matched_ref_fh.flush()
         else:
             entry["status"] = "success"
             entry["detail"] = f"Uploaded {len(uploaded_keys)} file(s)"

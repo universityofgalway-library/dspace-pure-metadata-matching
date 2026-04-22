@@ -143,10 +143,11 @@ All log files are written to `--log-dir` and timestamped with the run start time
 | `dspace_uuid` | `3f2a1b...` | DSpace item UUID. |
 | `pure_uuid` | `a1b2c3...` | Pure record UUID. |
 | `pure_id` | `12345678` | Pure internal numeric ID (`pureId`), captured before system fields are stripped. |
-| `handle` | `https://hdl.handle.net/10379/4728` | Item handle, prefixed with `https://hdl.handle.net/` if not already a full URL. |
+| `title` | `My paper title` | Research output title taken from the `dc.title` column of the DSpace CSV. |
 | `dspace_file_id` | `/10379/4728/1/file.pdf` | The handle-based file path from `pdf_handle_paths` for this specific file. For rows where all files were skipped or failed as a batch, this contains the full semicolon-separated `pdf_handle_paths` value. |
 | `pure_file_id` | `MDAxOTAxYjI5` | The `fileId` assigned by Pure to the linked file, retrieved via GET after a successful PUT. Empty if the PUT failed or if the GET could not find the file. For skipped files (already existed), taken from the existing `FileElectronicVersion` in the in-memory Pure record without an extra API call. |
 | `pure_file_name` | `my_paper.pdf` | The `fileName` as stored in Pure's `FileElectronicVersion.file` object. Corresponds to `pure_file_id`. |
+| `handle` | `https://hdl.handle.net/10379/4728` | Item handle, prefixed with `https://hdl.handle.net/` if not already a full URL. |
 
 ### Status values
 
