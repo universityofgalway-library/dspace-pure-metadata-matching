@@ -84,6 +84,17 @@ def safe_path(path: str) -> str:
     return path
 
 
+def sanitize_filename(file_name: str) -> str:
+    """
+    Replace characters that are illegal in Windows filenames with underscores.
+    Illegal characters on Windows: \\ / : * ? " < > |
+    On other platforms this is a no-op.
+    """
+    if sys.platform == "win32":
+        return re.sub(r'[\\/:*?"<>|]', '_', file_name)
+    return file_name
+
+
 def is_valid_pdf(content: bytes) -> bool:
     """Return True if content starts with the PDF magic bytes and is larger than 1kb."""
     return len(content) > 1024 and content[:4] == b'%PDF'
@@ -191,20 +202,37 @@ def resolve_embargo_and_access(dspace_row: dict):
 
 def already_has_file_ev(pure_record: dict, file_name: str = None, file_size: int = None) -> bool:
     """
-    Return True only if the record already has a FileElectronicVersion with
-    the same filename AND size. If file_name or file_size are not provided,
-    returns False — cannot confirm a match without both.
+    Return True only if the record already has a FileElectronicVersion whose
+    nested file.fileName matches file_name AND file.size matches file_size.
+
+    The Pure JSON structure for a FileElectronicVersion is:
+        {
+            "typeDiscriminator": "FileElectronicVersion",
+            ...
+            "file": {
+                "fileName": "example.pdf",
+                "size": 282790,
+                ...
+            }
+        }
+
+    If file_name or file_size are not provided, returns False — cannot confirm
+    a match without both.
     """
+    if file_name is None or file_size is None:
+        return False  # can't confirm match without both — don't skip
+
     for ev in pure_record.get("electronicVersions", []):
         if ev.get("typeDiscriminator") != "FileElectronicVersion":
             continue
-        if file_name is None or file_size is None:
-            return False  # can't confirm match without both — don't skip
-        ev_name = ev.get("file", {}).get("fileName", "")
-        ev_size = ev.get("file", {}).get("size", -1)
+        # Size and name are inside the nested "file" block, not on the EV itself
+        file_block = ev.get("file", {})
+        ev_name = file_block.get("fileName", "")
+        ev_size = file_block.get("size", -1)
         if ev_name == file_name and ev_size == file_size:
             return True
     return False
+
 
 def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
     """
@@ -348,7 +376,12 @@ def upload_pdf_to_pure(
     pdf_save_dir: str,
     session: requests.Session,
 ) -> dict | None:
-    os.makedirs(safe_path(pdf_save_dir), exist_ok=True)
+    try:
+        os.makedirs(safe_path(pdf_save_dir), exist_ok=True)
+    except OSError as exc:
+        print(f"    ❌ Could not create PDF save directory '{pdf_save_dir}': {exc}")
+        return None
+
     local_path = os.path.abspath(os.path.join(pdf_save_dir, file_name))
 
     # Always download to disk first to ensure the complete file
@@ -366,9 +399,15 @@ def upload_pdf_to_pure(
                 print(f"    ❌ Content is not a valid PDF or is under 1kb "
                       f"(first bytes: {src.content[:8]!r}, size: {len(src.content)})")
                 return None
-            with open(safe_path(local_path), "wb") as fh:
-                fh.write(src.content)
-            print(f"    💾 PDF saved locally: {local_path} ({len(src.content):,} bytes)")
+            try:
+                with open(safe_path(local_path), "wb") as fh:
+                    fh.write(src.content)
+                print(f"    💾 PDF saved locally: {local_path} ({len(src.content):,} bytes)")
+            except OSError as exc:
+                print(f"    ❌ Could not write PDF to disk (invalid path/filename?): {exc}")
+                print(f"       Attempted path : {local_path}")
+                print(f"       Original name  : {file_name}")
+                return None
         except requests.RequestException as exc:
             print(f"    ❌ PDF download error: {exc}")
             return None
@@ -384,17 +423,25 @@ def upload_pdf_to_pure(
                 headers={
                     "accept":       "application/json",
                     "api-key":      api_key,
-                    "content-type": "*/*",
+                    "content-type": "application/pdf",
                 },
                 timeout=120,
             )
+    except OSError as exc:
+        print(f"    ❌ Could not open local PDF for upload (invalid path/filename?): {exc}")
+        print(f"       Attempted path : {local_path}")
+        print(f"       Original name  : {file_name}")
+        return None
     except requests.RequestException as exc:
         print(f"    ❌ PDF upload error: {exc}")
         return None
 
     # Clean up unless --save-locally was requested
     if not save_locally and os.path.exists(safe_path(local_path)):
-        os.remove(safe_path(local_path))
+        try:
+            os.remove(safe_path(local_path))
+        except OSError as exc:
+            print(f"    ⚠️  Could not remove temporary file '{local_path}': {exc}")
 
     if upload_resp.status_code not in (200, 201):
         print(f"    ❌ Pure file-upload failed (HTTP {upload_resp.status_code}): "
@@ -428,17 +475,17 @@ def build_file_electronic_version(
         "visibleOnPortalDate": TODAY,
         "accessType":  {"uri": access_uri},
         "licenseType": {"uri": license_uri},
-                "versionType": {
+        "versionType": {
             "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
-                },
+        },
         "file": {
             "fileName": file_name,
-            "mimeType": upload_data.get("mimeType", "*/*"),
+            "mimeType": "application/pdf",
             "size":     upload_data.get("size", 0),
             "uploadedFile": {
                 "digest":     upload_data.get("digest"),
                 "digestType": upload_data.get("digestType"),
-                "mimeType":   upload_data.get("mimeType", "*/*"),
+                "mimeType":   "application/pdf",
                 "size":       upload_data.get("size", 0),
                 "key":        upload_data.get("key"),
             },
@@ -491,7 +538,12 @@ def upload_local_pdf_to_pure(
                 },
                 timeout=120,
             )
-    except (OSError, requests.RequestException) as exc:
+    except OSError as exc:
+        print(f"    ❌ Could not open local PDF (invalid path/filename?): {exc}")
+        print(f"       Attempted path : {local_path}")
+        print(f"       Original name  : {safe_file_name}")
+        return None
+    except requests.RequestException as exc:
         print(f"    ❌ Local PDF upload error: {exc}")
         return None
 
@@ -720,14 +772,14 @@ def main():
     skipped_rows = []
 
     counters = {
-        "total":           len(rows_with_pdf),
-        "no_match":        0,
-        "already_has_fev": 0,
+        "total":            len(rows_with_pdf),
+        "no_match":         0,
+        "already_has_fev":  0,
         "metadata_updated": 0,
-        "pdf_fail":        0,
-        "put_fail":        0,
-        "success":         0,
-        "dry_run_would":   0,
+        "pdf_fail":         0,
+        "put_fail":         0,
+        "success":          0,
+        "dry_run_would":    0,
     }
 
     start_time = time.time()
@@ -767,7 +819,7 @@ def main():
             # Prefix handle for the log if not already a full URL
             "handle":         f"https://hdl.handle.net/{handle_str}" if handle_str and not handle_str.startswith("http") else handle_str,
             "dspace_file_id": pdf_path,   # original semicolon-separated paths, as-is
-            "pdf_url": "; ".join(pdf_links) if args.source == "dspace" else "",
+            "pdf_url":        "; ".join(pdf_links) if args.source == "dspace" else "",
             "pure_uuid":      None,
             "pure_id":        None,
             "match_type":     None,
@@ -793,53 +845,68 @@ def main():
         entry["pure_id"]    = str(pure_record.get("pureId", ""))
         entry["match_type"] = match_type
         print(f"  ✅ Matched Pure record ({match_type}): {pure_uuid}  pureId: {entry['pure_id']}")
-        
 
         # Steps 2-6: process each PDF path individually
-        any_success   = False
-        any_fail      = False
+        any_success             = False
+        any_fail                = False
         metadata_update_handled = False
-        uploaded_keys = []
-        skipped_paths = []
-        failed_paths  = []
+        uploaded_keys           = []
+        skipped_paths           = []
+        failed_paths            = []
 
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
-            safe_file_name = unquote(file_name)                       # decoded — used in Pure and on disk
+            safe_file_name = unquote(file_name)                       # decoded — used as Pure fileName
+
+            # Sanitize for local disk (replaces chars illegal on Windows, e.g. |)
+            disk_file_name = sanitize_filename(safe_file_name)
+            if disk_file_name != safe_file_name:
+                print(f"    ⚠️  Filename contains characters illegal on this OS — sanitized for disk use.")
+                print(f"       Pure / DSpace name : {safe_file_name}")
+                print(f"       Disk name          : {disk_file_name}")
+
             full_pdf_url = pdf_link_map.get(single_path, "") if args.source == "dspace" else ""
 
             # Pre-download from DSpace for local saving (always, regardless of skip check)
             if args.source == "dspace" and args.save_locally and not args.dry_run:
-                local_path = os.path.abspath(os.path.join(args.pdf_dir, safe_file_name))
-                os.makedirs(safe_path(os.path.dirname(local_path)), exist_ok=True)
-                if not os.path.exists(local_path):
-                    # Rate limit before download
-                    elapsed_since_last = time.time() - last_dspace_request
-                    if elapsed_since_last < 5:
-                        wait = 5 - elapsed_since_last
-                        print(f"    ⏳ Rate limiting — waiting {wait:.1f}s...")
-                        time.sleep(wait)
-                    print(f"    💾 Pre-downloading for local save: {safe_file_name}")
-                    try:
-                        presrc = session.get(full_pdf_url, timeout=120, allow_redirects=True)
-                        if presrc.status_code == 200 and "text/html" not in presrc.headers.get("Content-Type", ""):
-                            if not is_valid_pdf(presrc.content):
-                                print(f"    ❌ Pre-download content is not a valid PDF or under 1kb — skipping save")
-                            else:
-                                with open(safe_path(local_path), "wb") as fh:
-                                    fh.write(presrc.content)
-                                last_dspace_request = time.time()
-                                print(f"    💾 Saved: {local_path} ({len(presrc.content):,} bytes)")
-                        else:
-                            print(f"    ⚠️  Pre-download failed (HTTP {presrc.status_code})")
-                    except requests.RequestException as exc:
-                        print(f"    ⚠️  Pre-download error: {exc}")
+                local_path = os.path.abspath(os.path.join(args.pdf_dir, disk_file_name))
+                try:
+                    os.makedirs(safe_path(os.path.dirname(local_path)), exist_ok=True)
+                except OSError as exc:
+                    print(f"    ❌ Could not create directory for pre-download: {exc} — skipping pre-save")
                 else:
-                    print(f"    ℹ️  Already saved locally: {local_path}")
+                    if not os.path.exists(local_path):
+                        elapsed_since_last = time.time() - last_dspace_request
+                        if elapsed_since_last < 5:
+                            wait = 5 - elapsed_since_last
+                            print(f"    ⏳ Rate limiting — waiting {wait:.1f}s...")
+                            time.sleep(wait)
+                        print(f"    💾 Pre-downloading for local save: {disk_file_name}")
+                        try:
+                            presrc = session.get(full_pdf_url, timeout=120, allow_redirects=True)
+                            if presrc.status_code == 200 and "text/html" not in presrc.headers.get("Content-Type", ""):
+                                if not is_valid_pdf(presrc.content):
+                                    print(f"    ❌ Pre-download is not a valid PDF or under 1kb — skipping save")
+                                else:
+                                    try:
+                                        with open(safe_path(local_path), "wb") as fh:
+                                            fh.write(presrc.content)
+                                        last_dspace_request = time.time()
+                                        print(f"    💾 Saved: {local_path} ({len(presrc.content):,} bytes)")
+                                    except OSError as exc:
+                                        print(f"    ❌ Could not write pre-downloaded PDF to disk: {exc}")
+                                        print(f"       Attempted path   : {local_path}")
+                                        print(f"       Original filename: {safe_file_name}")
+                            else:
+                                print(f"    ⚠️  Pre-download failed (HTTP {presrc.status_code})")
+                        except requests.RequestException as exc:
+                            print(f"    ⚠️  Pre-download error: {exc}")
+                    else:
+                        print(f"    ℹ️  Already saved locally: {local_path}")
 
             print(f"  📄 Processing file: {safe_file_name}")
 
-            # 2. Skip check — filename match first, then size confirmation
+            # 2. Skip check — compare against safe_file_name (the Pure-side name)
             if args.skip_existing:
                 existing_names = {
                     ev.get("file", {}).get("fileName", "")
@@ -850,11 +917,11 @@ def main():
                     print(f"    ℹ️  Same filename found in Pure — checking size...")
                     known_size = None
                     if args.source == "local":
-                        lp = os.path.join(args.pdf_dir, safe_file_name)
+                        lp = os.path.join(args.pdf_dir, disk_file_name)
                         if os.path.exists(lp):
                             known_size = os.path.getsize(lp)
                     else:
-                        lp = os.path.join(args.pdf_dir, safe_file_name)
+                        lp = os.path.join(args.pdf_dir, disk_file_name)
                         if args.save_locally and os.path.exists(lp):
                             known_size = os.path.getsize(lp)
                         else:
@@ -909,7 +976,7 @@ def main():
                                 results.append(entry)
                                 failed_rows.append(entry)
                                 metadata_update_handled = True
-                            continue  # skip the rest of the per-file loop and status consolidation
+                            continue
                         elif changed and args.dry_run:
                             print(f"    🔍 DRY RUN — metadata would be updated")
                             counters["already_has_fev"] += 1
@@ -930,7 +997,7 @@ def main():
             print(f"    📎 Uploading: {safe_file_name}")
             if args.source == "local":
                 upload_data = upload_local_pdf_to_pure(
-                    safe_file_name=safe_file_name,
+                    safe_file_name=disk_file_name,
                     pdf_dir=args.pdf_dir,
                     api_key=api_key,
                     pure_file_upload_url=pure_file_upload_url,
@@ -939,7 +1006,7 @@ def main():
             else:
                 upload_data = upload_pdf_to_pure(
                     full_pdf_url=full_pdf_url,
-                    file_name=safe_file_name,
+                    file_name=disk_file_name,       # sanitized name used on disk
                     api_key=api_key,
                     pure_file_upload_url=pure_file_upload_url,
                     save_locally=args.save_locally,
@@ -949,6 +1016,7 @@ def main():
                 last_dspace_request = time.time()
 
             if upload_data is None:
+                print(f"    ❌ Upload failed for: {safe_file_name}")
                 counters["pdf_fail"] += 1
                 failed_paths.append(safe_file_name)
                 any_fail = True
@@ -959,6 +1027,8 @@ def main():
             print(f"    ✅ Uploaded — key: {upload_key}")
 
             # 5. Build FileElectronicVersion
+            # Always use safe_file_name (original decoded) as the Pure-side fileName
+            # so it matches the DSpace original exactly, even if the disk copy is sanitized.
             file_ev = build_file_electronic_version(upload_data, safe_file_name, row)
 
             # 6. PUT the Pure record immediately (within 2-hour window)
@@ -1039,7 +1109,7 @@ def main():
     print(f"  PUT failed                    : {counters['put_fail']}")
     print(f"  Successfully uploaded         : {counters['success']}")
     if args.dry_run:
-        print(f"  Would have processed      : {counters['dry_run_would']}")
+        print(f"  Would have processed          : {counters['dry_run_would']}")
     print(f"  Time elapsed                  : {h:02d}:{m:02d}:{s:02d}")
     print(f"{'='*70}")
 
@@ -1067,7 +1137,6 @@ def main():
         print(f"  Skipped CSV  : {skipped_csv}")
 
     # Matched records reference CSV (all records matched to a Pure record, with or without a file)
-    # dspace_file_id retains the original semicolon-separated paths as-is
     matched_ref_csv  = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
     matched_ref_rows = [r for r in results if r.get("pure_uuid")]
     if matched_ref_rows:
