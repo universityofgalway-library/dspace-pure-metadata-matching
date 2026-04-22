@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-upload_pdfs_to_pure.py
+add_pdfs_to_pure.py
 
 For each record in the Pure JSON that has a matching DSpace row with a PDF path:
   1. Downloads the PDF from DSpace (or reads from local disk)
@@ -12,7 +12,7 @@ Records are processed one at a time to ensure each uploaded file is linked befor
 the 2-hour Pure expiry window. Multiple PDFs per DSpace row are all processed.
 
 Usage:
-    python upload_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
+    python add_pdfs_to_pure.py --dspace-csv <path> --pure-json <path> [options]
 
 .env file must contain:
     PURE_ROOT_API_KEY_TEST=your_key_here   (UAT)
@@ -605,6 +605,51 @@ def put_pure_record(
         return False, str(exc), pure_id
 
 
+def get_file_info(
+    session: requests.Session,
+    base_url: str,
+    uuid: str,
+    expected_file_name: str = None,
+) -> tuple[str, str]:
+    """
+    GET a research output from Pure and return (fileId, fileName) for the
+    FileElectronicVersion that matches expected_file_name (if given), or the
+    first FileElectronicVersion found.
+
+    Returns ("", "") when no matching file electronic version is found or
+    the request fails.
+    """
+    url = f"{base_url}research-outputs/{uuid}"
+    try:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        print(f"    ⚠️  GET file info — HTTP {exc.response.status_code} for uuid={uuid}")
+        return "", ""
+    except requests.RequestException as exc:
+        print(f"    ⚠️  GET file info — request failed for uuid={uuid}: {exc}")
+        return "", ""
+
+    data = resp.json()
+    first_file_id   = ""
+    first_file_name = ""
+
+    for ev in data.get("electronicVersions", []):
+        if ev.get("typeDiscriminator") != "FileElectronicVersion":
+            continue
+        file_obj  = ev.get("file", {})
+        file_id   = file_obj.get("fileId", "")
+        file_name = file_obj.get("fileName", "")
+        if not first_file_id and file_id:
+            first_file_id   = file_id
+            first_file_name = file_name
+        # If we know which file we just uploaded, prefer that one
+        if expected_file_name and file_name == expected_file_name:
+            return file_id, file_name
+
+    return first_file_id, first_file_name
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -690,11 +735,25 @@ def main():
 
     # ---- Logging setup -----------------------------------------------------
     os.makedirs(args.log_dir, exist_ok=True)
-    run_log_path = os.path.join(args.log_dir, f"run_{RUN_TS}.log")
-    results_json = os.path.join(args.log_dir, f"results_{RUN_TS}.json")
-    success_csv  = os.path.join(args.log_dir, f"success_{RUN_TS}.csv")
-    failed_csv   = os.path.join(args.log_dir, f"failed_{RUN_TS}.csv")
-    skipped_csv  = os.path.join(args.log_dir, f"skipped_{RUN_TS}.csv")
+    run_log_path    = os.path.join(args.log_dir, f"run_{RUN_TS}.log")
+    results_json    = os.path.join(args.log_dir, f"results_{RUN_TS}.json")
+    success_csv     = os.path.join(args.log_dir, f"success_{RUN_TS}.csv")
+    failed_csv      = os.path.join(args.log_dir, f"failed_{RUN_TS}.csv")
+    skipped_csv     = os.path.join(args.log_dir, f"skipped_{RUN_TS}.csv")
+    matched_ref_csv = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
+
+    # Open matched_ref CSV immediately so rows are written as we go,
+    # surviving early termination or keyboard interrupt.
+    MATCHED_REF_FIELDS = [
+        "dspace_uuid", "pure_uuid", "pure_id", "handle", "dspace_file_id",
+        "pure_file_id", "pure_file_name",
+    ]
+    matched_ref_fh     = open(matched_ref_csv, "w", newline="", encoding="utf-8")
+    matched_ref_writer = csv.DictWriter(
+        matched_ref_fh, fieldnames=MATCHED_REF_FIELDS, extrasaction="ignore"
+    )
+    matched_ref_writer.writeheader()
+    matched_ref_fh.flush()
 
     logger     = RunLogger(run_log_path)
     sys.stdout = logger
@@ -824,6 +883,8 @@ def main():
             "pure_id":        None,
             "match_type":     None,
             "upload_key":     None,
+            "pure_file_id":   None,
+            "pure_file_name": None,
             "status":         None,
             "detail":         None,
             "timestamp":      datetime.now().isoformat(),
@@ -962,11 +1023,22 @@ def main():
                             entry["pure_id"] = pure_id
                             if success:
                                 print(f"    ✅ Metadata updated ({detail})")
+                                # GET the updated record to retrieve fileId/fileName
+                                p_file_id, p_file_name = get_file_info(
+                                    session, base_url, pure_uuid,
+                                    expected_file_name=safe_file_name,
+                                )
+                                entry["pure_file_id"]   = p_file_id
+                                entry["pure_file_name"] = p_file_name
+                                if p_file_id:
+                                    print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
                                 counters["metadata_updated"] += 1
                                 entry["status"] = "metadata_updated"
                                 entry["detail"] = f"Metadata updated for: {safe_file_name}"
                                 results.append(entry)
                                 success_rows.append(entry)
+                                matched_ref_writer.writerow(entry)
+                                matched_ref_fh.flush()
                                 metadata_update_handled = True
                             else:
                                 print(f"    ❌ Metadata update PUT failed: {detail}")
@@ -975,6 +1047,8 @@ def main():
                                 entry["detail"] = f"Metadata update failed: {detail}"
                                 results.append(entry)
                                 failed_rows.append(entry)
+                                matched_ref_writer.writerow(entry)
+                                matched_ref_fh.flush()
                                 metadata_update_handled = True
                             continue
                         elif changed and args.dry_run:
@@ -983,6 +1057,10 @@ def main():
                             skipped_paths.append(safe_file_name)
                         else:
                             print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
+                            # Capture existing fileId/fileName from in-memory record
+                            if matching_ev:
+                                entry["pure_file_id"]   = matching_ev.get("file", {}).get("fileId", "")
+                                entry["pure_file_name"] = matching_ev.get("file", {}).get("fileName", "")
                             counters["already_has_fev"] += 1
                             skipped_paths.append(safe_file_name)
                         continue
@@ -1044,8 +1122,28 @@ def main():
 
             if success:
                 print(f"    ✅ PUT succeeded ({detail})")
+                # GET the updated record to retrieve the assigned fileId/fileName
+                p_file_id, p_file_name = get_file_info(
+                    session, base_url, pure_uuid,
+                    expected_file_name=safe_file_name,
+                )
+                entry["pure_file_id"]   = p_file_id
+                entry["pure_file_name"] = p_file_name
+                if p_file_id:
+                    print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
                 counters["success"] += 1
                 any_success = True
+                # Write matched_ref row immediately (before the outer loop closes)
+                matched_ref_writer.writerow({
+                    "dspace_uuid":    entry["dspace_uuid"],
+                    "pure_uuid":      pure_uuid,
+                    "pure_id":        entry["pure_id"],
+                    "handle":         entry["handle"],
+                    "dspace_file_id": single_path,
+                    "pure_file_id":   p_file_id,
+                    "pure_file_name": p_file_name,
+                })
+                matched_ref_fh.flush()
                 # Update in-memory record so subsequent files in this row
                 # see the newly added FileEV for the skip check
                 pure_record.setdefault("electronicVersions", []).append(file_ev)
@@ -1073,6 +1171,9 @@ def main():
             entry["detail"] = f"Failed: {'; '.join(failed_paths)}"
             results.append(entry)
             failed_rows.append(entry)
+            # Still record in matched_ref so failed files are traceable
+            matched_ref_writer.writerow(entry)
+            matched_ref_fh.flush()
         elif any_fail and any_success:
             entry["status"] = "partial_success"
             entry["detail"] = (
@@ -1081,19 +1182,28 @@ def main():
             )
             results.append(entry)
             success_rows.append(entry)
+            # Per-file rows were already written inside the inner loop for successes;
+            # write a summary row here covering the whole DSpace item
+            matched_ref_writer.writerow(entry)
+            matched_ref_fh.flush()
         elif not uploaded_keys and skipped_paths:
             # All paths skipped — existing FileEVs matched
             entry["status"] = "skipped_existing_fev"
             entry["detail"] = f"All files already exist in Pure with same name and size: {'; '.join(skipped_paths)}"
             results.append(entry)
             skipped_rows.append(entry)
+            matched_ref_writer.writerow(entry)
+            matched_ref_fh.flush()
         else:
             entry["status"] = "success"
             entry["detail"] = f"Uploaded {len(uploaded_keys)} file(s)"
             results.append(entry)
             success_rows.append(entry)
+            # Per-file rows already written in the inner loop; nothing extra needed here
 
     # ---- Summary & logs ----------------------------------------------------
+    matched_ref_fh.close()   # flush and close the continuously-written CSV
+
     elapsed = time.time() - start_time
     h, rem  = divmod(int(elapsed), 3600)
     m, s    = divmod(rem, 60)
@@ -1116,11 +1226,13 @@ def main():
     write_json_log(results, results_json)
     print(f"\n  Full log     : {run_log_path}")
     print(f"  Results JSON : {results_json}")
+    print(f"  Matched refs : {matched_ref_csv}")
 
     # All-columns CSV fields (used for success / failed / skipped CSVs)
     csv_fields = [
         "dspace_uuid", "title", "handle", "dspace_file_id", "pdf_url",
         "pure_uuid", "pure_id", "match_type", "upload_key",
+        "pure_file_id", "pure_file_name",
         "status", "detail", "timestamp",
     ]
 
@@ -1135,17 +1247,6 @@ def main():
     if skipped_rows:
         write_csv_log(skipped_rows, skipped_csv, csv_fields)
         print(f"  Skipped CSV  : {skipped_csv}")
-
-    # Matched records reference CSV (all records matched to a Pure record, with or without a file)
-    matched_ref_csv  = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
-    matched_ref_rows = [r for r in results if r.get("pure_uuid")]
-    if matched_ref_rows:
-        write_csv_log(
-            matched_ref_rows,
-            matched_ref_csv,
-            ["dspace_uuid", "pure_uuid", "pure_id", "handle", "dspace_file_id"],
-        )
-        print(f"  Matched refs  : {matched_ref_csv}")
 
     logger.close()
     sys.stdout = logger._terminal
