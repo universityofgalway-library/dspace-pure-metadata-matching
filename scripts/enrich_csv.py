@@ -3,8 +3,8 @@
 CSV Enrichment Script
 Enrich a target CSV with journal/publisher data from either:
 1. Another CSV file (matching by 'handle' column)
-2. JSON file (matching by journal title / uuid)
-3. Uploader log JSON (matching by journal title, no publisher uuid)
+2. JSON file (matching by journal/publisher title -- requires --type)
+3. Uploader log JSON (matching by journal/publisher title -- requires --type)
 """
 
 import csv
@@ -15,17 +15,23 @@ import os
 import pandas as pd
 from pathlib import Path
 
-# Mapping configuration for JSON mode
-JSON_MAPPINGS = {
+# Mapping configuration for JSON mode — journals
+JOURNAL_JSON_MAPPINGS = {
     "journal_uuid": "uuid",
     "publisher_uuid": "publisher.uuid",
-    "journal_title": "titles.0.title"
+    "journal_title": "titles.0.title",
 }
 
-# Mapping configuration for log mode (no publisher uuid)
-LOG_MAPPINGS = {
-    "journal_uuid": "uuid",
-    "journal_title": "name"
+# Mapping configuration for JSON mode — publishers
+# Only publisher_uuid is written; publisher_name is left as-is in the CSV.
+PUBLISHER_JSON_MAPPINGS = {
+    "publisher_uuid": "uuid",
+}
+
+# UUID column name per record type (log mode)
+LOG_UUID_COLUMN = {
+    "journals": "journal_uuid",
+    "publishers": "publisher_uuid",
 }
 
 _COMPARISON_STRIP = str.maketrans("", "", """—!–¿()-[]{};:'"''""‐\\,<>./?@#$%^&=+|£€*_~®™©0123456789""")
@@ -34,6 +40,30 @@ _COMPARISON_STRIP = str.maketrans("", "", """—!–¿()-[]{};:'"''""‐\\,<>./?
 def _normalise(s: str) -> str:
     return s.strip().lower().translate(_COMPARISON_STRIP)
 
+
+def _resolve_publisher_name(row: dict) -> str | None:
+    """
+    Return the best available publisher name from a CSV row.
+
+    Preference order:
+      1. dc.publisher   (if non-empty)
+      2. publisher_name (if non-empty)
+      3. None
+
+    Args:
+        row: A csv.DictReader row dict
+
+    Returns:
+        Publisher name string, or None if neither column has a value
+    """
+    dc = row.get("dc.publisher", "").strip()
+    pn = row.get("publisher_name", "").strip()
+    return dc if dc else (pn if pn else None)
+
+
+# ---------------------------------------------------------------------------
+# CSV mode
+# ---------------------------------------------------------------------------
 
 def enrich_from_csv(source_path, target_path):
     """
@@ -58,7 +88,7 @@ def enrich_from_csv(source_path, target_path):
         'journal_issn',
         'journal_uuid',
         'publisher_name',
-        'publisher_uuid'
+        'publisher_uuid',
     ]
 
     # Verify that source has the required columns
@@ -123,6 +153,10 @@ def enrich_from_csv(source_path, target_path):
     return output_path
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
 def extract_value(item, key_path):
     """
     Extract a value from a nested dictionary using dot notation.
@@ -153,12 +187,16 @@ def extract_value(item, key_path):
     return value
 
 
+# ---------------------------------------------------------------------------
+# JSON mode — lookup builders
+# ---------------------------------------------------------------------------
+
 def create_journal_lookup(data):
     """
-    Build lookup dictionaries for JSON mode.
+    Build lookup dictionaries for JSON mode — journals.
 
     Primary key  : (normalised_title, journal_uuid)
-    Fallback key : normalised_title  (stripped of punctuation via _normalise)
+    Fallback key : normalised_title
 
     Args:
         data: List of journal objects from the JSON file
@@ -188,27 +226,59 @@ def create_journal_lookup(data):
     return lookup
 
 
-def create_log_lookup(data):
+def create_publisher_lookup(data):
+    """
+    Build a lookup dictionary for JSON mode — publishers.
+
+    Key  : normalised name (via _normalise)
+    Value: publisher object
+
+    Args:
+        data: List of publisher objects from the JSON file.
+              Each object must have at least 'uuid' and 'name'.
+
+    Returns:
+        dict mapping normalised name to publisher object
+    """
+    lookup = {}
+
+    for item in data:
+        name = item.get('name', '').strip()
+        if not name or not item.get('uuid'):
+            continue
+        key = _normalise(name)
+        if key not in lookup:   # first occurrence wins
+            lookup[key] = item
+
+    return lookup
+
+
+# ---------------------------------------------------------------------------
+# Log mode — lookup builder
+# ---------------------------------------------------------------------------
+
+def create_log_lookup(data, record_type):
     """
     Build a lookup dictionary for log mode.
 
-    Key  : normalised title (via _normalise)
+    Key  : normalised name (via _normalise)
     Value: uuid string
 
-    Only entries with success=True and type='journals' are included.
+    Only entries with success=True and type matching record_type are included.
 
     Args:
         data: List of log entry objects
+        record_type: 'journals' or 'publishers'
 
     Returns:
-        dict mapping normalised title to uuid
+        dict mapping normalised name to uuid
     """
     lookup = {}
 
     for entry in data:
         if not entry.get("success") or not entry.get("uuid"):
             continue
-        if entry.get("type") != "journals":
+        if entry.get("type") != record_type:
             continue
         name = entry.get("name", "")
         if name:
@@ -219,14 +289,23 @@ def create_log_lookup(data):
     return lookup
 
 
-def enrich_from_json(csv_file, json_file):
+# ---------------------------------------------------------------------------
+# JSON mode — main enrichment function
+# ---------------------------------------------------------------------------
+
+def enrich_from_json(csv_file, json_file, record_type):
     """
-    Enrich CSV columns with journal data from a JSON file.
-    Matches by (normalised title, journal_uuid); falls back to normalised title only.
+    Enrich CSV columns with data from a Pure JSON file.
+
+    Journals  : matches by (normalised title, journal_uuid) with title-only fallback;
+                writes journal_uuid, publisher_uuid, journal_title.
+    Publishers: matches by normalised name resolved from dc.publisher / publisher_name
+                (dc.publisher preferred); writes publisher_uuid only.
 
     Args:
         csv_file: Path to input CSV file
-        json_file: Path to JSON file
+        json_file: Path to JSON file (journals or publishers)
+        record_type: 'journals' or 'publishers'
 
     Returns:
         Path to output file
@@ -247,15 +326,21 @@ def enrich_from_json(csv_file, json_file):
     if isinstance(json_data, dict) and 'items' in json_data:
         json_data = json_data['items']
 
-    lookup = create_journal_lookup(json_data)
-    print(f"Loaded {len(json_data)} journals from {json_file}")
+    if record_type == 'journals':
+        lookup = create_journal_lookup(json_data)
+        mappings = JOURNAL_JSON_MAPPINGS
+        print(f"Loaded {len(json_data)} journals from {json_file}")
+    else:  # publishers
+        lookup = create_publisher_lookup(json_data)
+        mappings = PUBLISHER_JSON_MAPPINGS
+        print(f"Loaded {len(lookup)} publishers from {json_file}")
 
     try:
         with open(csv_file, 'r', encoding='utf-8') as infile:
             reader = csv.DictReader(infile)
             fieldnames = list(reader.fieldnames)
 
-            for csv_col in JSON_MAPPINGS:
+            for csv_col in mappings:
                 if csv_col not in fieldnames:
                     fieldnames.append(csv_col)
 
@@ -268,38 +353,46 @@ def enrich_from_json(csv_file, json_file):
                 matched = False
                 item = None
 
-                # Detect title and journal_uuid columns (case-insensitive)
-                title_col = None
-                journal_uuid_col = None
+                if record_type == 'journals':
+                    # Detect journal title and journal_uuid columns (case-insensitive)
+                    title_col = None
+                    journal_uuid_col = None
 
-                for col in row.keys():
-                    col_lower = col.lower()
-                    if 'journal' in col_lower and 'title' in col_lower:
-                        title_col = col
-                    elif 'title' in col_lower and not title_col:
-                        title_col = col
-                    if 'journal' in col_lower and 'uuid' in col_lower:
-                        journal_uuid_col = col
+                    for col in row.keys():
+                        col_lower = col.lower()
+                        if 'journal' in col_lower and 'title' in col_lower:
+                            title_col = col
+                        elif 'title' in col_lower and not title_col:
+                            title_col = col
+                        if 'journal' in col_lower and 'uuid' in col_lower:
+                            journal_uuid_col = col
 
-                if title_col and row.get(title_col):
-                    norm_title = _normalise(row[title_col])
-                    journal_uuid = row.get(journal_uuid_col, "").strip() if journal_uuid_col else None
+                    if title_col and row.get(title_col):
+                        norm_title = _normalise(row[title_col])
+                        journal_uuid = row.get(journal_uuid_col, "").strip() if journal_uuid_col else None
 
-                    # Primary: composite match (normalised title + journal_uuid)
-                    if journal_uuid:
-                        item = lookup.get((norm_title, journal_uuid))
-                        if item:
-                            matched = True
+                        # Primary: composite match (normalised title + journal_uuid)
+                        if journal_uuid:
+                            item = lookup.get((norm_title, journal_uuid))
+                            if item:
+                                matched = True
 
-                    # Fallback: normalised title only
-                    if not matched:
-                        item = lookup.get(norm_title)
+                        # Fallback: normalised title only
+                        if not matched:
+                            item = lookup.get(norm_title)
+                            if item:
+                                matched = True
+
+                else:  # publishers
+                    pub_name = _resolve_publisher_name(row)
+                    if pub_name:
+                        item = lookup.get(_normalise(pub_name))
                         if item:
                             matched = True
 
                 if matched and item:
                     has_update = False
-                    for csv_col, json_key in JSON_MAPPINGS.items():
+                    for csv_col, json_key in mappings.items():
                         value = extract_value(item, json_key)
                         if value is not None and value != "":
                             row[csv_col] = value
@@ -310,7 +403,7 @@ def enrich_from_json(csv_file, json_file):
                     if has_update:
                         updated += 1
                 else:
-                    for csv_col in JSON_MAPPINGS:
+                    for csv_col in mappings:
                         if csv_col not in row:
                             row[csv_col] = ""
                     no_matches += 1
@@ -324,10 +417,10 @@ def enrich_from_json(csv_file, json_file):
 
         total_rows = matches + no_matches
         print("\n" + "="*60)
-        print("ENRICHMENT STATISTICS (JSON MODE)")
+        print(f"ENRICHMENT STATISTICS (JSON MODE — {record_type.upper()})")
         print("="*60)
         print(f"Total rows in target file:  {total_rows}")
-        print(f"Rows with matching titles:  {matches}")
+        print(f"Rows with matching names:   {matches}")
         print(f"Rows updated with new data: {updated}")
         print(f"Rows not matched:           {no_matches}")
         print(f"\nMatch rate:  {matches/total_rows*100:.2f}%")
@@ -346,18 +439,31 @@ def enrich_from_json(csv_file, json_file):
         sys.exit(1)
 
 
-def enrich_from_log(csv_file, log_file):
+# ---------------------------------------------------------------------------
+# Log mode — main enrichment function
+# ---------------------------------------------------------------------------
+
+def enrich_from_log(csv_file, log_file, record_type):
     """
-    Enrich CSV with journal UUIDs taken from an uploader log JSON file.
-    Matches by normalised journal title. No publisher UUID is available in this mode.
+    Enrich CSV with UUIDs taken from an uploader log JSON file.
+
+    Journals  : matches by normalised journal title column.
+    Publishers: matches by normalised publisher name resolved from
+                dc.publisher / publisher_name (dc.publisher preferred).
+
+    The UUID is written to 'journal_uuid' or 'publisher_uuid' depending on
+    record_type.
 
     Args:
         csv_file: Path to input CSV file
         log_file: Path to uploader log JSON file
+        record_type: 'journals' or 'publishers'
 
     Returns:
         Path to output file
     """
+    uuid_column = LOG_UUID_COLUMN[record_type]
+
     directory = os.path.dirname(csv_file) or '.'
     output_file = os.path.join(directory, f"enriched_{os.path.basename(csv_file)}")
 
@@ -371,51 +477,50 @@ def enrich_from_log(csv_file, log_file):
         print(f"Error: Invalid JSON in '{log_file}': {e}")
         sys.exit(1)
 
-    lookup = create_log_lookup(log_data)
-    print(f"Loaded {len(lookup)} journal entries from log {log_file}")
+    lookup = create_log_lookup(log_data, record_type)
+    print(f"Loaded {len(lookup)} {record_type} entries from log {log_file}")
 
     try:
         with open(csv_file, 'r', encoding='utf-8') as infile:
             reader = csv.DictReader(infile)
             fieldnames = list(reader.fieldnames)
 
-            for csv_col in LOG_MAPPINGS:
-                if csv_col not in fieldnames:
-                    fieldnames.append(csv_col)
+            if uuid_column not in fieldnames:
+                fieldnames.append(uuid_column)
 
             rows = []
             matches = 0
             no_matches = 0
-            updated = 0
 
             for row in reader:
-                # Detect title column (case-insensitive)
-                title_col = None
-                for col in row.keys():
-                    col_lower = col.lower()
-                    if 'journal' in col_lower and 'title' in col_lower:
-                        title_col = col
-                        break
-                    elif 'title' in col_lower and not title_col:
-                        title_col = col
+                name_to_match = None
+
+                if record_type == 'journals':
+                    # Detect journal title column (case-insensitive)
+                    title_col = None
+                    for col in row.keys():
+                        col_lower = col.lower()
+                        if 'journal' in col_lower and 'title' in col_lower:
+                            title_col = col
+                            break
+                        elif 'title' in col_lower and not title_col:
+                            title_col = col
+                    if title_col:
+                        name_to_match = row.get(title_col, "").strip() or None
+                else:  # publishers
+                    name_to_match = _resolve_publisher_name(row)
 
                 matched = False
-                if title_col and row.get(title_col):
-                    norm_title = _normalise(row[title_col])
-                    uuid = lookup.get(norm_title)
+                if name_to_match:
+                    uuid = lookup.get(_normalise(name_to_match))
                     if uuid:
                         matched = True
-                        row["journal_uuid"] = uuid
-                        # journal_title: keep existing value; add column if absent
-                        if "journal_title" not in row:
-                            row["journal_title"] = row[title_col]
+                        row[uuid_column] = uuid
                         matches += 1
-                        updated += 1
 
                 if not matched:
-                    for csv_col in LOG_MAPPINGS:
-                        if csv_col not in row:
-                            row[csv_col] = ""
+                    if uuid_column not in row:
+                        row[uuid_column] = ""
                     no_matches += 1
 
                 rows.append(row)
@@ -427,14 +532,13 @@ def enrich_from_log(csv_file, log_file):
 
         total_rows = matches + no_matches
         print("\n" + "="*60)
-        print("ENRICHMENT STATISTICS (LOG MODE)")
+        print(f"ENRICHMENT STATISTICS (LOG MODE — {record_type.upper()})")
         print("="*60)
         print(f"Total rows in target file:  {total_rows}")
-        print(f"Rows with matching titles:  {matches}")
-        print(f"Rows updated with new data: {updated}")
+        print(f"Rows with matching names:   {matches}")
+        print(f"Rows updated ({uuid_column}): {matches}")
         print(f"Rows not matched:           {no_matches}")
         print(f"\nMatch rate:  {matches/total_rows*100:.2f}%")
-        print(f"Update rate: {updated/total_rows*100:.2f}%")
         print("="*60)
 
         return output_file
@@ -448,6 +552,10 @@ def enrich_from_log(csv_file, log_file):
         traceback.print_exc()
         sys.exit(1)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -462,14 +570,26 @@ MODES OF OPERATION:
    python enrich_csv.py target.csv source.csv --mode csv
 
 2. JSON mode (--mode json):
-   Matches by journal title against a JSON file and populates journal/publisher data.
+   Matches against a Pure JSON export and populates journal or publisher fields.
+   Requires --type to specify which record type to match.
 
-   python enrich_csv.py target.csv journals.json --mode json
+   python enrich_csv.py target.csv journals.json   --mode json --type journals
+   python enrich_csv.py target.csv publishers.json --mode json --type publishers
+
+   journals  : matches by journal title column; writes journal_uuid, publisher_uuid,
+               journal_title.
+   publishers: matches dc.publisher (falling back to publisher_name) against the
+               publisher name field; writes publisher_uuid.
 
 3. Log mode (--mode log):
-   Matches by journal title against an uploader log and populates journal_uuid only.
+   Matches against an uploader log and populates journal_uuid or publisher_uuid.
+   Requires --type to specify which record type to match.
 
-   python enrich_csv.py target.csv upload_log.json --mode log
+   python enrich_csv.py target.csv upload_log.json --mode log --type journals
+   python enrich_csv.py target.csv upload_log.json --mode log --type publishers
+
+   journals  : matches by journal title column.
+   publishers: matches dc.publisher (falling back to publisher_name).
 
 OUTPUT:
   All modes write 'enriched_<original_filename>' in the same directory as the target file.
@@ -477,11 +597,16 @@ OUTPUT:
     )
 
     parser.add_argument("target", help="Path to target DSpace CSV file to enrich")
-    parser.add_argument("source", help="Path to source CSV, Pure JSON, or uploaderlog file")
+    parser.add_argument("source", help="Path to source CSV, Pure JSON, or uploader log file")
     parser.add_argument("--mode", choices=['csv', 'json', 'log'], required=True,
                         help="Enrichment mode")
+    parser.add_argument("--type", choices=['journals', 'publishers'], dest="record_type",
+                        help="Record type (required when --mode json or --mode log)")
 
     args = parser.parse_args()
+
+    if args.mode in ('json', 'log') and not args.record_type:
+        parser.error(f"--type is required when --mode {args.mode}")
 
     if not Path(args.target).exists():
         print(f"Error: Target file not found: {args.target}")
@@ -495,9 +620,9 @@ OUTPUT:
         if args.mode == 'csv':
             output_path = enrich_from_csv(args.source, args.target)
         elif args.mode == 'json':
-            output_path = enrich_from_json(args.target, args.source)
+            output_path = enrich_from_json(args.target, args.source, args.record_type)
         else:  # log
-            output_path = enrich_from_log(args.target, args.source)
+            output_path = enrich_from_log(args.target, args.source, args.record_type)
 
         print(f"\n✓ Success! Enriched file saved to: {output_path}")
 
