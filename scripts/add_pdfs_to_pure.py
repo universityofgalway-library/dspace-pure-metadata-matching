@@ -635,6 +635,7 @@ def get_file_info(
 
     data = resp.json()
     first_file_id   = ""
+    first_file_pure_id = ""
     first_file_name = ""
     norm_expected   = pure_normalize_filename(expected_file_name) if expected_file_name else None
 
@@ -643,14 +644,16 @@ def get_file_info(
             continue
         file_obj  = ev.get("file", {})
         file_id   = file_obj.get("fileId", "")
+        file_pure_id = file_obj.get("pureId", "")
         file_name = file_obj.get("fileName", "")
         if not first_file_id and file_id:
             first_file_id   = file_id
+            first_file_pure_id = file_pure_id
             first_file_name = file_name
         if norm_expected and pure_normalize_filename(file_name) == norm_expected:
-            return file_id, file_name
+            return file_id, file_pure_id,file_name
 
-    return first_file_id, first_file_name
+    return first_file_id, first_file_pure_id, first_file_name
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +752,8 @@ def main():
     # surviving early termination or keyboard interrupt.
     MATCHED_REF_FIELDS = [
         "dspace_uuid", "pure_uuid", "pure_id", "title",
-        "dspace_file_id", "pure_file_id", "pure_file_name", "handle"
+        "dspace_file_id", "pure_file_id", "pure_file_pure_id", 
+        "pure_file_name", "handle"
             ]
     matched_ref_fh     = open(matched_ref_csv, "w", newline="", encoding="utf-8")
     matched_ref_writer = csv.DictWriter(
@@ -888,6 +892,7 @@ def main():
             "match_type":     None,
             "upload_key":     None,
             "pure_file_id":   None,
+            "pure_file_pure_id": None,
             "pure_file_name": None,
             "status":         None,
             "detail":         None,
@@ -1031,11 +1036,12 @@ def main():
                             entry["pure_id"] = pure_id
                             if success:
                                 print(f"    ✅ Metadata updated ({detail})")
-                                p_file_id, p_file_name = get_file_info(
+                                p_file_id, p_file_pure_id, p_file_name = get_file_info(
                                     session, base_url, pure_uuid,
                                     expected_file_name=matched_ev_name,
                                 )
                                 entry["pure_file_id"]   = p_file_id
+                                entry["pure_file_pure_id"] = p_file_pure_id
                                 entry["pure_file_name"] = p_file_name
                                 if p_file_id:
                                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
@@ -1066,6 +1072,7 @@ def main():
                             print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
                             if matching_ev:
                                 entry["pure_file_id"]   = matching_ev.get("file", {}).get("fileId", "")
+                                entry["pure_file_pure_id"] = matching_ev.get("file", {}).get("pureId", "") if matching_ev else ""
                                 entry["pure_file_name"] = matching_ev.get("file", {}).get("fileName", "")
                             counters["already_has_fev"] += 1
                             skipped_paths.append(safe_file_name)
@@ -1077,6 +1084,7 @@ def main():
                                 "title":          entry["title"],
                                 "dspace_file_id": single_path,
                                 "pure_file_id":   entry["pure_file_id"] or "",
+                                "pure_file_pure_id": entry["pure_file_pure_id"] or "",
                                 "pure_file_name": entry["pure_file_name"] or "",
                             })
                             matched_ref_fh.flush()
@@ -1140,11 +1148,12 @@ def main():
             if success:
                 print(f"    ✅ PUT succeeded ({detail})")
                 # GET the updated record to retrieve the assigned fileId/fileName
-                p_file_id, p_file_name = get_file_info(
+                p_file_id, p_file_pure_id, p_file_name = get_file_info(
                     session, base_url, pure_uuid,
                     expected_file_name=safe_file_name,
                 )
                 entry["pure_file_id"]   = p_file_id
+                entry["pure_file_pure_id"] = p_file_pure_id
                 entry["pure_file_name"] = p_file_name
                 if p_file_id:
                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
@@ -1159,6 +1168,7 @@ def main():
                     "title":          entry["title"],
                     "dspace_file_id": single_path,
                     "pure_file_id":   p_file_id,
+                    "pure_file_pure_id": p_file_pure_id,
                     "pure_file_name": p_file_name,
                 })
                 matched_ref_fh.flush()
@@ -1249,7 +1259,7 @@ def main():
     csv_fields = [
         "dspace_uuid", "title", "handle", "dspace_file_id", "pdf_url",
         "pure_uuid", "pure_id", "match_type", "upload_key",
-        "pure_file_id", "pure_file_name",
+        "pure_file_id", "pure_file_pure_id", "pure_file_name",
         "status", "detail", "timestamp",
     ]
 
