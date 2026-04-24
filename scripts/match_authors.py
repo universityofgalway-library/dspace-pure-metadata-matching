@@ -9,9 +9,9 @@ from datetime import date
 # --- CONFIGURATION ---
 TODAY = date.today().isoformat()
 
-DSpace_Authors_JSON = "./author_matching/dspace_prod_authors_2026-04-22.json"
+DSpace_Authors_JSON = "./author_matching/2026-04-22/missing_authors_2026-04-22.json"
 Pure_Internal_JSON = "./pure_entities/pure_persons_2026-04-22.json"
-Pure_External_JSON = "./pure_entities/pure_external-persons_2026-04-22.json"
+Pure_External_JSON = "./pure_entities/pure_external-persons_2026-04-24.json"
 IRISH_SURNAMES_JSON = "./author_matching/irish_surnames.json"  # New file with canonical Irish surnames and their variants   
 OUTPUT_DIR = f"./author_matching/{TODAY}"
 HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)

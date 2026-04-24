@@ -15,15 +15,18 @@ import os
 import pandas as pd
 from pathlib import Path
 
-# Mapping configuration for JSON mode — journals
+# Mapping configuration for JSON mode — journals.
+# Values are dot-notation paths into the journal JSON object.
+# All target columns are only written when the existing CSV cell is empty.
 JOURNAL_JSON_MAPPINGS = {
     "journal_uuid": "uuid",
     "publisher_uuid": "publisher.uuid",
     "journal_title": "titles.0.title",
 }
 
-# Mapping configuration for JSON mode — publishers
+# Mapping configuration for JSON mode — publishers.
 # Only publisher_uuid is written; publisher_name is left as-is in the CSV.
+# The target column is only written when the existing CSV cell is empty.
 PUBLISHER_JSON_MAPPINGS = {
     "publisher_uuid": "uuid",
 }
@@ -43,22 +46,15 @@ def _normalise(s: str) -> str:
 
 def _resolve_publisher_name(row: dict) -> str | None:
     """
-    Return the best available publisher name from a CSV row.
-
-    Preference order:
-      1. dc.publisher   (if non-empty)
-      2. publisher_name (if non-empty)
-      3. None
+    Return the publisher name from a CSV row (dc.publisher column only).
 
     Args:
         row: A csv.DictReader row dict
 
     Returns:
-        Publisher name string, or None if neither column has a value
+        Publisher name string, or None if the column is absent or empty
     """
-    dc = row.get("dc.publisher", "").strip()
-    pn = row.get("publisher_name", "").strip()
-    return dc if dc else (pn if pn else None)
+    return row.get("dc.publisher", "").strip() or None
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +294,10 @@ def enrich_from_json(csv_file, json_file, record_type):
     Enrich CSV columns with data from a Pure JSON file.
 
     Journals  : matches by (normalised title, journal_uuid) with title-only fallback;
-                writes journal_uuid, publisher_uuid, journal_title.
-    Publishers: matches by normalised name resolved from dc.publisher / publisher_name
-                (dc.publisher preferred); writes publisher_uuid only.
+                writes journal_uuid, journal_issn, publisher_uuid, journal_title —
+                but only into cells that are currently empty.
+    Publishers: matches by dc.publisher; writes publisher_uuid only, and only when
+                the cell is currently empty.
 
     Args:
         csv_file: Path to input CSV file
@@ -348,6 +345,7 @@ def enrich_from_json(csv_file, json_file, record_type):
             matches = 0
             no_matches = 0
             updated = 0
+            skipped = 0   # matched but all writable cells already had values
 
             for row in reader:
                 matched = False
@@ -393,16 +391,20 @@ def enrich_from_json(csv_file, json_file, record_type):
                 if matched and item:
                     has_update = False
                     for csv_col, json_key in mappings.items():
+                        # Only write into cells that are currently empty
+                        if row.get(csv_col, "").strip():
+                            continue
                         value = extract_value(item, json_key)
                         if value is not None and value != "":
                             row[csv_col] = value
                             has_update = True
-                        elif csv_col not in row:
-                            row[csv_col] = ""
                     matches += 1
                     if has_update:
                         updated += 1
+                    else:
+                        skipped += 1
                 else:
+                    # Ensure output columns exist in the row even when unmatched
                     for csv_col in mappings:
                         if csv_col not in row:
                             row[csv_col] = ""
@@ -420,8 +422,9 @@ def enrich_from_json(csv_file, json_file, record_type):
         print(f"ENRICHMENT STATISTICS (JSON MODE — {record_type.upper()})")
         print("="*60)
         print(f"Total rows in target file:  {total_rows}")
-        print(f"Rows with matching names:   {matches}")
+        print(f"Rows matched:               {matches}")
         print(f"Rows updated with new data: {updated}")
+        print(f"Rows already had values:    {skipped}")
         print(f"Rows not matched:           {no_matches}")
         print(f"\nMatch rate:  {matches/total_rows*100:.2f}%")
         print(f"Update rate: {updated/total_rows*100:.2f}%")
@@ -448,11 +451,10 @@ def enrich_from_log(csv_file, log_file, record_type):
     Enrich CSV with UUIDs taken from an uploader log JSON file.
 
     Journals  : matches by normalised journal title column.
-    Publishers: matches by normalised publisher name resolved from
-                dc.publisher / publisher_name (dc.publisher preferred).
+    Publishers: matches by dc.publisher.
 
     The UUID is written to 'journal_uuid' or 'publisher_uuid' depending on
-    record_type.
+    record_type, and only when that cell is currently empty.
 
     Args:
         csv_file: Path to input CSV file
@@ -489,7 +491,8 @@ def enrich_from_log(csv_file, log_file, record_type):
                 fieldnames.append(uuid_column)
 
             rows = []
-            matches = 0
+            matches = 0       # matched and written (cell was empty)
+            skipped = 0       # matched but cell already had a value
             no_matches = 0
 
             for row in reader:
@@ -515,8 +518,11 @@ def enrich_from_log(csv_file, log_file, record_type):
                     uuid = lookup.get(_normalise(name_to_match))
                     if uuid:
                         matched = True
-                        row[uuid_column] = uuid
-                        matches += 1
+                        if not row.get(uuid_column, "").strip():
+                            row[uuid_column] = uuid
+                            matches += 1
+                        else:
+                            skipped += 1
 
                 if not matched:
                     if uuid_column not in row:
@@ -530,15 +536,16 @@ def enrich_from_log(csv_file, log_file, record_type):
             writer.writeheader()
             writer.writerows(rows)
 
-        total_rows = matches + no_matches
+        total_rows = matches + skipped + no_matches
         print("\n" + "="*60)
         print(f"ENRICHMENT STATISTICS (LOG MODE — {record_type.upper()})")
         print("="*60)
-        print(f"Total rows in target file:  {total_rows}")
-        print(f"Rows with matching names:   {matches}")
+        print(f"Total rows in target file:     {total_rows}")
+        print(f"Rows matched:                  {matches + skipped}")
         print(f"Rows updated ({uuid_column}): {matches}")
-        print(f"Rows not matched:           {no_matches}")
-        print(f"\nMatch rate:  {matches/total_rows*100:.2f}%")
+        print(f"Rows already had value:        {skipped}")
+        print(f"Rows not matched:              {no_matches}")
+        print(f"\nMatch rate:  {(matches + skipped)/total_rows*100:.2f}%")
         print("="*60)
 
         return output_file
@@ -576,10 +583,9 @@ MODES OF OPERATION:
    python enrich_csv.py target.csv journals.json   --mode json --type journals
    python enrich_csv.py target.csv publishers.json --mode json --type publishers
 
-   journals  : matches by journal title column; writes journal_uuid, publisher_uuid,
-               journal_title.
-   publishers: matches dc.publisher (falling back to publisher_name) against the
-               publisher name field; writes publisher_uuid.
+   journals  : matches by journal title column; writes journal_uuid, journal_issn,
+               publisher_uuid, journal_title — only into empty cells.
+   publishers: matches by dc.publisher; writes publisher_uuid — only into empty cells.
 
 3. Log mode (--mode log):
    Matches against an uploader log and populates journal_uuid or publisher_uuid.
@@ -588,8 +594,8 @@ MODES OF OPERATION:
    python enrich_csv.py target.csv upload_log.json --mode log --type journals
    python enrich_csv.py target.csv upload_log.json --mode log --type publishers
 
-   journals  : matches by journal title column.
-   publishers: matches dc.publisher (falling back to publisher_name).
+   journals  : matches by journal title column; writes journal_uuid — only into empty cells.
+   publishers: matches by dc.publisher; writes publisher_uuid — only into empty cells.
 
 OUTPUT:
   All modes write 'enriched_<original_filename>' in the same directory as the target file.

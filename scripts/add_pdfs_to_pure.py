@@ -296,19 +296,16 @@ def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
 
 def build_pure_index(pure_items: list) -> dict:
     """
-    Returns a dict with keys: by_doi, by_repo_doi, by_handle, by_uuid
+    Returns a dict with keys: by_doi, by_repo_doi, by_handle, by_dspace_uuid
     Each maps a normalised key -> Pure record dict.
     """
-    by_doi      = {}
-    by_repo_doi = {}
-    by_handle   = {}
-    by_uuid     = {}
+    by_doi         = {}
+    by_repo_doi    = {}
+    by_handle      = {}
+    by_dspace_uuid = {}
 
     for item in pure_items:
-        uuid = item.get("uuid")
-        if uuid:
-            by_uuid[uuid] = item
-
+        # DSpace UUID stored in Pure's electronicVersions or links
         for ev in item.get("electronicVersions", []):
             doi = ev.get("doi", "")
             if doi:
@@ -331,30 +328,47 @@ def build_pure_index(pure_items: list) -> dict:
             elif url.startswith("https://doi.org/") or url.startswith("http://doi.org/"):
                 by_doi[normalize_doi(url)] = item
 
-    return {"by_doi": by_doi, "by_repo_doi": by_repo_doi,
-            "by_handle": by_handle, "by_uuid": by_uuid}
+        # Index by DSpace UUID from identifiers list
+        for id_entry in item.get("identifiers", []):
+            if id_entry.get("idSource", "") == "DSpace":
+                dspace_uuid = id_entry.get("value", "").strip()
+                if dspace_uuid:
+                    by_dspace_uuid[dspace_uuid] = item
+                break
+
+    return {
+        "by_doi":         by_doi,
+        "by_repo_doi":    by_repo_doi,
+        "by_handle":      by_handle,
+        "by_dspace_uuid": by_dspace_uuid,
+    }
 
 
 def find_pure_record(dspace_row: dict, pure_index: dict):
     """
     Try to match a DSpace row to a Pure record.
-    Priority: Publisher DOI -> Repository DOI -> Handle.
+    Priority: DSpace UUID -> Publisher DOI -> Repository DOI -> Handle.
     Returns (pure_record | None, match_type str | None)
     """
-    # 1. Publisher DOI
+    # 1. DSpace UUID
+    dspace_uuid = dspace_row.get("uuid", "").strip()
+    if dspace_uuid and dspace_uuid in pure_index["by_dspace_uuid"]:
+        return pure_index["by_dspace_uuid"][dspace_uuid], "DSpace UUID"
+
+    # 2. Publisher DOI
     pub_doi = dspace_row.get("dc.identifier.doi", "").strip()
     if pub_doi:
         ndoi = normalize_doi(pub_doi)
         if ndoi in pure_index["by_doi"]:
             return pure_index["by_doi"][ndoi], "Publisher DOI"
 
-    # 2. Repository DOI (from dc.identifier.uri)
+    # 3. Repository DOI (from dc.identifier.uri)
     for rdoi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
         nrdoi = normalize_doi(rdoi)
         if nrdoi in pure_index["by_repo_doi"]:
             return pure_index["by_repo_doi"][nrdoi], "Repository DOI"
 
-    # 3. Handle — prefer dedicated 'handle' column, then dc.identifier.uri
+    # 4. Handle — prefer dedicated 'handle' column, then dc.identifier.uri
     candidates = []
     handle_col = dspace_row.get("handle", "").strip()
     if handle_col:
@@ -746,9 +760,9 @@ def main():
     success_csv     = os.path.join(args.log_dir, f"success_{RUN_TS}.csv")
     failed_csv      = os.path.join(args.log_dir, f"failed_{RUN_TS}.csv")
     skipped_csv     = os.path.join(args.log_dir, f"skipped_{RUN_TS}.csv")
-    matched_ref_csv = os.path.join(args.log_dir, f"matched_records_{RUN_TS}.csv")
+    matched_ref_csv = os.path.join(args.log_dir, f"pdf_matched_records_{RUN_TS}.csv")
 
-    # Open matched_ref CSV immediately so rows are written as we go,
+    # Open matched_ref CSV for records with PDFs immediately so rows are written as we go,
     # surviving early termination or keyboard interrupt.
     MATCHED_REF_FIELDS = [
         "dspace_uuid", "pure_uuid", "pure_id", "title",
@@ -761,6 +775,19 @@ def main():
     )
     matched_ref_writer.writeheader()
     matched_ref_fh.flush()
+
+    # Open no_pdf_matched CSV for records without PDFsimmediately so rows are written as we go,
+    # surviving early termination or keyboard interrupt.
+    NO_PDF_MATCHED_FIELDS = [
+        "dspace_uuid", "pure_uuid", "pure_id", "title", "handle"
+    ]
+    no_pdf_matched_csv = os.path.join(args.log_dir, f"no_pdf_matched_records_{RUN_TS}.csv")
+    no_pdf_matched_fh     = open(no_pdf_matched_csv, "w", newline="", encoding="utf-8")
+    no_pdf_matched_writer = csv.DictWriter(
+        no_pdf_matched_fh, fieldnames=NO_PDF_MATCHED_FIELDS, extrasaction="ignore"
+    )
+    no_pdf_matched_writer.writeheader()
+    no_pdf_matched_fh.flush()
 
     logger     = RunLogger(run_log_path)
     sys.stdout = logger
@@ -811,10 +838,10 @@ def main():
     # ---- Build Pure index --------------------------------------------------
     print("Building Pure lookup index...")
     pure_index = build_pure_index(pure_items)
-    print(f"  by_doi      : {len(pure_index['by_doi'])} entries")
-    print(f"  by_repo_doi : {len(pure_index['by_repo_doi'])} entries")
-    print(f"  by_handle   : {len(pure_index['by_handle'])} entries")
-    print(f"  by_uuid     : {len(pure_index['by_uuid'])} entries\n")
+    print(f"  by_doi         : {len(pure_index['by_doi'])} entries")
+    print(f"  by_repo_doi    : {len(pure_index['by_repo_doi'])} entries")
+    print(f"  by_handle      : {len(pure_index['by_handle'])} entries")
+    print(f"  by_dspace_uuid : {len(pure_index['by_dspace_uuid'])} entries\n")
 
     # ---- Filter to rows with a PDF path ------------------------------------
     rows_in_publications = [
@@ -825,8 +852,32 @@ def main():
         r for r in rows_in_publications
         if r.get("pdf_handle_paths", "").strip()
     ]
+    rows_without_pdf = [
+        r for r in rows_in_publications
+        if not r.get("pdf_handle_paths", "").strip()
+    ]
     print(f"DSpace rows in Publications collection  : {len(rows_in_publications)} / {len(dspace_rows)}")
-    print(f"DSpace rows with pdf_handle_paths       : {len(rows_with_pdf)} / {len(rows_in_publications)}\n")
+    print(f"DSpace rows with pdf_handle_paths       : {len(rows_with_pdf)} / {len(rows_in_publications)}")
+    print(f"DSpace rows without pdf_handle_paths    : {len(rows_without_pdf)} / {len(rows_in_publications)}\n")
+
+    print("Matching no-PDF rows to Pure records...")
+    for row in rows_without_pdf:
+        pure_record, match_type = find_pure_record(row, pure_index)
+        if pure_record is None:
+            continue
+        handle_str = row.get("handle", "").strip()
+        if not handle_str:
+            uri_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+            handle_str  = uri_handles[0] if uri_handles else ""
+        no_pdf_matched_writer.writerow({
+            "dspace_uuid": row.get("uuid", "").strip(),
+            "pure_uuid":   pure_record.get("uuid", ""),
+            "pure_id":     str(pure_record.get("pureId", "")),
+            "title":       row.get("dc.title", "").strip(),
+            "handle":      f"https://hdl.handle.net/{handle_str}" if handle_str and not handle_str.startswith("http") else handle_str,
+        })
+    no_pdf_matched_fh.flush()
+    print(f"✅ No-PDF matched records written to: {no_pdf_matched_csv}\n")
 
     # ---- Session -----------------------------------------------------------
     session = requests.Session()
@@ -1230,6 +1281,7 @@ def main():
 
     # ---- Summary & logs ----------------------------------------------------
     matched_ref_fh.close()   # flush and close the continuously-written CSV
+    no_pdf_matched_fh.close()
 
     elapsed = time.time() - start_time
     h, rem  = divmod(int(elapsed), 3600)
@@ -1253,7 +1305,8 @@ def main():
     write_json_log(results, results_json)
     print(f"\n  Full log     : {run_log_path}")
     print(f"  Results JSON : {results_json}")
-    print(f"  Matched refs : {matched_ref_csv}")
+    print(f"  Matched records with PDFs : {matched_ref_csv}")
+    print(f"  Matched records without PDFs : {no_pdf_matched_csv}")
 
     # All-columns CSV fields (used for success / failed / skipped CSVs)
     csv_fields = [

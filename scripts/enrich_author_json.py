@@ -14,7 +14,7 @@ def build_log_lookup(log_data: list, entity_type: str) -> dict:
     for entry in log_data:
         if not entry.get("success") or not entry.get("uuid"):
             continue
-        if entry.get("type") != entity_type:
+        if entry.get("data") != entity_type:
             continue
         name = entry.get("name", "")
         if name:

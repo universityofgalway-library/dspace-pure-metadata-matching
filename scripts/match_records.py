@@ -26,28 +26,44 @@ TODAY = date.today().isoformat()
 # attached anywhere (external authors are still linked via their externalPerson UUID).
 COLLECT_EXTERNAL_ORGS = False
 
-# If True, PDFs downloaded from DSpace will be saved to disk locally as well as uploaded to Pure
-SAVE_PDFS_LOCALLY = False
-LOCAL_PDF_SAVE_DIR = "./downloaded_dspace_pdfs"  # Only used if SAVE_PDFS_LOCALLY is True
-
-# If True, FileElectronicVersions will be created and attached to records
-ADD_FILE_ELECTRONIC_VERSIONS = False
-
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-# DSPACE_CSV = "./dspace_data/test_samples/dspace_test_sample_2026-04-20.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv"
-PURE_JSON = "./pure_research_outputs/pure_test_research-outputs_2026-04-21.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-02-26/updated_merged_all_authors_2026-02-26.json"
-ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-03-02.json"
-OUTPUT_DIR = f"./record_matching/test_output_{TODAY}"
+DSPACE_CSV = "./dspace_data/prod_samples/dspace_prod_remains_2026-04-24.csv"
+# DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_all_items_with_collection_uuids_pdfs_20260422.csv"
+PURE_JSON = "./pure_research_outputs/pure_research-outputs_2026-04-24.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-04-22/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-23.json"
+OUTPUT_DIR = f"./record_matching/prod_remains_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 NO_AUTHOR_CSV = os.path.join(OUTPUT_DIR, f"no_author_records_{TODAY}.csv")
-FAULTY_PDF_CSV = os.path.join(OUTPUT_DIR, f"faulty_pdf_records_{TODAY}.csv")
 
-USE_TEST_ENV = True  # Set to False to use production environment
+USE_TEST_ENV = False  # Set to False to use production environment
+
+ORG_CONFIG_PATH = (
+    "./scripts/test_orgs_config.json"
+    if USE_TEST_ENV else
+    "./scripts/prod_orgs_config.json"
+)
+
+try:
+    with open(ORG_CONFIG_PATH, 'r', encoding='utf-8') as f:
+        _org_config = json.load(f)
+except FileNotFoundError:
+    print(f"❌ ERROR: Organisation config file not found: {ORG_CONFIG_PATH}")
+    print(f"   Please create this file before running the script.")
+    print(f"   Expected keys: LIBRARY_REPOSITORY, CENTRAL_UNIVERSITY, EXTERNAL_ORGS_TO_IGNORE")
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"❌ ERROR: Organisation config file is not valid JSON: {ORG_CONFIG_PATH}")
+    print(f"   JSON error: {e}")
+    sys.exit(1)
+
+EXTERNAL_ORGS_TO_IGNORE = set(_org_config["EXTERNAL_ORGS_TO_IGNORE"])
+CENTRAL_UNIVERSITY_ORGS = set(_org_config["CENTRAL_UNIVERSITY"])
+LIBRARY_REPOSITORY_UUID = _org_config["LIBRARY_REPOSITORY"]
 
 API_KEY = os.getenv("PURE_ROOT_API_KEY_TEST", "") if USE_TEST_ENV else os.getenv("PURE_ROOT_API_KEY", "")
 BASE_URL = (
@@ -55,13 +71,6 @@ BASE_URL = (
     if USE_TEST_ENV else
     "https://research.universityofgalway.ie/ws/api/"
 )
-
-DSPACE_BITSTREAM_BASE = (
-    "https://galway.dspace7-test.openrepository.com/bitstreams"
-    if USE_TEST_ENV else
-    "https://researchrepository.universityofgalway.ie/bitstreams"
-)
-PURE_FILE_UPLOAD_URL = f"{BASE_URL}research-outputs/file-uploads"
 
 DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
@@ -92,40 +101,6 @@ dspace_pure_subtype_map = {
     "data management plan": "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other",
 }
 
-EXTERNAL_ORGS_TO_IGNORE = [
-    "c3dd2704-6c2e-4b9c-861d-6c9959c9a612",    # "University of Galway" 
-    "4f1dc9e7-a654-4b84-8704-efeab9d69875",    # "University of Galway" 
-    "688759fc-d6e2-41a2-aef7-49fb5d228634",    # "Univbersity of Galway" 
-    "8f6fd722-2dc6-4cd1-8568-e232088b8f24",    # "NUI Galway" 
-    "d43008f7-0efa-41ce-9a28-c4aba2a335c5",    # "NUI Galway" 
-    "d40f2787-74f3-4b63-8151-89abc1919538",    # "NUI Galway" 
-    "67e06257-a759-43e2-877e-ad1a7846e711",    # "National University of Ireland Galway " 
-    "5c0ba446-1322-4287-9bfb-cdfe607c606e",    # "National University of Ireland Galway" 
-    "18c76cc4-daaf-49c4-9867-7b0837b4a95b",    # "National University of Ireland ¡V Galway" 
-    "132c1680-5865-48ae-89c8-bd278d99832b",    # "National University of Ireland – Galway" 
-    "5c091814-92d4-4b6f-b50e-816725f105f8",    # "National University of Ireland, Galway " 
-    "cdc9d89f-b737-47ef-8cce-88fb619d1438",    # "National University of Ireland, Galway" 
-    "3d1d93ed-6e42-4cd0-af67-100c6d87a1a1",    # "National University of Ireland Galway." 
-    "3c5b13f5-1f04-494b-be48-c67eacd43dcf",    # "National university of Ireland Galway, Ireland " 
-    "0f02b3d9-dbf1-4970-9927-876ec82f895e",    # "National University of Ireland Galway, Ireland" 
-    "bccbb32b-8a4b-471f-a2ba-3a836479a0e7",    # "National University of Ireland Galway (Ireland)" 
-    "ed37f922-87e1-49d3-a30a-ac63d0322a87",    # "National University of Ireland, Galway." 
-    "684d8f18-0a1b-47cc-88b6-4fc50e8cc1cd",    # "National University of Ireland, Galway, Ireland" 
-    "05dd5c35-3f2a-4c17-b45e-b3ee2dffffed",    # "National University of Ireland, Galway, Galway, Ireland" 
-    "63da70e1-005a-45a6-a4d5-1cb161b5b72e",    # "National University of Ireland, Galway\t" 
-    "9e8c03cb-cfc3-4a91-aeb9-f65dd03dc42d",    # "National University of Ireland, Galway / UCG" 
-    "9ab586e4-be82-418b-9056-444f2b71faa0",    # "National University of Ireland, Galway (NUIG)" 
-    "44cc3e64-03d8-43c5-81fc-d712f335642b",    # "National University of Ireland, Galway (formerly University College Galway)" 
-    "3c493970-03e5-4670-b223-facf3a94dc2e",    # "National University of Ireland, Galway  " 
-    "689a3221-88fd-4d2e-8c20-74aeb22eb5ec",    # "National University of Ireland-Galway" 
-    "f026cf31-52e3-4aa3-a609-54a50ddd962b",    # "National University of Ireland—Galway" 
-    "0dc1af88-f709-4304-8a44-ad3178e1edb2",    # "National University of Ireland Galway College" 
-    "78363204-c24b-4e1c-a3e0-1e80614c1978",    # "National University of Ireland‐Galway" 
-    "6d370e14-c9b6-4749-8680-6d513e02976b",    # "National University of Ireland Galway (NUI Galway)" 
-    "3b995820-9623-4914-b158-2f2a217d20ec",    # "National University of Ireland"
-    "6d415501-0899-44ae-aac3-258f31cd1b03",    # "National University of Ireland"
-    "0aa5ccc1-a672-42ce-b262-fd01b3c54f5c"     # "National University of Ireland"
-]
 
 SYSTEM_FIELDS_TO_EXCLUDE = {
     "createdBy",
@@ -154,14 +129,82 @@ SYSTEM_FIELDS = {
 }
 
 LANG_MAP = {
-        "eng": "en_IE",
-        "fre": "fr_FR",
-        "fra": "fr_FR",
-        "ger": "de_DE",
-        "spa": "es_ES",
-        "gle": "ga"
-        # Add more as needed
-    }
+    "eng": "en_IE",
+    "fre": "fr_FR",
+    "fra": "fr_FR",
+    "ger": "de_DE",
+    "deu": "de_DE",
+    "spa": "es_ES",
+    # Celtic
+    "gle": "ga",
+    "wel": "cy_GB",  # Welsh
+    "cym": "cy_GB",  # Welsh (alternative code)
+    "bre": "br_FR",  # Breton
+    "cor": "kw_GB",  # Cornish
+    "gla": "gd_GB",  # Scottish Gaelic
+    "sga": "ga",     # Old Irish
+    "mga": "ga",     # Middle Irish
+    # Germanic
+    "dut": "nl_NL",
+    "nld": "nl_NL",
+    "por": "pt_PT",
+    "ita": "it_IT",
+    "swe": "sv_SE",
+    "nor": "nb_NO",
+    "nob": "nb_NO",
+    "nno": "nn_NO",
+    "dan": "da_DK",
+    "fin": "fi_FI",
+    "isl": "is_IS",
+    # Slavic
+    "rus": "ru_RU",
+    "pol": "pl_PL",
+    "ces": "cs_CZ",
+    "cze": "cs_CZ",
+    "slk": "sk_SK",
+    "slo": "sk_SK",
+    "hrv": "hr_HR",
+    "srp": "sr_RS",
+    "bul": "bg_BG",
+    "ukr": "uk_UA",
+    "bel": "be_BY",
+    "slv": "sl_SI",
+    "mkd": "mk_MK",
+    # Asian
+    "zho": "zh_CN",
+    "chi": "zh_CN",
+    "jpn": "ja_JP",
+    "kor": "ko_KR",
+    "hin": "hi_IN",
+    "ara": "ar_SA",
+    "tur": "tr_TR",
+    "vie": "vi_VN",
+    "tha": "th_TH",
+    "ind": "id_ID",
+    "msa": "ms_MY",
+    "may": "ms_MY",
+    "fas": "fa_IR",
+    "per": "fa_IR",
+    "heb": "he_IL",
+    "urd": "ur_PK",
+    "ben": "bn_BD",
+    # Other European
+    "cat": "ca_ES",
+    "eus": "eu_ES",
+    "glg": "gl_ES",
+    "ron": "ro_RO",
+    "rum": "ro_RO",
+    "hun": "hu_HU",
+    "ell": "el_GR",
+    "gre": "el_GR",
+    "lat": "la",
+    "lav": "lv_LV",
+    "lit": "lt_LT",
+    "est": "et_EE",
+    "afr": "af_ZA",
+    "sqi": "sq_AL",
+    "alb": "sq_AL",
+}
 
 LICENSE_MAP = {
     "CC BY-NC-ND":       "cc_by_nc_nd",
@@ -188,7 +231,7 @@ _org_validation_cache = {}
 
 _unmatched_contributors = []
 _unmatched_funders = []
-_faulty_pdf_records = []
+_unmatched_publishers = []
 
 # --- LOGGER SETUP --- #
 
@@ -267,12 +310,21 @@ def normalize(s):
     return s.strip().lower() if s else ""
 
 
-def normalize_funder_name(s):
-    """Normalize funder name: lowercase, replace punctuation with spaces, collapse whitespace."""
+def normalize_for_comparison(s):
+    """Lowercase, replace punctuation with spaces, collapse whitespace."""
     if not s:
         return ""
     result = "".join(" " if char in PUNC else char for char in s.lower())
-    return " ".join(result.split())  # collapse multiple spaces
+    return " ".join(result.split())
+
+
+def sanitize_abstract(abstract: str) -> str:
+    """Return empty string if abstract is a placeholder, otherwise return as-is."""
+    if not abstract:
+        return ""
+    if abstract.strip().lower() == "[no abstract available]":
+        return ""
+    return abstract
 
 
 def map_language(lang, lang_map=LANG_MAP):
@@ -331,7 +383,7 @@ def build_title_token_index(pure_items):
         subtitle = item.get("subTitle", {}).get("value", "")
         combined = f"{title} {subtitle}".strip()
         tokens = {
-            w for w in normalize(combined).split()
+            w for w in normalize_for_comparison(combined).split()
             if len(w) > 3 and w not in STOP_WORDS
         }
         for token in tokens:
@@ -351,7 +403,7 @@ def find_fuzzy_title_candidates(dspace_title, dspace_subtitle, token_index, pure
     }
     combined = f"{dspace_title} {dspace_subtitle}".strip()
     tokens = {
-        w for w in normalize(combined).split()
+        w for w in normalize_for_comparison(combined).split()
         if len(w) > 3 and w not in STOP_WORDS
     }
 
@@ -430,7 +482,7 @@ def calculate_title_similarity(dspace_title, dspace_subtitle, pure_title, pure_s
     def _sim(t1, t2):
         if not t1 or not t2:
             return 0.0
-        t1n, t2n = normalize(t1), normalize(t2)
+        t1n, t2n = normalize_for_comparison(t1), normalize_for_comparison(t2)
         if t1n == t2n:
             return 1.0
         max_len = max(len(t1n), len(t2n))
@@ -1221,9 +1273,13 @@ def resolve_embargo_and_access(dspace_row):
             embargo_date_iso = candidate
             embargo_active   = True
 
-    if not embargo_active and embargo_desc and embargo_desc > TODAY:
-        embargo_date_iso = embargo_desc
-        embargo_active   = True
+    if not embargo_active and embargo_desc:
+        year, month, day = parse_date(embargo_desc)
+        candidate = f"{year:04d}-{month:02d}-{day:02d}"
+        if candidate > TODAY:
+            embargo_date_iso = candidate
+            embargo_active   = True
+
 
     access_uri = (
         "/dk/atira/pure/core/openaccesspermission/embargoed"
@@ -1234,125 +1290,6 @@ def resolve_embargo_and_access(dspace_row):
 
     return embargo_date_iso, embargo_active, access_uri, embargo_period
 
-
-def upload_pdf_electronic_version(dspace_row):
-    # Respect global config — skip entirely if file EVs are disabled
-    if not ADD_FILE_ELECTRONIC_VERSIONS:
-        return None
-
-    pdf_path = dspace_row.get("pdf_handle_paths", "").strip()
-    if not pdf_path:
-        return None
-
-    dspace_uuid  = dspace_row.get("uuid", "").strip()
-    title        = dspace_row.get("dc.title", "").strip()
-    handle_str   = dspace_row.get("handle", "").strip()
-    full_pdf_url = f"{DSPACE_BITSTREAM_BASE}{pdf_path}"
-    file_name    = pdf_path.rstrip("/").split("/")[-1]
-
-    print(f"  📎 Uploading PDF: {full_pdf_url}")
-
-    try:
-        src_response = requests.get(full_pdf_url, stream=True, timeout=60)
-        if src_response.status_code != 200:
-            msg = (f"  ❌ PDF download failed (HTTP {src_response.status_code}): "
-                   f"{full_pdf_url}")
-            print(msg)
-            _faulty_pdf_records.append({
-                "uuid":          dspace_uuid,
-                "title":         title,
-                "handle":        handle_str,
-                "full_pdf_path": full_pdf_url,
-            })
-            return None
-
-        # Optionally save PDF to disk before streaming to Pure
-        if SAVE_PDFS_LOCALLY:
-            os.makedirs(LOCAL_PDF_SAVE_DIR, exist_ok=True)
-            local_path = os.path.join(LOCAL_PDF_SAVE_DIR, file_name)
-            with open(local_path, "wb") as pdf_file:
-                for chunk in src_response.iter_content(chunk_size=8192):
-                    pdf_file.write(chunk)
-            print(f"  💾 PDF saved locally to: {local_path}")
-            # Re-open for streaming to Pure
-            upload_content = open(local_path, "rb")
-        else:
-            upload_content = src_response.iter_content(chunk_size=8192)
-
-        upload_response = requests.put(
-            PURE_FILE_UPLOAD_URL,
-            data=upload_content,
-            headers={
-                "accept":       "application/json",
-                "api-key":      API_KEY,
-                "content-type": "*/*",
-            },
-            timeout=120,
-        )
-
-        if SAVE_PDFS_LOCALLY and hasattr(upload_content, "close"):
-            upload_content.close()
-
-    except requests.RequestException as exc:
-        print(f"  ❌ PDF upload request error: {exc}")
-        _faulty_pdf_records.append({
-            "uuid":          dspace_uuid,
-            "title":         title,
-            "handle":        handle_str,
-            "full_pdf_path": full_pdf_url,
-        })
-        return None
-
-    if upload_response.status_code not in (200, 201):
-        print(f"  ❌ Pure file-upload failed (HTTP {upload_response.status_code}): "
-              f"{upload_response.text[:200]}")
-        _faulty_pdf_records.append({
-            "uuid":          dspace_uuid,
-            "title":         title,
-            "handle":        handle_str,
-            "full_pdf_path": full_pdf_url,
-        })
-        return None
-
-    try:
-        upload_data = upload_response.json()
-    except ValueError:
-        print(f"  ❌ Could not parse Pure file-upload response as JSON")
-        _faulty_pdf_records.append({
-            "uuid":          dspace_uuid,
-            "title":         title,
-            "handle":        handle_str,
-            "full_pdf_path": full_pdf_url,
-        })
-        return None
-
-    print(f"  ✅ PDF uploaded successfully. Key: {upload_data.get('key')}")
-
-    license_uri                                    = resolve_license_uri(dspace_row.get("dc.rights", ""))
-    _, _, access_uri, embargo_period               = resolve_embargo_and_access(dspace_row)
-
-    file_ev = {
-        "typeDiscriminator": "FileElectronicVersion",
-        "accessType":  {"uri": access_uri},
-        "licenseType": {"uri": license_uri},
-        "file": {
-            "fileName": file_name,
-            "mimeType": upload_data.get("mimeType", "*/*"),
-            "size":     upload_data.get("size", 0),
-            "uploadedFile": {
-                "digest":     upload_data.get("digest"),
-                "digestType": upload_data.get("digestType"),
-                "mimeType":   upload_data.get("mimeType", "*/*"),
-                "size":       upload_data.get("size", 0),
-                "key":        upload_data.get("key"),
-            },
-        },
-    }
-
-    if embargo_period:
-        file_ev["embargoPeriod"] = embargo_period
-
-    return file_ev
 
 
 def build_link(url, alias="", description=""):
@@ -1549,6 +1486,20 @@ def validate_and_fix_organizations(contributors, api_key, base_url, collect_exte
     return updated_contributors
 
 
+def resolve_managing_organization(first_internal_org_uuid):
+    """
+    Return the UUID to use as managingOrganization.
+    If the first internal author's org is a Central University org,
+    fall back to the Library Repository instead.
+    """
+    if not first_internal_org_uuid:
+        return LIBRARY_REPOSITORY_UUID
+    if first_internal_org_uuid in CENTRAL_UNIVERSITY_ORGS:
+        print(f"  ℹ️ Primary org {first_internal_org_uuid} is Central University — using Library Repository instead")
+        return LIBRARY_REPOSITORY_UUID
+    return first_internal_org_uuid
+
+
 def resolve_funder_duplicate(matches, api_key, base_url):
     """
     Resolve duplicate organization matches for funders.
@@ -1595,7 +1546,7 @@ def build_organization_name_index(organization_mapping):
     for org in organization_mapping:
         org_names = org.get("name", [])
         for org_name in org_names:
-            normalized = normalize_funder_name(org_name)
+            normalized = normalize_for_comparison(org_name)
             if normalized not in org_index:
                 org_index[normalized] = []
             org_index[normalized].append(org)
@@ -1605,7 +1556,7 @@ def build_organization_name_index(organization_mapping):
 
 def find_funder_match(funder_name, org_index):
     """Find matching organization using pre-built index"""
-    normalized_name = normalize_funder_name(funder_name)
+    normalized_name = normalize_for_comparison(funder_name)
     return org_index.get(normalized_name, [])
 
 
@@ -1643,12 +1594,28 @@ def build_funding_organizations(funder_uuids_with_type):
     return funding_details
 
 
+def build_publisher_name_index(publisher_mapping):
+    """Build index for O(1) publisher name lookup"""
+    pub_index = {}
+    for pub in publisher_mapping:
+        name = pub.get("name", "")
+        if name:
+            normalized = normalize_for_comparison(name)
+            if normalized not in pub_index:
+                pub_index[normalized] = []
+            pub_index[normalized].append(pub)
+    return pub_index
+
+
+def find_publisher_match(publisher_name, pub_index):
+    """Find matching publisher using pre-built index"""
+    if not publisher_name:
+        return []
+    normalized = normalize_for_comparison(publisher_name)
+    return pub_index.get(normalized, [])
+
+
 def append_record_to_file(filepath, new_record):
-    """
-    Append new_record to a JSON array file, deduplicating by uuid.
-    If the file does not exist it is created. Re-running is idempotent:
-    a record with the same uuid as an existing entry replaces it.
-    """
     existing = []
     if os.path.exists(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
@@ -1658,14 +1625,37 @@ def append_record_to_file(filepath, new_record):
                 print(f"  ⚠️ Could not parse existing file {filepath} — starting fresh.")
                 existing = []
 
-    # Build a dict keyed by uuid for O(1) dedup; preserve insertion order
-    records_by_uuid = {r.get("uuid"): r for r in existing}
     record_uuid = new_record.get("uuid")
 
-    if record_uuid and record_uuid in records_by_uuid:
-        print(f"  ℹ️ uuid {record_uuid} already in {os.path.basename(filepath)} — replacing.")
+    # For new records without a Pure UUID, use the DSpace identifier as the dedup key
+    if record_uuid:
+        dedup_key = record_uuid
+    else:
+        dspace_id = next(
+            (i.get("value") for i in new_record.get("identifiers", [])
+             if i.get("idSource") == "DSpace"),
+            None
+        )
+        handle = next(
+            (l.get("url") for l in new_record.get("links", [])
+             if "hdl.handle.net" in l.get("url", "")),
+            None
+        )
+        dedup_key = dspace_id or handle or id(new_record)  # id() as last resort
 
-    records_by_uuid[record_uuid] = new_record
+    records_by_uuid = {
+        (r.get("uuid") or next(
+            (i.get("value") for i in r.get("identifiers", []) if i.get("idSource") == "DSpace"), None
+        ) or next(
+            (l.get("url") for l in r.get("links", []) if "hdl.handle.net" in l.get("url", "")), None
+        )): r
+        for r in existing
+    }
+
+    if dedup_key in records_by_uuid:
+        print(f"  ℹ️ Record {dedup_key} already in {os.path.basename(filepath)} — replacing.")
+
+    records_by_uuid[dedup_key] = new_record
 
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(list(records_by_uuid.values()), f, indent=2, ensure_ascii=False)
@@ -1673,7 +1663,7 @@ def append_record_to_file(filepath, new_record):
 
 # --- UPDATING RECORDS ---
 
-def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, override_mode=False):
+def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, pub_index=None, override_mode=False):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -1787,32 +1777,19 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     break
 
     if override_mode:
-        if first_internal_org_uuid:
-            updated_record["managingOrganization"] = {
-                "uuid": first_internal_org_uuid,
-                "systemName": "Organization"
-            }
-            print(f"  ✅ Override: Set managingOrganization to: {first_internal_org_uuid}")
-        else:
-            updated_record["managingOrganization"] = {
-                "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b",
-                "systemName": "Organization"
-            }
-            print(f"  ✅ Override: Set managingOrganization to Library Repository (no internal authors)")
+        managing_org_uuid = resolve_managing_organization(first_internal_org_uuid)
+        updated_record["managingOrganization"] = {
+            "uuid": managing_org_uuid,
+            "systemName": "Organization"
+        }
+        print(f"  ✅ Override: Set managingOrganization to: {managing_org_uuid}")
     elif not pure_record.get("managingOrganization", {}).get("uuid"):
-        if first_internal_org_uuid:
-            updated_record["managingOrganization"] = {
-                "uuid": first_internal_org_uuid,
-                "systemName": "Organization"
-            }
-            print(f"  ✅ Precedence: Set managingOrganization to: {first_internal_org_uuid}")
-        else:
-            updated_record["managingOrganization"] = {
-                    "uuid": "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
-#                   "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
-                "systemName": "Organization"
-            }
-            print(f"  ✅ Precedence: Set managingOrganization to Library Repository (no internal authors)")
+        managing_org_uuid = resolve_managing_organization(first_internal_org_uuid)
+        updated_record["managingOrganization"] = {
+            "uuid": managing_org_uuid,
+            "systemName": "Organization"
+        }
+        print(f"  ✅ Precedence: Set managingOrganization to: {managing_org_uuid}")
 
     # --- 1c. Remove author keyword group if all DSpace authors are now matched ---
     if final_contributors:
@@ -2081,12 +2058,6 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             ev["doi"] = normalize_doi(ev["doi"])
         final_evs.append(ev)
 
-    # --- 5f. Upload PDF as FileElectronicVersion (append last) ---
-    file_ev = upload_pdf_electronic_version(dspace_row)
-    if file_ev:
-        final_evs.append(file_ev)
-        print(f"  ✅ FileElectronicVersion added: {file_ev['file']['fileName']}")
-
     # Only update if changed
     if final_evs != existing_evs:
         updated_record["electronicVersions"] = final_evs
@@ -2168,7 +2139,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         }
 
     # --- 7. Abstract (dc.description.abstract) > fill if blank ---
-    abstract = dspace_row.get("dc.description.abstract", "").strip()
+    abstract = sanitize_abstract(dspace_row.get("dc.description.abstract", "").strip())
     if abstract and (not has_text_in_any_language(pure_record, "abstract") or override_mode):
         if lang_code == "ga":
             # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
@@ -2240,7 +2211,31 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         updated_record["identifiers"] = merge_identifiers(existing_identifiers, dspace_uuid)
     else:
         print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
-    # --- 11. Set workflow step ---
+    
+    # --- 11. Publisher (dc.publisher) > inject for BookAnthology / ContributionToBookAnthology ---
+    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology"}
+    if pub_index and pure_type in PUBLISHER_TYPES:
+        dspace_publisher = dspace_row.get("dc.publisher", "").strip()
+        existing_publisher_uuid = pure_record.get("publisher", {}).get("uuid") if pure_record.get("publisher") else None
+        if dspace_publisher and (not existing_publisher_uuid or override_mode):
+            matches = find_publisher_match(dspace_publisher, pub_index)
+            if matches:
+                matched_pub = matches[0]  # take first — names are unique enough
+                updated_record["publisher"] = {
+                    "uuid": matched_pub["uuid"],
+                    "systemName": "Publisher"
+                }
+                print(f"  ✅ Set publisher: '{dspace_publisher}' → {matched_pub['uuid']}")
+            else:
+                print(f"  ⚠️ No publisher match found for: '{dspace_publisher}'")
+                _unmatched_publishers.append({
+                    "name": dspace_publisher,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": pure_record.get("uuid")
+                })
+
+    # --- 12. Set workflow step ---
     updated_record["workflow"] = {
         "step": "validated"
     }
@@ -2257,7 +2252,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
 # --- CREATING RECORDS ---
 
-def create_new_record_from_dspace(dspace_row, person_index, org_index):
+def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index=None):
     """Create new Pure record from DSpace row"""
     
     record = {
@@ -2272,8 +2267,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
             "uri": "/dk/atira/pure/core/languages/en_IE"
         },
         "managingOrganization": {
-            "uuid":  "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
-#            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
+            "uuid":  LIBRARY_REPOSITORY_UUID,
             "systemName": "Organization"
             }, 
         "visibility": {
@@ -2339,7 +2333,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         }
 
     # Set abstract
-    abstract = dspace_row.get("dc.description.abstract", "").strip()
+    abstract = sanitize_abstract(dspace_row.get("dc.description.abstract", "").strip())
     if abstract:
         if lang_code == "ga":
             # Workaround: set both en_IE and ga versions to same abstract yo display abstracts in Irish
@@ -2499,19 +2493,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
                 if first_internal_org_uuid:
                     break
 
-    if first_internal_org_uuid:
-        record["managingOrganization"] = {
-            "uuid": first_internal_org_uuid,
-            "systemName": "Organization"
-        }
-        print(f"✅ Set managingOrganization to: {first_internal_org_uuid}")
-    else:
-        record["managingOrganization"] = {
-            "uuid": "cb47638d-8856-42a9-a3ae-2f8e8f90c7ad", # PROD
-#            "uuid": "a57f818f-e41c-443e-8bea-5183a9c54a6b", # UAT
-            "systemName": "Organization"
-        }
-        print(f"✅ Set managingOrganization to Library Repository (no internal authors)")
+    managing_org_uuid = resolve_managing_organization(first_internal_org_uuid)
+    record["managingOrganization"] = {
+        "uuid": managing_org_uuid,
+        "systemName": "Organization"
+    }
+    print(f"✅ Set managingOrganization to: {managing_org_uuid}")
     
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
     electronic_versions = []
@@ -2576,11 +2563,6 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
     if electronic_versions:
         record["electronicVersions"] = electronic_versions
 
-    file_ev = upload_pdf_electronic_version(dspace_row)
-    if file_ev:
-        record.setdefault("electronicVersions", []).append(file_ev)
-        print(f"✅ FileElectronicVersion added: {file_ev['file']['fileName']}")
-
     # Add only the first Handle from DSpace to links to avoid duplication
     if uri_str:
         handles = extract_handles_from_uri(uri_str)
@@ -2593,6 +2575,29 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index):
         record["identifiers"] = [build_dspace_identifier(dspace_uuid)]
     else:
         print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
+
+    
+    # Publisher (dc.publisher) > inject for BookAnthology / ContributionToBookAnthology
+    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology"}
+    if pub_index and record.get("typeDiscriminator") in PUBLISHER_TYPES:
+        dspace_publisher = dspace_row.get("dc.publisher", "").strip()
+        if dspace_publisher:
+            matches = find_publisher_match(dspace_publisher, pub_index)
+            if matches:
+                matched_pub = matches[0]
+                record["publisher"] = {
+                    "uuid": matched_pub["uuid"],
+                    "systemName": "Publisher"
+                }
+                print(f"  ✅ Set publisher: '{dspace_publisher}' → {matched_pub['uuid']}")
+            else:
+                print(f"  ⚠️ No publisher match found for: '{dspace_publisher}'")
+                _unmatched_publishers.append({
+                    "name": dspace_publisher,
+                    "handle": extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")) else None,
+                    "title": dspace_row.get("dc.title", ""),
+                    "pure_uuid": None
+                })
 
     return record
 
@@ -2631,6 +2636,11 @@ def main():
         organization_mapping = json.load(f)
     print(f"✅ Loaded {len(organization_mapping)} organization records from {ORGANIZATION_MAPPING_JSON}")
 
+    print("Loading Publisher Mapping...")
+    with open(PUBLISHER_MAPPING_JSON, 'r', encoding='utf-8') as f:
+        publisher_mapping = json.load(f)
+    print(f"✅ Loaded {len(publisher_mapping)} publisher records from {PUBLISHER_MAPPING_JSON}")
+
     # Build indices
     print("\n🔨 Building lookup indices...")
     person_index = build_person_name_index(person_mapping)
@@ -2642,6 +2652,10 @@ def main():
     print("Building title token index...")
     title_token_index = build_title_token_index(pure_items)
     print(f"✅ Built title token index with {len(title_token_index)} tokens")
+
+    pub_index = build_publisher_name_index(publisher_mapping)
+    print(f"✅ Built publisher name index with {len(pub_index)} entries")
+
 
     # Prepare logs
     log_entries = []
@@ -2838,7 +2852,10 @@ def main():
             log_entry["matchType"] = match_type
 
             try:
-                updated_record, success = update_record_from_dspace(record, row, person_index, org_index, log_entry, before_update_records, override_mode=OVERRIDE_MODE)
+                updated_record, success = update_record_from_dspace(
+                    record, row, person_index, org_index, log_entry,
+                    before_update_records, pub_index, override_mode=OVERRIDE_MODE
+                )
                 log_entry["success"] = success
                 if success:
                     type_key = get_pure_type_key(log_entry["pureType"])
@@ -2854,7 +2871,7 @@ def main():
         else:
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
-                new_record = create_new_record_from_dspace(row, person_index, org_index)
+                new_record = create_new_record_from_dspace(row, person_index, org_index, pub_index)
                 
                 # Skip record if no contributors were matched
                 if new_record is None:
@@ -2916,7 +2933,7 @@ def main():
             writer.writerows(_unmatched_contributors)
         print(f"✅ Unmatched contributors saved to: {unmatched_contributors_csv}")
 
-    #  unmatched funders CSV
+    #  Unmatched funders CSV
     if _unmatched_funders:
         unmatched_funders_csv = os.path.join(OUTPUT_DIR, f"unmatched_funders_{TODAY}.csv")
         print(f"\n📝 Writing {len(_unmatched_funders)} unmatched funders to CSV...")
@@ -2927,16 +2944,16 @@ def main():
             writer.writerows(_unmatched_funders)
         print(f"✅ Unmatched funders saved to: {unmatched_funders_csv}")
 
-
-    # Write faulty PDF records CSV
-    if _faulty_pdf_records:
-        print(f"\n📝 Writing {len(_faulty_pdf_records)} faulty PDF records to CSV...")
-        with open(FAULTY_PDF_CSV, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['uuid', 'title', 'handle', 'full_pdf_path']
+    # Unmatched publishers CSV
+    if _unmatched_publishers:
+        unmatched_publishers_csv = os.path.join(OUTPUT_DIR, f"unmatched_publishers_{TODAY}.csv")
+        print(f"\n📝 Writing {len(_unmatched_publishers)} unmatched publishers to CSV...")
+        with open(unmatched_publishers_csv, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['name', 'handle', 'title', 'pure_uuid']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(_faulty_pdf_records)
-        print(f"✅ Faulty PDF records saved to: {FAULTY_PDF_CSV}")
+            writer.writerows(_unmatched_publishers)
+        print(f"✅ Unmatched publishers saved to: {unmatched_publishers_csv}")
 
 
     # Calculate elapsed time
@@ -2946,13 +2963,19 @@ def main():
     seconds = int(elapsed_time % 60)
     
     # Count results
+    SKIP_ERRORS = {
+    "Skipped: not in a Publications collection",
+    "No contributors found in any contributor field",
+    "No matched contributors",
+}
+    
     matched_count = sum(1 for e in log_entries if e['matched'])
     not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
     no_matched_authors_count = sum(1 for e in log_entries if e.get('error') == "No matched contributors")
-    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') not in ("No contributors found in any contributor field", "No matched contributors"))
+    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') not in SKIP_ERRORS)
     success_count = sum(1 for e in log_entries if e['success'])
-    failed_count = sum(1 for e in log_entries if not e['success'])
+    failed_count = sum(1 for e in log_entries if not e['success'] and e.get('error') not in SKIP_ERRORS)
     error_count = len(error_log)
 
     print(f"\n✅ Done! {len(log_entries)} records processed.")
@@ -2966,7 +2989,7 @@ def main():
     print(f"     ↳ Not in Publications collection: {not_publications_count}")
     print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
     print(f"   Unmatched funders: {len(_unmatched_funders)}")
-    print(f"   Faulty PDF records: {len(_faulty_pdf_records)}")
+    print(f"   Unmatched publishers: {len(_unmatched_publishers)}")
     print(f"   Logs saved to: {LOG_DIR}")
     print(f"\n⏱️  Total time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     

@@ -242,9 +242,7 @@ def process_file(path, mode, data_type, session, error_log, log_dir, is_test):
     return success_count, results, failed_records
 
 
-def process_folder(folder_path, data_type, session, error_log, log_dir, is_test):
-    # For folder mode, determine mode by folder name: matched -> update, unmatched -> create
-    mode = "update" if os.path.basename(folder_path).lower().startswith("matched") else "create"
+def process_folder(folder_path, mode, data_type, session, error_log, log_dir, is_test):
     json_files = []
     for root, _, files in os.walk(folder_path):
         for fn in files:
@@ -388,22 +386,21 @@ if __name__ == "__main__":
    
     error_log = []
 
+    if not args.mode:
+        print("Please set --mode create|update")
+        sys.exit(1)
+
     if args.folder:
         if not os.path.isdir(args.folder):
             print(f"Folder not found: {args.folder}")
             sys.exit(1)
-        mode = "update" if os.path.basename(args.folder).lower().startswith("matched") else "create"
-        successes, failures, total_files = process_folder(args.folder, args.data, session, error_log, LOG_DIR, args.test)
+        successes, failures, total_files = process_folder(args.folder, args.mode, args.data, session, error_log, LOG_DIR, args.test)
         print(f"\n✅ Done. {successes} records succeeded, {failures} failed across {total_files} files.")
         success_count = successes
     elif args.file:
         if not os.path.isfile(args.file):
             print(f"File not found: {args.file}")
             sys.exit(1)
-        if not args.mode:
-            print("For single file uploads please set --mode create|update")
-            sys.exit(1)
-        mode = args.mode
         success_count, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR, args.test)
         print(f"\n✅ Single file results: {success_count} records succeeded")
         # print(f"Details: {results}")
@@ -422,6 +419,6 @@ if __name__ == "__main__":
     
     # Create CSVs from logs only for research-outputs
     if args.data == "research-outputs":
-        create_csv(LOG_DIR, mode)
+        create_csv(LOG_DIR, args.mode)
     
-    print(f"\n✅ {success_count} records {mode}d and logged")
+    print(f"\n✅ {success_count} records {args.mode}d and logged")
