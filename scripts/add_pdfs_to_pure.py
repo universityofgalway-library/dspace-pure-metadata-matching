@@ -974,6 +974,8 @@ def main():
         uploaded_keys           = []
         skipped_paths           = []
         failed_paths            = []
+        failed_upload_paths     = []
+        failed_put_paths        = []
 
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
@@ -1171,7 +1173,7 @@ def main():
 
             if upload_data is None:
                 print(f"    ❌ Upload failed for: {safe_file_name}")
-                counters["pdf_fail"] += 1
+                failed_upload_paths.append(safe_file_name)
                 failed_paths.append(safe_file_name)
                 any_fail = True
                 continue
@@ -1208,7 +1210,6 @@ def main():
                 entry["pure_file_name"] = p_file_name
                 if p_file_id:
                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
-                counters["success"] += 1
                 any_success = True
                 # Write matched_ref row immediately (before the outer loop closes)
                 matched_ref_writer.writerow({
@@ -1228,9 +1229,9 @@ def main():
                 pure_record.setdefault("electronicVersions", []).append(file_ev)
             else:
                 print(f"    ❌ PUT failed: {detail}")
-                counters["put_fail"] += 1
-                any_fail = True
+                failed_put_paths.append(safe_file_name)
                 failed_paths.append(safe_file_name)
+                any_fail = True
 
         if metadata_update_handled and not uploaded_keys and not skipped_paths and not failed_paths:
             continue
@@ -1245,22 +1246,35 @@ def main():
             continue
 
         if not uploaded_keys and not skipped_paths:
-            # Every path failed to upload
-            entry["status"] = "pdf_upload_failed"
-            entry["detail"] = f"Failed: {'; '.join(failed_paths)}"
-            results.append(entry)
-            failed_rows.append(entry)
-            # Still record in matched_ref so failed files are traceable
-            matched_ref_writer.writerow(entry)
-            matched_ref_fh.flush()
+            if failed_put_paths and not failed_upload_paths:
+                # Files uploaded successfully to Pure temp storage but PUT to record failed
+                entry["status"] = "put_failed"
+                entry["detail"] = f"PUT failed: {'; '.join(failed_put_paths)}"
+                results.append(entry)
+                failed_rows.append(entry)
+                counters["put_fail"] += 1
+                matched_ref_writer.writerow(entry)
+                matched_ref_fh.flush()
+            else:
+                # Every path failed at the upload stage
+                entry["status"] = "pdf_upload_failed"
+                entry["detail"] = f"Failed: {'; '.join(failed_upload_paths)}"
+                results.append(entry)
+                failed_rows.append(entry)
+                counters["pdf_fail"] += 1
+                # Still record in matched_ref so failed files are traceable
+                matched_ref_writer.writerow(entry)
+                matched_ref_fh.flush()
         elif any_fail and any_success:
             entry["status"] = "partial_success"
             entry["detail"] = (
                 f"Uploaded: {'; '.join(uploaded_keys)}"
-                + (f" | Failed: {'; '.join(failed_paths)}" if failed_paths else "")
+                + (f" | Upload failed: {'; '.join(failed_upload_paths)}" if failed_upload_paths else "")
+                + (f" | PUT failed: {'; '.join(failed_put_paths)}" if failed_put_paths else "")
             )
             results.append(entry)
             success_rows.append(entry)
+            counters["success"] += 1
             # Per-file rows were already written inside the inner loop for successes;
             # write a summary row here covering the whole DSpace item
             matched_ref_writer.writerow(entry)
@@ -1272,11 +1286,13 @@ def main():
             entry["detail"] = f"All files already exist in Pure with same name and size: {'; '.join(skipped_paths)}"
             results.append(entry)
             skipped_rows.append(entry)
+            counters["already_has_fev"] += 1
         else:
             entry["status"] = "success"
             entry["detail"] = f"Uploaded {len(uploaded_keys)} file(s)"
             results.append(entry)
             success_rows.append(entry)
+            counters["success"] += 1
             # Per-file rows already written in the inner loop; nothing extra needed here
 
     # ---- Summary & logs ----------------------------------------------------
