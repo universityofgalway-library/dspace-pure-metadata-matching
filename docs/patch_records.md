@@ -10,7 +10,7 @@ A unified command-line tool for cleaning and patching **Pure research output** J
 pip install tqdm
 ```
 
-Python ≥ 3.9.
+Python ≥ 3.10.
 
 ---
 
@@ -54,12 +54,15 @@ python patch_records.py <input> <output_dir> [OPTIONS]
 | `--patch-workflow` | Set `workflow.step = "validated"` for records where `success = true`. |
 | `--patch-external-orgs` | Clear `externalOrganizations` at the record level and within every contributor. |
 | `--patch-author-keywords` | Remove the `/dk/atira/pure/authors` keyword group from `keywordGroups`. |
+| `--patch-publishers` | Inject publisher UUIDs into eligible Pure records that have no publisher set, sourced from DSpace `dc.publisher`. Requires `--publisher-mapping` and `--dspace-csv`. |
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--modified-after YYYY-MM-DD` | `1970-01-01` | Skip records with a `modifiedDate` on or before this date. Applies to **all modes except `--patch-nulls`**. |
+| `--publisher-mapping PATH` | *(none)* | `[--patch-publishers only]` Path to the publisher mapping JSON file (array of objects with `name` and `uuid` keys). |
+| `--dspace-csv PATH` | *(none)* | `[--patch-publishers only]` Path to the DSpace source CSV file. |
 
 ---
 
@@ -149,6 +152,35 @@ Patch shape:
 }
 ```
 
+### `--patch-publishers`
+
+For each Pure record whose `typeDiscriminator` is one of `BookAnthology`, `ContributionToBookAnthology`, `OtherContribution`, `WorkingPaper`, or `NonTextual`, and which has no `publisher` set, this mode:
+
+1. Matches the Pure record to a DSpace row using any available identifier — publisher DOI, repository DOI, handle, or DSpace UUID (checked against the record's `electronicVersions`, `links`, and `identifiers` fields).
+2. Reads `dc.publisher` from the matched DSpace row.
+3. Looks up the publisher name in the publisher mapping JSON (normalised, punctuation-insensitive match).
+4. Emits a patch record with the resolved publisher UUID.
+
+Records are skipped if:
+- They already have a `publisher.uuid` set.
+- No matching DSpace row can be found.
+- The matched DSpace row has no `dc.publisher` value.
+- The publisher name cannot be resolved against the mapping.
+
+The `--modified-after` date filter applies.
+
+Output file: `publisher_patch_YYYY-MM-DD.json`  
+Patch shape:
+```json
+{
+  "uuid": "…",
+  "publisher": {
+    "uuid": "…",
+    "systemName": "Publisher"
+  }
+}
+```
+
 ---
 
 ## Output files summary
@@ -160,6 +192,7 @@ Patch shape:
 | `--patch-workflow` | `workflow_patch_YYYY-MM-DD.json` |
 | `--patch-external-orgs` | `external_org_patch_YYYY-MM-DD.json` |
 | `--patch-author-keywords` | `author_keyword_patch_YYYY-MM-DD.json` |
+| `--patch-publishers` | `publisher_patch_YYYY-MM-DD.json` |
 
 All files are written to `<output_dir>/`. The date in each filename is the date the script is run.
 
@@ -188,13 +221,24 @@ python patch_records.py data/records.json patches/ \
 # 5. Remove author keyword groups
 python patch_records.py data/records.json patches/ --patch-author-keywords
 
-# 6. Run all standard patches in one pass
+# 6. Inject publishers from DSpace into eligible Pure records
+python patch_records.py data/records.json patches/ \
+    --patch-publishers \
+    --publisher-mapping data/publishers.json \
+    --dspace-csv data/dspace_export.csv \
+    --modified-after 2024-01-01
+
+# 7. Run all standard patches in one pass
 python patch_records.py data/records.json patches/ \
     --patch-nulls \
     --patch-titles \
     --patch-external-orgs \
     --patch-author-keywords \
+    --patch-publishers \
+    --publisher-mapping data/publishers.json \
+    --dspace-csv data/dspace_export.csv \
     --modified-after 2023-06-01
+
 ```
 
 ---

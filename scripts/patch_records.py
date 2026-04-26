@@ -9,11 +9,15 @@ Patch modes (one or more may be combined):
   --patch-workflow       Set workflow step to "validated" for successful records
   --patch-external-orgs  Clear externalOrganizations at record and contributor level
   --patch-author-keywords  Remove the /dk/atira/pure/authors keyword group
+  --patch-publishers     Inject publisher from DSpace dc.publisher into Pure records
+                         that lack one. Requires --publisher-mapping and --dspace-csv.
 
 See README.md for full usage examples.
 """
 
 import os
+import re
+import csv
 import json
 import argparse
 from datetime import date, datetime
@@ -40,6 +44,14 @@ SYSTEM_FIELDS_TO_EXCLUDE = {
 PUNC = set("""—!–¿()-[]{};:'"''""‐\\,<>./?@#$%^&=+|£€*_~®™©0123456789""")
 
 AUTHOR_KEYWORD_LOGICAL_NAME = "/dk/atira/pure/authors"
+
+PUBLISHER_TYPES = {
+    "BookAnthology",
+    "ContributionToBookAnthology",
+    "OtherContribution",
+    "WorkingPaper",
+    "NonTextual",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +510,230 @@ def patch_author_keywords(
         "files":               [output_path],
     }
 
+
+# ---------------------------------------------------------------------------
+# Patch: publishers
+# ---------------------------------------------------------------------------
+
+def _normalize_for_comparison(s: str) -> str:
+    """Lowercase, replace punctuation with spaces, collapse whitespace."""
+    if not s:
+        return ""
+    result = "".join(" " if char in PUNC else char for char in s.lower())
+    return " ".join(result.split())
+
+
+def _load_dspace_rows(csv_path: str) -> list[dict]:
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _build_dspace_lookup(dspace_rows: list[dict]) -> dict:
+    """
+    Index DSpace rows by every available identifier so Pure records can be
+    matched against them by DOI, repository DOI, handle, or DSpace UUID.
+    Returns dict mapping normalised identifier string → dspace row.
+    A single row may be reachable via multiple keys.
+    """
+    DOI_RE    = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
+    HANDLE_RE = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+    def norm_doi(v):
+        m = DOI_RE.match(v.strip().lower())
+        return f"https://doi.org/{m.group(1)}" if m else None
+
+    def norm_handle(v):
+        m = HANDLE_RE.match(v.strip().lower())
+        return f"http://hdl.handle.net/{m.group(1)}" if m else None
+
+    index = {}
+
+    for row in dspace_rows:
+        # DSpace UUID
+        ds_uuid = row.get("uuid", "").strip()
+        if ds_uuid:
+            index[ds_uuid.lower()] = row
+
+        # Handle
+        handle_raw = row.get("handle", "").strip()
+        if handle_raw:
+            nh = norm_handle(handle_raw)
+            if nh:
+                index[nh] = row
+
+        # All URIs (semicolon-separated) — handles and DOIs
+        uri_str = row.get("dc.identifier.uri", "")
+        for u in [x.strip() for x in uri_str.split(";") if x.strip()]:
+            nh = norm_handle(u)
+            if nh:
+                index[nh] = row
+            nd = norm_doi(u)
+            if nd:
+                index[nd] = row
+
+        # Publisher DOI
+        pub_doi = row.get("dc.identifier.doi", "").strip()
+        if pub_doi:
+            nd = norm_doi(pub_doi)
+            if nd:
+                index[nd] = row
+
+    return index
+
+
+def _find_dspace_row(pure_record: dict, dspace_index: dict) -> dict | None:
+    """
+    Try to find the DSpace row that corresponds to this Pure record by
+    checking DOIs, handles and DSpace UUID identifiers on the Pure record.
+    """
+    DOI_RE    = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
+    HANDLE_RE = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+
+    def norm_doi(v):
+        m = DOI_RE.match(v.strip().lower())
+        return f"https://doi.org/{m.group(1)}" if m else None
+
+    def norm_handle(v):
+        m = HANDLE_RE.match(v.strip().lower())
+        return f"http://hdl.handle.net/{m.group(1)}" if m else None
+
+    candidates = []
+
+    # Electronic versions → DOIs
+    for ev in pure_record.get("electronicVersions", []):
+        doi = ev.get("doi", "").strip()
+        if doi:
+            nd = norm_doi(doi)
+            if nd:
+                candidates.append(nd)
+            nh = norm_handle(doi)
+            if nh:
+                candidates.append(nh)
+
+    # Links → handles
+    for link in pure_record.get("links", []):
+        url = link.get("url", "").strip()
+        if url:
+            nh = norm_handle(url)
+            if nh:
+                candidates.append(nh)
+            nd = norm_doi(url)
+            if nd:
+                candidates.append(nd)
+
+    # Identifiers → DSpace UUID
+    for ident in pure_record.get("identifiers", []):
+        if ident.get("idSource") == "DSpace":
+            val = ident.get("value", "").strip().lower()
+            if val:
+                candidates.append(val)
+
+    for key in candidates:
+        if key in dspace_index:
+            return dspace_index[key]
+
+    return None
+
+
+def patch_publishers(
+    records: list,
+    publisher_mapping_path: str,
+    dspace_csv_path: str,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    For each Pure record whose typeDiscriminator is in PUBLISHER_TYPES and
+    which has no publisher set, find the matching DSpace row (by DOI, handle,
+    or DSpace UUID), look up dc.publisher in that row, resolve it against the
+    publisher mapping, and emit a PATCH-compatible record (uuid + publisher).
+    """
+    # Load and index publisher mapping by normalised name
+    with open(publisher_mapping_path, "r", encoding="utf-8") as f:
+        publisher_mapping = json.load(f)
+    pub_index = {}
+    for pub in publisher_mapping:
+        name = pub.get("name", "").strip()
+        if name:
+            key = _normalize_for_comparison(name)
+            pub_index.setdefault(key, []).append(pub)
+
+    # Load and index DSpace rows
+    dspace_rows  = _load_dspace_rows(dspace_csv_path)
+    dspace_index = _build_dspace_lookup(dspace_rows)
+
+    patches = []
+    skipped_date            = 0
+    skipped_wrong_type      = 0
+    skipped_has_publisher   = 0
+    skipped_no_dspace_match = 0
+    skipped_no_pub_name     = 0
+    skipped_no_pub_match    = 0
+    patched                 = 0
+
+    for record in tqdm(records, desc="[publishers] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        type_disc = record.get("typeDiscriminator", "")
+        if type_disc not in PUBLISHER_TYPES:
+            skipped_wrong_type += 1
+            continue
+
+        publisher = record.get("publisher")
+        if isinstance(publisher, dict) and publisher.get("uuid"):
+            skipped_has_publisher += 1
+            continue
+
+        uuid = record.get("uuid", "")
+
+        dspace_row = _find_dspace_row(record, dspace_index)
+        if dspace_row is None:
+            skipped_no_dspace_match += 1
+            tqdm.write(f"  ⚠️  [{uuid}] No matching DSpace row found")
+            continue
+
+        publisher_name = dspace_row.get("dc.publisher", "").strip()
+        if not publisher_name:
+            skipped_no_pub_name += 1
+            tqdm.write(f"  ⚠️  [{uuid}] DSpace row has no dc.publisher")
+            continue
+
+        matches = pub_index.get(_normalize_for_comparison(publisher_name), [])
+        if not matches:
+            skipped_no_pub_match += 1
+            tqdm.write(f"  ⚠️  [{uuid}] No publisher match for: '{publisher_name}'")
+            continue
+
+        matched_pub = matches[0]
+        patches.append({
+            "uuid": uuid,
+            "publisher": {
+                "uuid":       matched_pub["uuid"],
+                "systemName": "Publisher",
+            },
+        })
+        patched += 1
+        tqdm.write(f"  ✅ [{uuid}] '{publisher_name}' → {matched_pub['uuid']}")
+
+    output_path = os.path.join(output_dir, f"publisher_patch_{TODAY}.json")
+    write_json(output_path, patches)
+
+    return {
+        "total":                     len(records),
+        "skipped_date_filter":       skipped_date,
+        "skipped_wrong_type":        skipped_wrong_type,
+        "skipped_already_has_publisher": skipped_has_publisher,
+        "skipped_no_dspace_match":   skipped_no_dspace_match,
+        "skipped_no_publisher_name": skipped_no_pub_name,
+        "skipped_no_publisher_match": skipped_no_pub_match,
+        "patched":                   patched,
+        "files":                     [output_path],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
@@ -570,6 +806,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove the /dk/atira/pure/authors keyword group from records.",
     )
 
+    modes.add_argument(
+        "--patch-publishers",
+        action="store_true",
+        help=(
+            "Inject publisher UUIDs into Pure records of eligible types that "
+            "have no publisher set. Matches Pure records to DSpace rows by DOI, "
+            "handle, or DSpace UUID, then resolves dc.publisher against the "
+            "publisher mapping. Requires --publisher-mapping and --dspace-csv."
+        ),
+    )
+
     opts = parser.add_argument_group("Options")
     opts.add_argument(
         "--workflow-from-log",
@@ -594,6 +841,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    opts.add_argument(
+        "--publisher-mapping",
+        default=None,
+        metavar="PATH",
+        help=(
+            "[--patch-publishers only] Path to the publisher mapping JSON file "
+            "(array of objects with 'name' and 'uuid' keys)."
+        ),
+    )
+
+    opts.add_argument(
+        "--dspace-csv",
+        default=None,
+        metavar="PATH",
+        help=(
+            "[--patch-publishers only] Path to the DSpace source CSV file."
+        ),
+    )
+
     return parser
 
 
@@ -611,13 +877,30 @@ def main() -> None:
         args.patch_workflow,
         args.patch_external_orgs,
         args.patch_author_keywords,
+        args.patch_publishers,
     ]
+    
     if not any(modes_selected):
         parser.error(
             "No patch mode selected. Choose at least one of: "
             "--patch-nulls, --patch-titles, --patch-workflow, "
-            "--patch-external-orgs, --patch-author-keywords"
+            "--patch-external-orgs, --patch-author-keywords, --patch-publishers"
         )
+
+    if args.patch_publishers and not args.publisher_mapping:
+        parser.error("--patch-publishers requires --publisher-mapping.")
+    if args.patch_publishers and not args.dspace_csv:
+        parser.error("--patch-publishers requires --dspace-csv.")
+    if args.publisher_mapping and not args.patch_publishers:
+        parser.error("--publisher-mapping requires --patch-publishers.")
+    if args.dspace_csv and not args.patch_publishers:
+        parser.error("--dspace-csv requires --patch-publishers.")
+    if args.publisher_mapping and not os.path.isfile(args.publisher_mapping):
+        print(f"❌ Publisher mapping file not found: {args.publisher_mapping}")
+        return
+    if args.dspace_csv and not os.path.isfile(args.dspace_csv):
+        print(f"❌ DSpace CSV file not found: {args.dspace_csv}")
+        return
 
     # --- Validate input ---
     if not os.path.isfile(args.input):
@@ -667,6 +950,13 @@ def main() -> None:
     if args.patch_author_keywords:
         stats = patch_author_keywords(records, args.output_dir, modified_after)
         print_summary("Author keyword groups", stats)
+
+    if args.patch_publishers:
+        stats = patch_publishers(
+            records, args.publisher_mapping, args.dspace_csv,
+            args.output_dir, modified_after
+        )
+        print_summary("Publishers", stats)
 
     print(f"\n✅ All done. Output directory: {args.output_dir}\n")
 
