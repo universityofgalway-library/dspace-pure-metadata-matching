@@ -1,8 +1,6 @@
 # enrich_author_json.py
 
-Injects UUIDs from a creation log into an authors JSON file. For each author
-who is neither internal nor external, it looks for an exact name match in an uploader
-log and, on a hit, sets `external: true` and appends the UUID to `externalUUIDs`.
+Injects UUIDs from a creation log into an authors JSON file. For each author who is neither internal nor external, it looks for an exact name match in an uploader log and, on a hit, sets `external: true` and appends the UUID to `externalUUIDs`.
 
 ---
 
@@ -24,10 +22,9 @@ python enrich_author_json.py --authors-file <path> --log-file <path> [--entity-t
 |---|---|---|---|
 | `--authors-file` | Yes | — | Path to the authors JSON file to enrich. |
 | `--log-file` | Yes | — | Path to the creation log JSON file. |
-| `--entity-type` | No | `external-persons` | The `type` field value to filter log entries by. Use `external-organizations` for organizations. |
+| `--entity-type` | No | `external-persons` | The `data` field value to filter log entries by. Use `external-organizations` for organizations. |
 
-The script writes the enriched data to `updated_<original-filename>` in the
-same directory as the source file. The source file is never modified.
+The script writes the enriched data to `updated_<original-filename>` in the same directory as the source file. The source file is never modified.
 
 ---
 
@@ -59,12 +56,12 @@ An array of author objects. Relevant fields:
 
 ### Log JSON
 
-An array of uploader log entries for newly created external persons. Relevant fields:
+An array of uploader log entries for newly created external persons (as produced by `pure_uploader.py`). Relevant fields:
 
 ```json
 [
   {
-    "type": "external-persons",
+    "data": "external-persons",
     "name": "Aabenhus, R.",
     "uuid": "d159f747-a98c-4952-ae41-4dd17c075f53",
     "success": true
@@ -74,7 +71,7 @@ An array of uploader log entries for newly created external persons. Relevant fi
 
 | Field | Type | Role |
 |---|---|---|
-| `type` | string | Must equal `--entity-type` or the entry is ignored. |
+| `data` | string | Must equal `--entity-type` or the entry is ignored. |
 | `name` | string | Match key — must be in `"lastName, firstName"` format. |
 | `uuid` | string | Injected into the author on a match. |
 | `success` | boolean | Must be `true` or the entry is ignored. |
@@ -91,10 +88,7 @@ For each candidate, the script builds a key from the author's JSON fields:
 "lastName, firstName"  →  lowercased
 ```
 
-This is compared against the lowercased `name` field of every eligible log
-entry. The match is **exact** (case-insensitive only) — no fuzzy logic,
-no variant handling. If the strings differ by even one character the entry
-is not matched.
+This is compared against the lowercased `name` field of every eligible log entry. The match is **exact** (case-insensitive only) — no fuzzy logic, no variant handling. If the strings differ by even one character the entry is not matched.
 
 ---
 
@@ -123,10 +117,8 @@ Console output:
 Loading authors file : data/persons.json
 Loading log file     : data/creation_log.json
 Log entries loaded   : 2 (type='external-persons', success=True)
-
   ✓  R. Aabenhus                               →  d159f747-a98c-4952-ae41-4dd17c075f53
   ✗  J. Smith  (no match found)
-
 ============================================================
 SUMMARY
 ============================================================
@@ -134,6 +126,5 @@ SUMMARY
   Matched & updated     : 1
   No match found        : 1
   Skipped (already i/e) : 1
-
   Output written to     : data/updated_persons.json
 ```

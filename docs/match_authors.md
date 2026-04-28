@@ -4,6 +4,16 @@ Matches DSpace authors against Pure internal and external person records and out
 
 ---
 
+## Requirements
+
+```bash
+pip install regex tqdm
+```
+
+Python ≥ 3.10.
+
+---
+
 ## Usage
 
 ```bash
@@ -40,6 +50,20 @@ IRISH_SURNAMES_JSON     = "./author_matching/irish_surnames.json"
 OUTPUT_DIR              = f"./author_matching/{TODAY}"
 ```
 
+`OUTPUT_DIR` is the default output directory (`./author_matching/<YYYY-MM-DD>`). It can be overridden at runtime with `--output-dir`.
+
+---
+
+## CLI Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--output-dir PATH` | `./author_matching/<TODAY>` | Override default output directory. |
+| `--prefix STRING` | `authors` | Prefix for output filenames. |
+| `--option OPTION` | *(all eight)* | Generate only one named output file instead of all eight. See Output Options table. |
+| `--generate-initial-variants` | `False` | Generate spacing/punctuation variants from existing initials (e.g. `J.` → `J`, `J P`, etc.) and use them for matching. Applied to both the Pure person index and DSpace author lookup. |
+| `--generate-initials-from-names` | `False` | Generate initials from full names (e.g. `John` → `J`, `J.`) for recording in `alternativeFirstName` **only** — never used for matching. Applied to both the Pure person index and DSpace author lookup. |
+
 ---
 
 ## Input Files
@@ -62,7 +86,7 @@ OUTPUT_DIR              = f"./author_matching/{TODAY}"
 ]
 ```
 
-Papers without a `handle` value are silently dropped during processing. If the same handle appears more than once for an author, only the first occurrence is kept.
+Papers without a `handle` value are silently dropped during processing. If the same handle appears more than once for an author, only the first occurrence is kept. Authors with a missing or blank `firstName` or `lastName` are filtered out and counted in the summary statistics.
 
 ### 2. Pure Internal Persons JSON
 
@@ -113,7 +137,7 @@ Curly apostrophes (`'`, `'`) are normalized to straight apostrophes (`'`) before
 
 ### Step 2: Index Pure Persons
 
-`build_index_persons` processes both internal and external person lists. For each person it:
+`build_index_persons` processes both internal and external person lists. The `--generate-initial-variants` and `--generate-initials-from-names` flags control variant generation at this stage as well as during DSpace author matching. For each person it:
 
 1. Extracts the primary name and any additional names from the `names` array
 2. Looks up each surname in the Irish surnames index to get all normalised variants
@@ -227,9 +251,9 @@ From **internal matches**:
 
 From **external matches**:
 - Alternative first and last names
-- Internal and external organisation UUIDs (external persons can have both)
+- External organisation UUIDs
 
-ORCID and Scopus IDs are collected across all internal match UUIDs into a set. If an author has internal duplicates, they may yield multiple distinct values — in that case a warning is logged and the first value found is used. These identifiers are never collected from external matches.
+ORCID and Scopus IDs are collected across all internal match UUIDs into a set. If an author has internal duplicates, they may yield multiple distinct values — in that case a warning is logged for both ORCID and Scopus ID separately, and the first value found is used. These identifiers are never collected from external matches.
 
 #### 3.6 Build the enriched record
 
@@ -295,6 +319,7 @@ One JSON file per output option, named `<prefix>_<option>_<TODAY>.json`:
 
 **Field notes:**
 - `orcid` and `scopusId` are always present (empty string `""` if not found); populated from internal matches only
+- `internalUUIDs` is a list of `{"uuid": "...", "visibility": "..."}` objects; `externalUUIDs` is a plain list of UUID strings
 - `internalDuplicates: true` means more than one internal Pure person matched this author; all matching UUIDs are listed
 
 ---
@@ -336,10 +361,11 @@ Pure: firstName="O'Brien", lastName="Sarah"
 
 ### Duplicate Warnings
 
-If two matched internal UUIDs carry different ORCIDs or Scopus IDs, a warning is logged:
+If two matched internal UUIDs carry different ORCIDs or different Scopus IDs, a warning is logged for each:
 
 ```
 ⚠️ WARNING: Multiple distinct ORCIDs for author 'Sarah O'Brien': {'0000-...1', '0000-...2'}
+⚠️ WARNING: Multiple distinct Scopus IDs for author 'Sarah O'Brien': {'12345', '67890'}
 ```
 
 ---
@@ -478,7 +504,7 @@ A full log is also written to `./author_matching/match_authors_<TODAY>.log`.
   "externalUUIDs": [],
   "internalOrganizations": ["org-1"],
   "externalOrganizations": [],
-  "primaryInternalOrganisation": "org-1",
+  "primaryInternalOrganization": "org-1",
   "alternativeFirstName": ["Sarah"],
   "alternativeLastName": ["O Brien", "O' Brien"]
 }

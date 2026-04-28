@@ -30,6 +30,13 @@ python prepare_uploads.py all --help
 
 All commands that accept a CSV file (`funders`, `publishers`, `journals`, `run`, `all`) automatically detect whether the file uses comma or tab as its delimiter by sniffing the first non-empty line. No configuration is needed.
 
+---
+
+## Logging
+
+Every command writes a timestamped log file to `<output_dir>/logs/<command>_<timestamp>.log`. The log directory can be overridden with `--log-dir`. Log output is also written to stdout.
+
+---
 
 ## Commands
 
@@ -38,15 +45,14 @@ All commands that accept a CSV file (`funders`, `publishers`, `journals`, `run`,
 Reads a JSON array of author objects and extracts those where **both** `internal` and `external` flags are `false`, formatting them as `ExternalPerson` records.
 
 ```
-python prepare_uploads.py authors <input> [-o OUTPUT] [--sample]
+python prepare_uploads.py authors <input> [-o OUTPUT] [--sample] [--log-dir DIR]
 ```
 
 | Argument | Description |
 |---|---|
 | `input` | Path to the source authors JSON file |
 | `-o / --output` | Output path (default: `<input_dir>/authors_to_upload_<today>.json`) |
-| `--sample` | Print the first output record to stdout after writing |
-| `--log-dir` | Directory for log files (default: `<output_dir>/logs)` |
+| `--log-dir` | Directory for log files (default: `<output_dir>/logs`) |
 | `--sample` | Print the first output record to stdout after writing |
 
 **Input format** — a JSON array where each object may contain:
@@ -83,10 +89,10 @@ python prepare_uploads.py authors ./data/merged_authors_2026-03-25.json --sample
 
 ### `funders` — Find missing funders
 
-Reads funder names from a CSV column, compares them case-insensitively against an organisations JSON, and writes missing ones as `ExternalOrganization` (type: `researchFundingBody`) records. Names longer than 10 words are skipped automatically with a warning. Matching against existing organisations is case- and punctuation-insensitive, but punctuation is preserved in the output.
+Reads funder names from a CSV column, compares them case- and punctuation-insensitively against an organisations JSON, and writes missing ones as `ExternalOrganization` (type: `researchFundingBody`) records. Names longer than 10 words are skipped automatically with a warning. Original casing and punctuation are preserved in the output.
 
 ```
-python prepare_uploads.py funders <csv> <organisations> [-o OUTPUT] [--column COLUMN]
+python prepare_uploads.py funders <csv> <organisations> [-o OUTPUT] [--column COLUMN] [--sample] [--log-dir DIR]
 ```
 
 | Argument | Description |
@@ -95,7 +101,7 @@ python prepare_uploads.py funders <csv> <organisations> [-o OUTPUT] [--column CO
 | `organisations` | Path to a Pure organisations JSON file for name matching |
 | `-o / --output` | Output path (default: `<organisations_dir>/funders_to_upload_<today>.json`) |
 | `--column` | CSV column containing funder values (default: `dc.contributor.funder`) |
-| `--log-dir` | Directory for log files (default: `<output_dir>/logs)` |
+| `--log-dir` | Directory for log files (default: `<output_dir>/logs`) |
 | `--sample` | Print the first output record to stdout after writing |
 
 Multiple funders in a single cell must be separated by semicolons (`;`).
@@ -130,7 +136,7 @@ python prepare_uploads.py funders ./exports/items.csv ./data/organisations.json 
 Reads a journal CSV (delimiter auto-detected), matches each row against an existing journals JSON (by UUID first, then by title), and produces two output files: one for journals that must be created and one for journals that need updating.
 
 ```
-python prepare_uploads.py journals <csv> <existing> [--output-create FILE] [--output-update FILE]
+python prepare_uploads.py journals <csv> <existing> [--output-create FILE] [--output-update FILE] [--sample] [--log-dir DIR]
 ```
 
 | Argument | Description |
@@ -139,7 +145,7 @@ python prepare_uploads.py journals <csv> <existing> [--output-create FILE] [--ou
 | `existing` | Path to the existing journals JSON file |
 | `--output-create` | Output for new journals (default: `./unmatched_records/journals_to_create_<timestamp>.json`) |
 | `--output-update` | Output for journals needing updates (default: `./unmatched_records/journals_to_update_<timestamp>.json`) |
-| `--log-dir` | Directory for log files (default: `<output_dir>/logs)` |
+| `--log-dir` | Directory for log files (default: `<output_dir>/logs`) |
 | `--sample` | Print the first output record to stdout after writing |
 
 **Expected CSV columns:**
@@ -147,13 +153,13 @@ python prepare_uploads.py journals <csv> <existing> [--output-create FILE] [--ou
 | Column | Description |
 |---|---|
 | `journal_title` | Journal title (required) |
-| `journal_issn` | Semicolon-separated ISSNs |
+| `journal_issn` | Semicolon-separated ISSNs. The first ISSN is mapped to `issns`; the second is mapped to `additionalSearchableIssns` as an `ElectronicISSN`. |
 | `journal_uuid` | UUID of an existing journal (optional) |
 | `publisher_uuid` | UUID of the publisher to link (optional) |
 
 **Matching logic:**
 
-1. If `journal_uuid` is present → look up by UUID; generate an update record if the publisher or ISSNs differ.
+1. If `journal_uuid` is present → look up by UUID in the existing journals. If found, generate an update record if the publisher or ISSNs differ. If the UUID is not found in the existing journals, a warning is logged and no record is produced.
 2. If no UUID → look up by title (case-insensitive). If found, check for updates; if not found, generate a create record.
 
 **Example:**
@@ -168,19 +174,21 @@ python prepare_uploads.py journals ./exports/journals.csv ./data/existing_journa
 
 ### `publishers` — Find missing publishers
 
-Reads publisher names from a CSV column, compares them case-insensitively against an organisations JSON, and writes missing ones as `Publisher` records. Names longer than 10 words are skipped automatically with a warning. This command uses the same matching logic as `funders`.
+Reads publisher names from a CSV column, compares them case- and punctuation-insensitively against a **Pure publishers JSON**, and writes missing ones as `Publisher` records. Names longer than 10 words are skipped automatically with a warning. Original casing and punctuation are preserved in the output.
+
+Note: this command takes a **publishers** JSON (where each record has a plain string `name` field), not an organisations JSON. Use a Pure publishers export as the reference file.
 
 ```
-python prepare_uploads.py publishers <csv> <organisations> [-o OUTPUT] [--column COLUMN]
+python prepare_uploads.py publishers <csv> <publishers> [-o OUTPUT] [--column COLUMN] [--sample] [--log-dir DIR]
 ```
 
 | Argument | Description |
 |---|---|
 | `csv` | Path to the input CSV file (delimiter auto-detected) |
-| `organisations` | Path to a Pure organisations JSON file for name matching |
-| `-o / --output` | Output path (default: `<organisations_dir>/publishers_to_upload_<today>.json`) |
+| `publishers` | Path to a Pure publishers JSON file for name matching |
+| `-o / --output` | Output path (default: `<publishers_dir>/publishers_to_upload_<today>.json`) |
 | `--column` | CSV column containing publisher values (default: `dc.publisher`) |
-| `--log-dir` | Directory for log files (default: `<output_dir>/logs)` |
+| `--log-dir` | Directory for log files (default: `<output_dir>/logs`) |
 | `--sample` | Print the first output record to stdout after writing |
 
 Multiple publishers in a single cell must be separated by semicolons (`;`).
@@ -204,7 +212,7 @@ Multiple publishers in a single cell must be separated by semicolons (`;`).
 **Example:**
 
 ```bash
-python prepare_uploads.py publishers ./exports/items.csv ./data/organisations.json \
+python prepare_uploads.py publishers ./exports/items.csv ./data/publishers.json \
   --column "dc.publisher"
 ```
 
@@ -225,7 +233,8 @@ python prepare_uploads.py run --commands COMMAND [COMMAND ...] [options]
 | Flag | Used by | Description |
 |---|---|---|
 | `--csv` | funders, publishers, journals | CSV file (delimiter auto-detected) |
-| `--organisations` | funders, publishers | Organisations JSON for name matching |
+| `--organisations` | funders | Organisations JSON for name matching |
+| `--publishers` | publishers | Publishers JSON for name matching |
 
 #### Per-command inputs
 
@@ -233,14 +242,15 @@ python prepare_uploads.py run --commands COMMAND [COMMAND ...] [options]
 |---|---|---|
 | `--authors-input` | authors | Input authors JSON |
 | `--authors-output` | authors | Output path for authors |
-| `--sample` | all | Print the first output record for each command |
-| `--funders-column` | funders | CSV column (default: `dc.contributor.funder`) |
 | `--funders-output` | funders | Output path for funders |
-| `--publishers-column` | publishers | CSV column (default: `dc.publisher`) |
 | `--publishers-output` | publishers | Output path for publishers |
 | `--journals-existing` | journals | Existing journals JSON |
 | `--journals-output-create` | journals | Output path for journals to create |
 | `--journals-output-update` | journals | Output path for journals to update |
+| `--log-dir` | all | Directory for log files |
+| `--sample` | all | Print the first output record for each command |
+
+> **Note:** The `funders` and `publishers` commands always use their default CSV columns (`dc.contributor.funder` and `dc.publisher` respectively) when invoked via `run` or `all`. Per-column overrides are only available when running each command individually.
 
 **Example — funders and publishers from the same CSV:**
 
@@ -248,7 +258,8 @@ python prepare_uploads.py run --commands COMMAND [COMMAND ...] [options]
 python prepare_uploads.py run \
   --commands funders publishers \
   --csv ./exports/items.csv \
-  --organisations ./data/organisations.json
+  --organisations ./data/organisations.json \
+  --publishers ./data/publishers.json
 ```
 
 **Example — all four commands:**
@@ -259,6 +270,7 @@ python prepare_uploads.py run \
   --authors-input ./data/authors.json \
   --csv ./exports/items.csv \
   --organisations ./data/organisations.json \
+  --publishers ./data/publishers.json \
   --journals-existing ./data/journals.json
 ```
 
@@ -269,7 +281,7 @@ python prepare_uploads.py run \
 Shortcut for `run --commands authors funders publishers journals`. Accepts the same optional flags as `run`.
 
 ```
-python prepare_uploads.py all --authors-input FILE --csv FILE --organisations FILE --journals-existing FILE [options]
+python prepare_uploads.py all --authors-input FILE --csv FILE --organisations FILE --publishers FILE --journals-existing FILE [options]
 ```
 
 **Example:**
@@ -279,6 +291,7 @@ python prepare_uploads.py all \
   --authors-input ./data/authors.json \
   --csv ./exports/items.csv \
   --organisations ./data/organisations.json \
+  --publishers ./data/publishers.json \
   --journals-existing ./data/journals.json
 ```
 
@@ -290,4 +303,4 @@ python prepare_uploads.py all \
 - Parent directories are created automatically if they do not exist.
 - Default output paths include today's date or a timestamp so repeated runs never overwrite previous results.
 - All records are placed in workflow step `forApproval`, meaning they require manual review in the target system before going live.
-- The organisations JSON passed to `funders` and `publishers` can be either an internal or external Pure organisations export; both name formats (plain string list and locale dict) are handled automatically.
+- The organisations JSON passed to `funders` handles both string names and localised dicts (e.g. `{"en_IE": "Name"}`) automatically. The publishers JSON passed to `publishers` expects a plain string `name` field on each record.

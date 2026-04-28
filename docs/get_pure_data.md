@@ -21,13 +21,14 @@ pip install requests python-dotenv tqdm
 
 The script requires a Pure API key with **root access** to retrieve all metadata fields (including restricted fields such as keywords). A regular user API key will work but may return incomplete records.
 
-Store the key in a `.env` file in the working directory:
+Store keys in a `.env` file in the working directory:
 
 ```env
-PURE_ROOT_API_KEY=your_api_key_here
+PURE_ROOT_API_KEY=your_production_api_key_here
+PURE_ROOT_API_KEY_TEST=your_uat_api_key_here
 ```
 
-If the key is not found, the script will print a warning and continue with an empty key (requests will likely be rejected by the API).
+`PURE_ROOT_API_KEY` is used by default (production). `PURE_ROOT_API_KEY_TEST` is used when `--test` is set. If the required key is not found, the script will print a warning and continue with an empty key (requests will likely be rejected by the API).
 
 ---
 
@@ -37,16 +38,16 @@ If the key is not found, the script will print a warning and continue with an em
 python get_pure_data.py [OPTIONS]
 ```
 
-### Example: fetch all entity types from the staging environment
+### Example: fetch all entity types from the UAT staging environment
 
 ```bash
-python get_pure_data.py --test True
+python get_pure_data.py --test
 ```
 
-### Example: fetch only persons from production
+### Example: fetch only persons from production (default)
 
 ```bash
-python get_pure_data.py --test False --data persons
+python get_pure_data.py --data persons
 ```
 
 ### Example: fetch research outputs split by subtype, with a custom output directory
@@ -73,11 +74,11 @@ python get_pure_data.py \
 
 | Argument | Type | Default | Description |
 |---|---|---|---|
-| `--test` | `bool` | `True` | Target environment. `True` uses the UAT staging URL; `False` uses the production URL. |
+| `--test` | flag | *(omit for production)* | Include to target the UAT staging environment. Omit to target production (the default). |
 | `--data` | `str` | `all` | Entity type to fetch. Use `all` to fetch every supported type, or specify one (see [Supported Entity Types](#supported-entity-types)). |
 | `--output-dir` | `str` | `./pure_entities` | Directory where output JSON files are saved. Created automatically if it does not exist. |
-| `--split-by-type` | flag | `False` | For `research-outputs` only: split results into separate files per subtype (e.g. `contributiontojournal`, `conferencepaper`). |
-| `--filename-prefix` | `str` | `pure_test_<data_type>` | Custom prefix for the output filename. Only applies when fetching a single data type. |
+| `--split-by-type` | flag | `False` | For `research-outputs` only: split results into separate files per subtype (e.g. `contributiontojournal`, `bookanthology`). |
+| `--filename-prefix` | `str` | `pure_<data_type>` | Custom prefix for the output filename. When fetching a single type, the prefix applies to that file. When using `--data all`, each type uses its own default prefix (`pure_<data_type>`). |
 
 ---
 
@@ -110,19 +111,19 @@ Each entity type is saved as a JSON file in the output directory. The filename f
 **Example:**
 
 ```
-pure_test_persons_2026-03-30.json
+pure_persons_2026-04-28.json
 ```
 
 When `--split-by-type` is used with `research-outputs`, a separate file is created per subtype:
 
 ```
-pure_test_research-outputs_2026-03-30_contributiontojournal.json
-pure_test_research-outputs_2026-03-30_conferencepaper.json
-pure_test_research-outputs_2026-03-30_book.json
+pure_research-outputs_2026-04-28_contributiontojournal.json
+pure_research-outputs_2026-04-28_bookanthology.json
+pure_research-outputs_2026-04-28_contributiontoconference.json
 ...
 ```
 
-Subtypes are derived from the `type.uri` field within each research output record.
+Subtypes are derived from the second-to-last path segment of the `type.uri` field within each research output record (e.g. `contributiontojournal` from `.../contributiontojournal/article`). Research output records with a missing or unrecognised `type.uri` are grouped under `unknown`.
 
 ---
 
@@ -130,8 +131,8 @@ Subtypes are derived from the `type.uri` field within each research output recor
 
 | Mode | URL |
 |---|---|
-| UAT / Staging (`--test True`) | `https://galway-staging.elsevierpure.com/ws/api/` |
-| Production (`--test False`) | `https://research.universityofgalway.ie/ws/api/` |
+| Production — default | `https://research.universityofgalway.ie/ws/api/` |
+| UAT / Staging — `--test` | `https://galway-staging.elsevierpure.com/ws/api/` |
 
 ---
 
@@ -168,6 +169,5 @@ After all types have been processed, the script prints a summary:
 ## Notes
 
 - Root API key access is required to retrieve all metadata fields. With a regular user key, fields such as keywords may be missing from the response.
-- The `--filename-prefix` argument is only applied when fetching a single data type. When `--data all` is used, each type receives its own default prefix (`pure_test_<data_type>`).
 - Output files include today's date in the filename, so repeated runs will only overwrite previous exports made on the same day.
 - All JSON files are saved with UTF-8 encoding and 2-space indentation.

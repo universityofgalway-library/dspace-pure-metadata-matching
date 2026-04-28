@@ -6,38 +6,44 @@ Uploads JSON records to the University of Galway's Pure research information sys
 
 - Python 3.x
 - Dependencies: `requests`, `tqdm`, `python-dotenv`
-- A `.env` file in the working directory containing a valid Pure API key
+- A `.env` file in the working directory containing valid Pure API keys
 
 ```
-PURE_ROOT_API_KEY=your_api_key_here
+PURE_ROOT_API_KEY=your_production_api_key_here
+PURE_ROOT_API_KEY_TEST=your_uat_api_key_here
 ```
+
+`PURE_ROOT_API_KEY` is used by default (production). `PURE_ROOT_API_KEY_TEST` is used when `--test` is set. If the required variable is missing from the environment, a warning is printed and the run continues — all API calls will likely fail with authentication errors.
 
 ## Usage
 
 ```bash
-# Upload a folder of JSON files (mode inferred from folder name)
-python pure_uploader.py --folder path/to/matched_records/ --data research-outputs
+# Upload a folder of JSON files in create mode
+python pure_uploader.py --folder path/to/unmatched_records/ --mode create --data research-outputs
 
-# Upload a single JSON file with an explicit mode
+# Upload a folder of JSON files in update mode
+python pure_uploader.py --folder path/to/matched_records/ --mode update --data research-outputs
+
+# Upload a single JSON file
 python pure_uploader.py --file path/to/record.json --mode create --data persons
 
-# Target the production environment instead of UAT
-python pure_uploader.py --folder path/to/matched/ --data research-outputs --test False
+# Target the UAT environment instead of production
+python pure_uploader.py --folder path/to/matched/ --mode update --data research-outputs --test
 
 # Write logs to a custom directory
-python pure_uploader.py --folder path/to/matched/ --data journals --log-dir /custom/log/dir
+python pure_uploader.py --folder path/to/matched/ --mode update --data journals --log-dir /custom/log/dir
 ```
 
 ## Arguments
 
 | Argument | Required | Default | Description |
 |---|---|---|---|
-| `--folder` | One of `--folder` or `--file` | — | Path to a folder of JSON files to upload. Mode is inferred from the folder name (see [Folder Mode](#folder-mode)). |
-| `--file` | One of `--folder` or `--file` | — | Path to a single JSON file to upload. Requires `--mode`. |
-| `--mode` | Only with `--file` | — | `create` or `update`. Required when using `--file`. |
+| `--folder` | One of `--folder` or `--file` | — | Path to a folder of JSON files to upload. The folder is walked recursively; all `.json` files found are processed. |
+| `--file` | One of `--folder` or `--file` | — | Path to a single JSON file to upload. |
+| `--mode` | **Always required** | — | `create` or `update`. Required regardless of whether `--folder` or `--file` is used. |
 | `--data` | No | `research-outputs` | The Pure data type to upload. See [Supported Data Types](#supported-data-types). |
-| `--test` | No | `True` | `True` targets the UAT environment; `False` targets production. |
-| `--log-dir` | No | `./logs/` next to input | Directory where log files are written. |
+| `--test` | No | *(omit for production)* | Flag — include to target the UAT environment. Omit to target production. |
+| `--log-dir` | No | `./logs/` next to input | Parent directory for log output. Logs are written to `<log-dir>/uploader_logs/`. |
 
 ## Supported Data Types
 
@@ -70,14 +76,7 @@ Input files must be valid JSON. Each file may contain either a single record obj
 ]
 ```
 
-## Folder Mode
-
-When using `--folder`, the upload mode is inferred from the folder name:
-
-- Folder name **starts with `matched`** (case-insensitive) → `update`
-- Any other folder name → `create`
-
-The script walks the folder recursively and processes every `.json` file found.
+Records missing a `uuid` in update mode are treated as failures and written to the failed records file.
 
 ## API Behaviour
 
@@ -92,14 +91,14 @@ Base URLs:
 
 | Environment | URL |
 |---|---|
-| UAT (staging) | `https://galway-staging.elsevierpure.com/ws/api/` |
-| Production | `https://research.universityofgalway.ie/ws/api/` |
+| UAT (staging) — `--test` | `https://galway-staging.elsevierpure.com/ws/api/` |
+| Production — default | `https://research.universityofgalway.ie/ws/api/` |
 
 HTTP status codes `200` and `201` are treated as success. All other codes are treated as failures and logged.
 
 ## Output and Logs
 
-All logs are written to `{log_dir}/uploader_logs/` (created automatically if it does not exist).
+All logs are written to `<log-dir>/uploader_logs/` (created automatically if it does not exist). File names include a full timestamp in `YYYY-MM-DD_HH-MM-SS` format.
 
 ### Success log — `created_records_<timestamp>.json` / `updated_records_<timestamp>.json`
 
@@ -121,7 +120,9 @@ One entry is appended per successfully created or updated record:
 }
 ```
 
-The `portalUrl`, `handle`, and `portalUrlPROD` fields are only present for `research-outputs`. `portalUrlPROD` is only included when running in test mode (`--test True`) on `update` operations, because newly created records do not yet exist in production.
+The `portalUrl`, `handle`, and `portalUrlPROD` fields are only present for `research-outputs`. `portalUrlPROD` is only included when running in UAT mode (`--test`) on `update` operations, because newly created records do not yet exist in production.
+
+> **Note:** The success log uses `"data"` (not `"type"`) as the field name for the data type. If you use this log with `patch_records.py --workflow-from-log`, note that `patch_records.py` filters on a `"type"` field — the two are not currently compatible without pre-processing the log.
 
 ### Error log — `uploader_errors_<timestamp>.log`
 
@@ -129,7 +130,7 @@ A plain-text file listing one error per line. Each line includes the file path, 
 
 ### Failed records — `failed_records_<data_type>_<mode>_<timestamp>.json`
 
-If any records fail (API error or missing `uuid` on update), they are written to a single JSON file in the same directory as the source input. This file can be corrected and re-submitted.
+If any records fail (API error, exception, or missing `uuid` on update), they are written to a single JSON file. For `--folder` uploads the file is placed in the **parent directory of the input folder**; for `--file` uploads it is placed in the same directory as the input file. This file can be corrected and re-submitted.
 
 ### CSV summary — `created_records_<timestamp>.csv` / `updated_records_<timestamp>.csv`
 
@@ -140,7 +141,7 @@ Generated automatically after a run, but **only for `research-outputs`**. Contai
 | `name` | Record title |
 | `handle` | Handle URL (e.g. `http://hdl.handle.net/...`) |
 | `portalUrl` | URL in the target environment |
-| `portalUrlPROD` | Production URL (test + update mode only) |
+| `portalUrlPROD` | Production URL (UAT + update mode only) |
 
 ## Localized Field Handling
 
@@ -157,6 +158,5 @@ For language dicts, the preference order is `en_IE` → `en_GB` → `en_US` → 
 ## Notes
 
 - The script uses a persistent `requests.Session` for all API calls, with a 60-second timeout per request.
-- If `PURE_ROOT_API_KEY` is missing from the environment, a warning is printed and the run continues — all API calls will likely fail with authentication errors.
 - Progress bars (via `tqdm`) are shown at both the file level and the record level during processing.
-- Running against production (`--test False`) without verifying results in UAT first is not recommended.
+- Running against production (default, without `--test`) without verifying results in UAT first is not recommended.

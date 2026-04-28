@@ -28,13 +28,13 @@ COLLECT_EXTERNAL_ORGS = False
 
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-DSPACE_CSV = "./dspace_data/prod_samples/dspace_prod_remains_2026-04-24.csv"
-# DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_all_items_with_collection_uuids_pdfs_20260422.csv"
-PURE_JSON = "./pure_research_outputs/pure_research-outputs_2026-04-24.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-04-22/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
+# DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
+DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_all_items_with_collection_uuids_pdfs_20260422.csv"
+PURE_JSON = "./pure_research_outputs/pure_research-outputs_2026-04-27.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-23.json"
-OUTPUT_DIR = f"./record_matching/prod_remains_output_{TODAY}"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-27.json"
+OUTPUT_DIR = f"./record_matching/prod_all_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -2213,7 +2213,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
     
     # --- 11. Publisher (dc.publisher) > inject for BookAnthology / ContributionToBookAnthology ---
-    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology"}
+    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology", "OtherContribution", "WorkingPaper", "NonTextual"}
     if pub_index and pure_type in PUBLISHER_TYPES:
         dspace_publisher = dspace_row.get("dc.publisher", "").strip()
         existing_publisher_uuid = pure_record.get("publisher", {}).get("uuid") if pure_record.get("publisher") else None
@@ -2578,7 +2578,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
 
     
     # Publisher (dc.publisher) > inject for BookAnthology / ContributionToBookAnthology
-    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology"}
+    PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology", "OtherContribution", "WorkingPaper", "NonTextual"}
     if pub_index and record.get("typeDiscriminator") in PUBLISHER_TYPES:
         dspace_publisher = dspace_row.get("dc.publisher", "").strip()
         if dspace_publisher:

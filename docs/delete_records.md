@@ -23,10 +23,11 @@ pip install requests python-dotenv
 The script requires a Pure API key with **root access**. Store it in a `.env` file in the working directory:
 
 ```env
-PURE_ROOT_API_KEY=your_api_key_here
+PURE_ROOT_API_KEY=your_production_api_key_here
+PURE_ROOT_API_KEY_TEST=your_uat_api_key_here
 ```
 
-If the key is not found, the script exits immediately with an error.
+`PURE_ROOT_API_KEY` is used by default (production). `PURE_ROOT_API_KEY_TEST` is used when `--test` is set. If the required key is not found, a warning is printed and the script exits.
 
 ---
 
@@ -46,21 +47,20 @@ python delete_records.py \
   --dry-run
 ```
 
-### Example: delete all records from a folder of logs, staging environment
+### Example: delete all records from a folder of logs, UAT environment
 
 ```bash
 python delete_records.py \
   --log-dir ./logs/march/ \
-  --test True
+  --test
 ```
 
-### Example: delete only records modified after a given date, production
+### Example: delete only records modified after a given date, production (default)
 
 ```bash
 python delete_records.py \
   --log ./logs/import_log.json \
-  --after-date 2025-12-01 \
-  --test False
+  --after-date 2025-12-01
 ```
 
 ### Example: custom output directory for deletion logs
@@ -78,10 +78,10 @@ python delete_records.py \
 | Argument | Type | Default | Description |
 |---|---|---|---|
 | `--log` | `str` | `None` | Path to a single JSON log file to process |
-| `--log-dir` | `str` | `None` | Path to a directory — all `.json` files inside are processed in sorted order |
-| `--log-output-dir` | `str` | See below | Directory to write deletion result logs. Defaults to a `deletion_logs/` folder next to the input file, or inside `--log-dir` if that was used |
-| `--after-date` | `str` | `None` | Only delete records with a `modifiedDate` after this value. Accepts `YYYY-MM-DD` or full ISO datetime `YYYY-MM-DDTHH:MM:SSZ`. If omitted, all records in the log are eligible for deletion. |
-| `--test` | `bool` | `True` | Target environment. `True` uses UAT staging; `False` uses production. |
+| `--log-dir` | `str` | `None` | Path to a directory — all `.json` files inside are processed in sorted alphabetical order |
+| `--log-output-dir` | `str` | See below | Directory to write deletion result logs. Defaults to a `deletion_logs/` folder next to the input file, or inside `--log-dir` if that was used. |
+| `--after-date` | `str` | `None` | Only delete records with a `modifiedDate` strictly after this value. Accepts `YYYY-MM-DD` or full ISO datetime `YYYY-MM-DDTHH:MM:SSZ`. If omitted, all records in the log are eligible for deletion. |
+| `--test` | flag | *(omit for production)* | Include to target the UAT staging environment. Omit to target production (the default). |
 | `--dry-run` | flag | `False` | Print a preview of records that would be deleted without making any API calls or asking for confirmation. |
 
 ---
@@ -104,15 +104,15 @@ Log files must be JSON arrays (or a single JSON object) where each element repre
 | Field | Description |
 |---|---|
 | `uuid` | The Pure UUID of the record to delete. Records without a UUID are skipped and logged as failures. |
-| `data` | The entity type, used to resolve the API endpoint (see [Supported Entity Types](#supported-entity-types)). Defaults to `research-outputs` if missing. |
+| `data` | The entity type, used to resolve the API endpoint (see [Supported Entity Types](#supported-entity-types)). Defaults to `research-outputs` if missing or unrecognised. |
 
 ### Optional fields
 
 | Field | Description |
 |---|---|
-| `modifiedDate` | ISO datetime string. Required if using `--after-date` filtering; records without this field are excluded from the filtered set. |
+| `modifiedDate` | ISO datetime string. Required if using `--after-date` filtering; records without this field are silently excluded from the filtered set. |
 | `name` | Display name used in console output and logs. |
-| `endpoint` | Manual override for the API endpoint, used if `data` cannot be resolved. |
+| `endpoint` | Manual override for the API endpoint, consulted if `data` cannot be resolved to a known entity type. |
 
 ---
 
@@ -126,7 +126,7 @@ The following values are valid for the `data` field in log records:
 - `organizations`
 - `external-organizations`
 - `journals`
-- `publishers` *(remapped internally to `external-organizations`)*
+- `publishers`
 
 ---
 
@@ -178,8 +178,8 @@ Files are only created if there are records in that category. All files use UTF-
 
 | Mode | URL |
 |---|---|
-| UAT / Staging (`--test True`) | `https://galway-staging.elsevierpure.com/ws/api` |
-| Production (`--test False`) | `https://research.universityofgalway.ie/ws/api` |
+| Production — default | `https://research.universityofgalway.ie/ws/api` |
+| UAT / Staging — `--test` | `https://galway-staging.elsevierpure.com/ws/api` |
 
 ---
 

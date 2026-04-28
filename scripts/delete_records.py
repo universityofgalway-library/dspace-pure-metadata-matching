@@ -16,12 +16,7 @@ VALID_ENDPOINTS = {
     "organizations",
     "external-organizations",
     "journals",
-    "publishers",       # log label only — remapped to external-organizations below
-}
-
-# Some log 'type' values don't match the API endpoint directly
-LOG_TYPE_REMAPS = {
-    "publishers": "external-organizations",
+    "publishers",       
 }
 
 
@@ -67,7 +62,7 @@ def get_data_type_from_record(record):
     raw_type = record.get("data", "research-outputs")  # default to research-outputs if type is missing
     if isinstance(raw_type, str) and raw_type.strip().lower() in VALID_ENDPOINTS:
         endpoint = raw_type.strip().lower()
-        return LOG_TYPE_REMAPS.get(endpoint, endpoint)
+        return endpoint
 
     # Explicit override key for manually patched log entries
     if endpoint := record.get("endpoint", ""):

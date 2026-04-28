@@ -4,7 +4,7 @@ Enriches a target DSpace CSV file with journal and publisher data. Three modes a
 
 - **CSV mode** matches rows by `handle` and copies columns from another CSV;
 - **JSON mode** matches rows by journal or publisher name against a local JSON file (exported from Pure API);
-- **log mode** matches rows by journal or publisher name against an uploader JSON log and injects UUIDs only.
+- **Log mode** matches rows by journal or publisher name against an uploader JSON log and injects UUIDs only.
 
 ---
 
@@ -63,6 +63,8 @@ python enrich_csv.py target.csv source.csv --mode csv
 
 Matches rows in the target CSV against a local Pure JSON export, then populates journal or publisher columns. Requires `--type`.
 
+All target columns are written only into cells that are currently empty — existing values are never overwritten.
+
 #### `--type journals`
 
 Matches by journal title against a journals JSON file.
@@ -77,10 +79,10 @@ Matches by journal title against a journals JSON file.
 
 The JSON file must contain an array of journal objects, or a dict with an `items` array.
 
-The title column in the CSV is detected automatically (case-insensitive: prefers a column containing both `journal` and `title`, falls back to any column containing `title`).
+The title column in the CSV is detected automatically (case-insensitive: prefers a column containing both `journal` and `title`, falls back to any column containing `title`). The `journal_uuid` column is similarly detected case-insensitively (a column containing both `journal` and `uuid`).
 
 **Matching strategy** (in order):
-1. **Composite match** — normalised title + `journal_uuid`. Used when the target row already has a `journal_uuid` value; more precise as it disambiguates journals with identical titles.
+1. **Composite match** — normalised title + `journal_uuid`. Used when the target row already has a value in the detected `journal_uuid` column; more precise as it disambiguates journals with identical titles.
 2. **Title-only fallback** — normalised title alone, stripped of punctuation (see [Title normalisation](#title-normalisation) below).
 
 ```bash
@@ -97,9 +99,7 @@ Matches by publisher name against a publishers JSON file.
 |---|---|
 | `publisher_uuid` | `uuid` |
 
-The publisher name used for matching is resolved from the CSV row in this order:
-1. `dc.publisher` (if non-empty)
-2. `publisher_name` (if non-empty)
+The publisher name used for matching is read from the `dc.publisher` column of the CSV row. If that column is absent or empty, no match is attempted.
 
 **Expected publisher JSON format:**
 ```json
@@ -124,7 +124,9 @@ python enrich_csv.py target.csv publishers.json --mode json --type publishers
 
 Matches rows in the target CSV by name against an uploader log JSON file and injects a UUID only. Requires `--type`.
 
-The log file must be an array of uploader log entries. Only entries where `success` is `true` and `type` matches the specified `--type` value are used. Matching is on normalised name (same `_normalise` function as JSON mode).
+The log file must be an array of log entries. Only entries where `success` is `true` and `type` matches the specified `--type` value are used. Matching is on normalised name (same `_normalise` function as JSON mode).
+
+> **Note:** Log mode filters on the `"type"` field in each log entry. This is distinct from the `"data"` field written by `pure_uploader.py`. Log files intended for use with this script must use the `"type"` field name.
 
 **Expected log entry format:**
 ```json
@@ -135,6 +137,8 @@ The log file must be an array of uploader log entries. Only entries where `succe
   "success": true
 }
 ```
+
+The UUID is written only into cells that are currently empty — existing values are never overwritten.
 
 #### `--type journals`
 
@@ -152,7 +156,7 @@ python enrich_csv.py target.csv upload_log.json --mode log --type journals
 
 #### `--type publishers`
 
-Matches by publisher name, resolved from `dc.publisher` (preferred) or `publisher_name`.
+Matches by publisher name, read from the `dc.publisher` column. If that column is absent or empty, no match is attempted.
 
 **Columns populated in target:**
 
@@ -181,16 +185,49 @@ def _normalise(s: str) -> str:
 
 ## Output
 
-After each run the script prints a summary, for example:
+After each run the script prints a summary. The exact fields vary by mode:
 
+**CSV mode:**
+```
+============================================================
+ENRICHMENT STATISTICS (CSV MODE)
+============================================================
+Total rows in target file:  500
+Rows with matching handles: 390
+Rows updated with new data: 385
+Rows not matched:           110
+
+Match rate:  78.00%
+Update rate: 77.00%
+============================================================
+```
+
+**JSON mode:**
+```
+============================================================
+ENRICHMENT STATISTICS (JSON MODE — JOURNALS)
+============================================================
+Total rows in target file:  500
+Rows matched:               390
+Rows updated with new data: 370
+Rows already had values:    20
+Rows not matched:           110
+
+Match rate:  78.00%
+Update rate: 74.00%
+============================================================
+```
+
+**Log mode:**
 ```
 ============================================================
 ENRICHMENT STATISTICS (LOG MODE — PUBLISHERS)
 ============================================================
-Total rows in target file:  500
-Rows with matching names:   390
-Rows updated (publisher_uuid): 390
-Rows not matched:           110
+Total rows in target file:     500
+Rows matched:                  390
+Rows updated (publisher_uuid): 370
+Rows already had value:        20
+Rows not matched:              110
 
 Match rate:  78.00%
 ============================================================
