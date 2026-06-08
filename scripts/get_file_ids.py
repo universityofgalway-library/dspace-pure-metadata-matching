@@ -116,9 +116,10 @@ def match_dspace_to_pure_files(
         matched_dspace_paths, matched_pure_file_ids,
         matched_pure_file_pure_ids, matched_pure_file_names
 
-    Only paths that have a matching Pure file are included.
-    If no DSpace paths match any Pure file, all Pure files are returned as-is
-    (best-effort fallback for records where the filename can't be correlated).
+    Only paths that have a matching Pure file are included in the per-path
+    pairing. If NO DSpace paths match any Pure file, falls back to returning
+    all DSpace paths paired with all Pure files (best-effort fallback), so
+    that file info is never silently dropped.
     """
     from urllib.parse import unquote
 
@@ -142,8 +143,13 @@ def match_dspace_to_pure_files(
             matched_fpids.append(pure_file_pure_ids[idx])
             matched_fnames.append(pure_file_names[idx])
 
-    # If no DSpace path matched any Pure file, return empty lists —
-    # the caller will classify this as a partial/unmatched record.
+    # If no DSpace path matched any Pure file, fall back to returning all
+    # DSpace paths alongside all Pure files. This ensures file info is never
+    # silently lost due to minor filename discrepancies (e.g. double vs single
+    # underscore: JBDS_MentalHealth__31082017.pdf vs JBDS_MentalHealth_31082017.pdf).
+    if not matched_dspace:
+        return dspace_pdf_paths, pure_file_ids, pure_file_pure_ids, pure_file_names
+
     return matched_dspace, matched_fids, matched_fpids, matched_fnames
 
 
@@ -241,7 +247,7 @@ def match_records(
             else:
                 # DSpace has PDFs but Pure record has no FileElectronicVersions at all —
                 # nothing is matched; do not populate matched_dspace
-                matched_dspace = []
+                matched_dspace = dspace_pdf_paths
                 matched_fids   = []
                 matched_fpids  = []
                 matched_fnames = []
