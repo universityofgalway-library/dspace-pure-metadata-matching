@@ -1,4 +1,4 @@
-# get_file_ids.py
+# match_handles.py
 
 Matches records between a DSpace CSV export and a Pure JSON export by Handle URL. For each matched pair, it correlates DSpace PDF file paths against Pure `FileElectronicVersion` entries by filename and produces a joined CSV of identifiers from both systems.
 
@@ -14,7 +14,7 @@ Matches records between a DSpace CSV export and a Pure JSON export by Handle URL
 ## Usage
 
 ```bash
-python get_file_ids.py --csv <file> --json <file> [OPTIONS]
+python match_handles.py --csv <file> --json <file> [OPTIONS]
 ```
 
 Both `--csv` and `--json` are required.
@@ -23,19 +23,19 @@ Both `--csv` and `--json` are required.
 
 ```bash
 # Basic match
-python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json
+python match_handles.py --csv dspace_export.csv --json pure_outputs.json
 
 # Custom output path
-python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+python match_handles.py --csv dspace_export.csv --json pure_outputs.json \
   --output ./results/matched_2026-04-28.csv
 
 # Filter by modifier and date
-python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+python match_handles.py --csv dspace_export.csv --json pure_outputs.json \
   --modified-by "john@example.com" \
   --modified-after "2025-01-01"
 
 # Only include records where every DSpace PDF has a matched Pure file
-python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+python match_handles.py --csv dspace_export.csv --json pure_outputs.json \
   --pdf-filter with
 ```
 
