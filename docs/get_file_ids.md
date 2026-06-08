@@ -124,7 +124,7 @@ Three cases are handled:
 | DSpace has no PDF paths | Pure file fields are carried through as-is (may be empty) |
 | DSpace has PDF paths but Pure has no `FileElectronicVersion` entries | All file output fields are empty |
 
-When multiple PDFs are matched, values in the file columns are semicolon-separated.
+When multiple PDFs are found, values in the file columns are semicolon-separated.
 
 ---
 
