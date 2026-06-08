@@ -21,7 +21,7 @@ ALL_DATA_TYPES = [
     "publishers"
 ]
 
-def fetch_all(data_type, api_key="", test=False):
+def fetch_all(data_type, base_url, api_key="", test=False):
     """
     Fetch all data from the Elsevier Pure API, handling pagination.
     Returns a list of all items.
@@ -29,8 +29,6 @@ def fetch_all(data_type, api_key="", test=False):
     all_data = []
     offset = 0
     page_size = 1000
-
-    base_url = 'https://galway-staging.elsevierpure.com/ws/api/' if test == True else 'https://research.universityofgalway.ie/ws/api/'
 
     headers = {
         "accept": "application/json",
@@ -130,7 +128,7 @@ def fetch_and_save_data_type(data_type, api_key, test, output_dir, split_by_type
 
     try:
         # Fetch all data
-        all_data = fetch_all(data_type, api_key=api_key, test=test)
+        all_data = fetch_all(data_type, base_url, api_key=api_key, test=test)
         
         # Save data
         if data_type == "research-outputs" and split_by_type:
@@ -179,6 +177,10 @@ if __name__ == "__main__":
         "--filename-prefix",
         help="Custom filename prefix (only used when fetching a single data type)"
     )
+    parser.add_argument(
+        "--api-endpoint",
+        help="Custom API endpoint (overwrites the default)"
+    )
     
     args = parser.parse_args()
 
@@ -196,6 +198,11 @@ if __name__ == "__main__":
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    if args.api_endpoint:
+        base_url = args.api_endpoint
+    else:
+        base_url = 'https://galway-staging.elsevierpure.com/ws/api/' if test == True else 'https://research.universityofgalway.ie/ws/api/'
 
     # Determine which data types to fetch
     if args.data == "all":
