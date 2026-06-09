@@ -139,7 +139,7 @@ The `--pdf-filter` flag controls which matched records appear in the output. The
 | `file_name_mismatch` | `file_name_mismatch` | Both sides have files but no DSpace filename matched any Pure filename |
 | `dspace_only_pdf` | `dspace_only_pdf` | DSpace has files but the Pure record has no `FileElectronicVersion` entries |
 | `pure_only_pdf` | `pure_only_pdf` | Pure has `FileElectronicVersion` entries but DSpace has no `pdf_handle_paths` |
-| `no_pdf` | *(blank)* | Neither DSpace nor Pure have any files |
+| `no_pdf` | `no_pdf` | Neither DSpace nor Pure have any files |
 
 ---
 
@@ -220,7 +220,6 @@ Matching records by Handle…
      • http://hdl.handle.net/10379/6474
        kept:    uuid-aaa  (score (2, 2, datetime.datetime(...)))
        dropped: [uuid-bbb]
-  → No duplicates found.
 Output written to: all_matched_records_2026-06-09.csv
 Duplicates written to: all_duplicate_matched_records_2026-06-09.csv
 ```

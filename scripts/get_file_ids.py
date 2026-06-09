@@ -197,7 +197,7 @@ def classify_file_match(
     has_pure   = bool(pure_fids)
 
     if not has_dspace and not has_pure:
-        return ""
+        return "no_pdf"
 
     if has_dspace and not has_pure:
         return "dspace_only_pdf"
@@ -305,11 +305,7 @@ def match_records(
 
         # --- Apply PDF filter ---
         if pdf_filter != "all":
-            if pdf_filter == "no_pdf":
-                # Include only records where neither side has files
-                if file_match_type != "":
-                    continue
-            elif file_match_type != pdf_filter:
+            if file_match_type != pdf_filter:
                 continue
 
         # --- Build output row — always emit ALL paths and ALL Pure files ---
@@ -358,10 +354,11 @@ def _score_row(row: dict) -> tuple:
     n_pure        = len(pure_files)
     n_dspace      = len(dspace_files)
 
-    if fmt == "full_match":
-        n_matched = n_dspace
-    elif fmt == "partial_match":
-        n_matched = max(1, n_dspace - 1)
+    # With an exact recount:
+    if fmt in ("full_match", "partial_match"):
+        pure_names = [f.strip() for f in row.get("pure_file_name", "").split(";") if f.strip()]
+        _, matched_pure = match_dspace_to_pure_files(dspace_files, pure_names)
+        n_matched = len(matched_pure)
     else:
         n_matched = 0
 
@@ -387,51 +384,66 @@ def resolve_duplicates(
       3. Most recently modified Pure record (tie-breaker for determinism).
 
     Returns:
-        deduplicated_rows  — one row per unique (handle, dspace_uuid) pair
-        duplicate_rows     — every row involved in a collision (including winner),
-                             with an extra 'duplicate_key' column indicating which
-                             key triggered the group
+        deduplicated_rows  — one row per unique (handle, dspace_uuid) pair;
+                             only the winner of each collision group is kept
+        duplicate_rows     — every row involved in any collision (winners and
+                             losers), each annotated with a 'duplicate_key'
+                             column showing which key triggered the group;
+                             preferred key is dspace_uuid, falling back to
+                             handle when no dspace_uuid collision exists
         duplicate_groups   — raw dict keyed by collision key, for warning output
     """
-    # Group by handle, then separately by dspace_uuid, to catch both collision types.
-    by_handle:      dict[str, list[dict]] = defaultdict(list)
+    # Group by dspace_uuid first (preferred key), then by handle (fallback).
     by_dspace_uuid: dict[str, list[dict]] = defaultdict(list)
+    by_handle:      dict[str, list[dict]] = defaultdict(list)
 
     for row in output_rows:
-        by_handle[row["handle"]].append(row)
         by_dspace_uuid[row["dspace_uuid"]].append(row)
+        by_handle[row["handle"]].append(row)
 
-    # Collect all pure_uuids that are part of any collision group so we can
-    # replace them with the winner in the final output.
-    # Key: pure_uuid → winning row for that collision group.
-    replacement: dict[str, dict] = {}   # pure_uuid → winner row to keep
-    to_remove:   set[str]        = set() # pure_uuids to drop from final output
+    # pure_uuids involved in any collision, mapped to the winner of their group.
+    to_remove:   set[str]        = set()  # losers — dropped from main output
 
     duplicate_groups: dict[str, list[dict]] = {}
-    duplicate_rows:   list[dict]            = []
+    # pure_uuid → annotated duplicate row; built with dspace_uuid key preferred.
+    dup_by_pure_uuid: dict[str, dict] = {}
 
-    def _process_group(key: str, rows: list[dict]) -> None:
+    def _process_group(key: str, rows: list[dict], prefer: bool) -> None:
+        """
+        Register a collision group.
+
+        prefer=True  — dspace_uuid pass: always record/overwrite the annotated
+                       row for each pure_uuid in this group (preferred key).
+        prefer=False — handle pass: only record if this pure_uuid has not yet
+                       been annotated by a dspace_uuid group (fallback key).
+        """
         if len(rows) < 2:
             return
         duplicate_groups[key] = rows
         winner = max(rows, key=_score_row)
         for row in rows:
+            uid = row["pure_uuid"]
             annotated = dict(row, duplicate_key=key)
-            duplicate_rows.append(annotated)
+            if prefer or uid not in dup_by_pure_uuid:
+                dup_by_pure_uuid[uid] = annotated
             if row["pure_uuid"] != winner["pure_uuid"]:
-                to_remove.add(row["pure_uuid"])
-            else:
-                # Mark winner so we keep exactly one copy if it appears in
-                # multiple collision groups (e.g. same row flagged by both
-                # handle AND dspace_uuid).
-                replacement[row["pure_uuid"]] = winner
+                to_remove.add(uid)
 
-    for key, rows in by_handle.items():
-        _process_group(key, rows)
+    # dspace_uuid pass first — these entries take priority in the duplicates file.
     for key, rows in by_dspace_uuid.items():
-        _process_group(key, rows)
+        _process_group(key, rows, prefer=True)
+    # handle pass — fills in any pure_uuid not already covered above.
+    for key, rows in by_handle.items():
+        _process_group(key, rows, prefer=False)
 
-    # Rebuild output: drop losers, keep one copy of each winner.
+    # Preserve insertion order of output_rows in the duplicates file.
+    duplicate_rows: list[dict] = [
+        dup_by_pure_uuid[row["pure_uuid"]]
+        for row in output_rows
+        if row["pure_uuid"] in dup_by_pure_uuid
+    ]
+
+    # Main output: one winner per collision group, all non-duplicate rows kept.
     seen_winners: set[str] = set()
     deduplicated: list[dict] = []
     for row in output_rows:
@@ -439,37 +451,11 @@ def resolve_duplicates(
         if uid in to_remove:
             continue
         if uid in seen_winners:
-            continue    # winner already emitted (dedup across both group passes)
+            continue
         seen_winners.add(uid)
         deduplicated.append(row)
 
-    # Deduplicate the duplicate_rows list to one entry per pure_uuid.
-    # A row can be flagged by both its handle group and its dspace_uuid group;
-    # we keep only the handle-keyed entry (more meaningful identifier), falling
-    # back to the dspace_uuid-keyed entry if no handle entry exists.
-    handle_keyed:    dict[str, dict] = {}   # pure_uuid → handle-keyed entry
-    fallback_keyed:  dict[str, dict] = {}   # pure_uuid → first other entry seen
-
-    for row in duplicate_rows:
-        uid = row["pure_uuid"]
-        if row["duplicate_key"].startswith("http"):
-            handle_keyed[uid] = row
-        else:
-            if uid not in fallback_keyed:
-                fallback_keyed[uid] = row
-
-    deduped_dup_rows: list[dict] = []
-    seen: set[str] = set()
-    for row in duplicate_rows:
-        uid = row["pure_uuid"]
-        if uid in seen:
-            continue
-        seen.add(uid)
-        # Prefer the handle-keyed entry; fall back to whatever we have
-        canonical = handle_keyed.get(uid, fallback_keyed.get(uid, row))
-        deduped_dup_rows.append(canonical)
-
-    return deduplicated, deduped_dup_rows, duplicate_groups
+    return deduplicated, duplicate_rows, duplicate_groups
 
 
 def write_output(output_rows: list[dict], output_path: str) -> None:
@@ -528,7 +514,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="matched_records.csv",
+        default="./pure_temp/temp_test_matched_records.csv",
         metavar="OUTPUT_FILE",
         help=(
             "Base path for the main output CSV (default: matched_records.csv). "
@@ -578,7 +564,7 @@ def parse_args() -> argparse.Namespace:
 def _dated_path(path: str, date_str: str) -> str:
     """
     Insert a YYYY-MM-DD suffix before the file extension.
-    e.g. "temp_test_matched_records.csv" → "matched_records_2026-06-09.csv"
+    e.g. "matched_records.csv" → "matched_records_2026-06-09.csv"
     """
     if "." in path:
         stem, ext = path.rsplit(".", 1)
