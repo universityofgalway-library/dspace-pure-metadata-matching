@@ -22,21 +22,21 @@ Both `--csv` and `--json` are required.
 ### Examples
 
 ```bash
-# Basic match
+# Basic match — all records, default output filename
 python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json
 
 # Custom output path
 python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
-  --output ./results/matched_2026-04-28.csv
+  --output ./results/matched_records.csv
 
 # Filter by modifier and date
 python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
   --modified-by "john@example.com" \
   --modified-after "2025-01-01"
 
-# Only include records where every DSpace PDF has a matched Pure file
+# Only include records where every DSpace PDF matched a Pure file
 python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
-  --pdf-filter with
+  --pdf-filter full_match
 ```
 
 ---
@@ -47,10 +47,10 @@ python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
 |---|---|---|---|
 | `--csv` | Yes | — | Path to the DSpace CSV input file |
 | `--json` | Yes | — | Path to the Pure JSON input file |
-| `--output` | No | `matched_records.csv` | Path for the output CSV file |
+| `--output` | No | `matched_records.csv` | Base path for the output CSV. The `--pdf-filter` value and today's date are inserted automatically — see [Output Files](#output-files) |
 | `--modified-by` | No | `None` | Only include Pure records whose `modifiedBy` field exactly matches this value |
 | `--modified-after` | No | `None` | Only include Pure records modified strictly after this date. Format: `YYYY-MM-DD` |
-| `--pdf-filter` | No | `all` | Filter output by PDF match state — see [PDF Filter](#pdf-filter) |
+| `--pdf-filter` | No | `all` | Filter output by PDF match type — see [PDF Filter](#pdf-filter) |
 
 Both `--modified-by` and `--modified-after` can be combined. If neither is set, all Pure records are considered.
 
@@ -73,7 +73,7 @@ Optional columns used when present:
 
 | Column | Description |
 |---|---|
-| `pdf_handle_paths` | Semicolon-separated handle-based paths to DSpace PDFs, e.g. `/10379/4728/1/file.pdf`. Used for PDF matching against Pure file records. |
+| `pdf_handle_paths` | Semicolon-separated paths to DSpace PDFs, e.g. `/10379/4728/1/file.pdf`. Used for PDF matching against Pure file records. |
 
 ### Pure JSON
 
@@ -92,9 +92,9 @@ Optional fields:
 | Field | Description |
 |---|---|
 | `title` | Used to populate the `title` output column. Read from `title.value`. |
-| `electronicVersions` | Used to extract `FileElectronicVersion` file metadata (see [PDF Matching](#pdf-matching)). |
+| `electronicVersions` | Used to extract `FileElectronicVersion` file metadata — see [PDF Matching](#pdf-matching). |
 | `modifiedBy` | String. Used by the `--modified-by` filter. |
-| `modifiedDate` | ISO-8601 datetime string. Used by the `--modified-after` filter. Records with a missing or unparseable `modifiedDate` are excluded when this filter is active. |
+| `modifiedDate` | ISO-8601 datetime string. Used by the `--modified-after` filter and by duplicate resolution. Records with a missing or unparseable `modifiedDate` are excluded when `--modified-after` is active, and treated as least-recently-modified during duplicate resolution. |
 
 ---
 
@@ -110,47 +110,60 @@ Optional fields:
 
 ## PDF Matching
 
-When a DSpace row has a `pdf_handle_paths` value and the matched Pure record has `FileElectronicVersion` entries, the script correlates them by filename:
+All DSpace PDF paths and all Pure `FileElectronicVersion` entries are always written to the output row regardless of whether their filenames matched — no file information is silently dropped.
+
+When both sides have files, the script attempts to correlate them by filename:
 
 - The base filename is extracted from each DSpace path (URL-decoded, trailing slashes stripped).
-- Both the DSpace filename and the Pure `fileName` are normalised using Pure's filename normalisation rules (non-alphanumeric characters other than hyphens, underscores, dots, and spaces are replaced with underscores).
+- Both the DSpace filename and the Pure `fileName` are normalised using Pure's filename normalisation rules: characters that are not alphanumeric, hyphens, underscores, dots, or spaces are replaced with underscores.
 - A DSpace path is considered matched if its normalised filename equals a normalised Pure `fileName`.
 
-Three cases are handled:
+The result of this correlation determines the `file_match_type` column — see [PDF Filter](#pdf-filter).
 
-| Situation | Behaviour |
-|---|---|
-| DSpace has PDF paths AND Pure has `FileElectronicVersion` entries | Per-file matching is performed; only correlated pairs are written to the output |
-| DSpace has no PDF paths | Pure file fields are carried through as-is (may be empty) |
-| DSpace has PDF paths but Pure has no `FileElectronicVersion` entries | All file output fields are empty |
-
-When multiple PDFs are found, values in the file columns are semicolon-separated.
+When multiple files are present, values in the file columns are semicolon-separated.
 
 ---
 
 ## PDF Filter
 
-The `--pdf-filter` flag controls which matched records appear in the output based on how well DSpace PDF paths correlate with Pure file records:
+The `--pdf-filter` flag controls which matched records appear in the output. The same label is written to the `file_match_type` column of every row.
 
-| Value | Included records |
-|---|---|
-| `all` (default) | Every handle-matched record |
-| `with` | Only records where every DSpace PDF path has a matching Pure file (records with no DSpace PDFs are excluded) |
-| `without` | Only records with no `pdf_handle_paths` in the DSpace row |
-| `partial` | Only records where at least one DSpace PDF matched a Pure file AND at least one did not |
+| Value | `file_match_type` | Included records |
+|---|---|---|
+| `all` (default) | varies | Every handle-matched record |
+| `full_match` | `full_match` | Both sides have files and every DSpace PDF path matched a Pure filename |
+| `partial_match` | `partial_match` | Both sides have files, at least one DSpace PDF matched, and at least one did not |
+| `file_name_mismatch` | `file_name_mismatch` | Both sides have files but no DSpace filename matched any Pure filename |
+| `dspace_only_pdf` | `dspace_only_pdf` | DSpace has files but the Pure record has no `FileElectronicVersion` entries |
+| `pure_only_pdf` | `pure_only_pdf` | Pure has `FileElectronicVersion` entries but DSpace has no `pdf_handle_paths` |
+| `no_pdf` | *(blank)* | Neither DSpace nor Pure have any files |
 
 ---
 
-## Output
+## Output Files
 
-A CSV file written to the path specified by `--output`:
+Two output files are produced, both named automatically from the `--output` base path using the `--pdf-filter` value as a prefix and today's date as a suffix:
+
+| File | Naming pattern | Contents |
+|---|---|---|
+| Main output | `<filter>_<name>_<YYYY-MM-DD>.csv` | One row per matched record, after duplicate resolution |
+| Duplicates | `<filter>_duplicate_<name>_<YYYY-MM-DD>.csv` | All rows involved in duplicate collisions (only written if duplicates exist) |
+
+For example, with `--output matched_records.csv` and `--pdf-filter all` run on 2026-06-09:
 
 ```
-dspace_uuid,pure_uuid,pure_id,title,dspace_file_id,pure_file_id,pure_file_pure_id,pure_file_name,handle
-a1b2c3d4-...,e5f6a7b8-...,12345,My Paper Title,/10379/4728/1/paper.pdf,MDAxOTAxYjI5,98765,paper.pdf,http://hdl.handle.net/10379/4728
+all_matched_records_2026-06-09.csv
+all_duplicate_matched_records_2026-06-09.csv
 ```
 
-### Output columns
+With a directory prefix such as `--output results/matched_records.csv`, the filter prefix and date suffix are applied to the filename only:
+
+```
+results/all_matched_records_2026-06-09.csv
+results/all_duplicate_matched_records_2026-06-09.csv
+```
+
+### Main output columns
 
 | Column | Description |
 |---|---|
@@ -158,17 +171,34 @@ a1b2c3d4-...,e5f6a7b8-...,12345,My Paper Title,/10379/4728/1/paper.pdf,MDAxOTAxY
 | `pure_uuid` | UUID of the matched Pure record |
 | `pure_id` | Numeric Pure identifier (`pureId`) |
 | `title` | Pure record title (`title.value`) |
-| `dspace_file_id` | Semicolon-separated handle-based paths for matched DSpace PDFs |
-| `pure_file_id` | Semicolon-separated `fileId` values for matched Pure files |
-| `pure_file_pure_id` | Semicolon-separated `pureId` values for matched Pure file objects |
-| `pure_file_name` | Semicolon-separated `fileName` values for matched Pure files |
+| `dspace_file_id` | Semicolon-separated DSpace PDF paths from `pdf_handle_paths` |
+| `pure_file_id` | Semicolon-separated `fileId` values for all Pure `FileElectronicVersion` entries |
+| `pure_file_pure_id` | Semicolon-separated `pureId` values for all Pure file objects |
+| `pure_file_name` | Semicolon-separated `fileName` values for all Pure files |
+| `file_match_type` | PDF match classification for this record — see [PDF Filter](#pdf-filter) |
 | `handle` | Full Handle URL used to make the match |
+
+### Duplicates output columns
+
+Identical to the main output, with one additional leading column:
+
+| Column | Description |
+|---|---|
+| `duplicate_key` | The handle or `dspace_uuid` that triggered the collision group |
 
 ---
 
-## Duplicate Detection
+## Duplicate Resolution
 
-After matching, the script checks for rows where the same `handle` or `dspace_uuid` maps to more than one `pure_uuid`. Duplicate rows are included in the output — they are not removed — and a warning is printed to stdout listing each conflicting key and the Pure UUIDs involved. These should be investigated manually.
+After matching, the script detects records where the same `handle` or `dspace_uuid` maps to more than one `pure_uuid`. Rather than emitting all candidates, it selects the best one per collision group and excludes the rest from the main output.
+
+**Selection criteria (descending priority):**
+
+1. Most DSpace filenames matched to a Pure filename.
+2. Most Pure `FileElectronicVersion` entries in total.
+3. Most recently modified (`modifiedDate` from the Pure record). Records missing a `modifiedDate` rank lowest.
+
+All candidates (winner and losers) are written to the duplicates output file for review. A warning is printed to stdout for each collision group, showing which Pure record was kept, its score, and which were dropped.
 
 ---
 
@@ -184,7 +214,10 @@ Matching records by Handle…
   → 287 complete matches found.
   → 4 matched records skipped due to missing core fields.
   → WARNING: 2 duplicate keys detected (same handle or dspace_uuid maps to multiple pure_uuids).
-     • http://hdl.handle.net/10379/6474  →  [uuid-aaa, uuid-bbb]
+     • http://hdl.handle.net/10379/6474
+       kept:    uuid-aaa  (score (2, 2, datetime.datetime(...)))
+       dropped: [uuid-bbb]
   → No duplicates found.
-Output written to: matched_records.csv
+Output written to: all_matched_records_2026-06-09.csv
+Duplicates written to: all_duplicate_matched_records_2026-06-09.csv
 ```
