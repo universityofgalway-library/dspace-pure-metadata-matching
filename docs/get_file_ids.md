@@ -100,11 +100,14 @@ Optional fields:
 
 ## Matching Logic
 
-1. Each Pure record is checked for links with `alias == "Handle"`.
-2. Each Handle URL is looked up in the DSpace records dictionary (keyed by full Handle URL). Bare handles in the DSpace CSV (e.g. `10379/6474`) are automatically prefixed with `http://hdl.handle.net/` before lookup.
-3. On a match, identifiers and file information are collected from both records (see [PDF Matching](#pdf-matching)) and a row is produced.
-4. Rows where any of the four core fields (`dspace_uuid`, `pure_uuid`, `pure_id`, `handle`) is empty are skipped and counted separately.
-5. If a Pure record has multiple Handle links, the first one that matches a DSpace record is used and subsequent handles for that record are ignored.
+1. The DSpace CSV is indexed by two keys on load: full Handle URL and DSpace item UUID.
+2. For each Pure record, a DSpace match is attempted in priority order:
+   - **DSpace UUID first** — the Pure record's `identifiers` array is searched for an entry with `idSource == "DSpace"`. If found, the UUID is looked up in the DSpace UUID index.
+   - **Handle fallback** — if no UUID match is found, each link in the Pure record's `links` array with `alias == "Handle"` is looked up in the DSpace Handle index. The first matching Handle is used.
+3. If neither lookup finds a match, the Pure record is skipped.
+4. On a match, identifiers and file information are collected from both records (see [PDF Matching](#pdf-matching)) and a row is produced. The `handle` value in the output row is always taken from the DSpace CSV record's own `handle` column, regardless of which key triggered the match.
+5. Rows where any of the four core fields (`dspace_uuid`, `pure_uuid`, `pure_id`, `handle`) is empty are skipped and counted separately.
+6. Each Pure record produces at most one output row. Once a match is found (by either key), no further lookups are attempted for that record.
 
 ---
 
