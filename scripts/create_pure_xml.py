@@ -443,7 +443,7 @@ def rights_to_licence(rights: str) -> str:
 # ---------------------------------------------------------------------------
 
 def sub(parent: ET.Element, tag: str, text: str | None = None,
-        attrib: dict | None = None, ns: str = "") -> ET.Element:
+        attrib: dict | None = None, ns: str = PUB_NS) -> ET.Element:
     """Create and append a child element, optionally with text and attributes."""
     full_tag = f"{{{ns}}}{tag}" if ns else tag
     el = ET.SubElement(parent, full_tag, attrib=attrib or {})
@@ -478,11 +478,11 @@ def build_publication_statuses(parent: ET.Element, pure_record: dict) -> None:
         if pub_date:
             date_el = sub(st_el, "date")
             if pub_date.get("year"):
-                sub(date_el, ns2("year"), str(pub_date["year"]))
+                sub(date_el, "year", str(pub_date["year"]), ns=CMN_NS)
             if pub_date.get("month"):
-                sub(date_el, ns2("month"), str(pub_date["month"]))
+                sub(date_el, "month", str(pub_date["month"]), ns=CMN_NS)
             if pub_date.get("day"):
-                sub(date_el, ns2("day"), str(pub_date["day"]))
+                sub(date_el, "day", str(pub_date["day"]), ns=CMN_NS)
 
 
 def build_title(parent: ET.Element, pure_record: dict, lang_uri: str) -> None:
@@ -828,7 +828,7 @@ def build_record_element(
 
     rec_el = ET.SubElement(
         root,
-        xml_tag,
+        f"{{{PUB_NS}}}{xml_tag}",
         attrib={"id": pure_id, "subType": sub_type},
     )
 
