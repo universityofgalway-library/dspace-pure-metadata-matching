@@ -775,6 +775,25 @@ def build_journal(
         sub(issns_el, "issn", issn)
 
 
+def build_journal_required(parent: ET.Element, dspace_record: dict) -> None:
+    """
+    Like build_journal but always emits the <journal> element even when no
+    title or ISSN is available, because for contributionToSpecialist the
+    element is mandatory (minOccurs=1 in the XSD).
+    """
+    journal_title = (dspace_record.get("journal_title") or "").strip()
+    if not journal_title:
+        journal_title = (dspace_record.get("dc.identifier.journal") or "").strip()
+    issn = (dspace_record.get("dc.identifier.issn") or "").strip()
+
+    j_el = sub(parent, "journal")
+    if journal_title:
+        sub(j_el, "title", journal_title)
+    if issn:
+        issns_el = sub(j_el, "printIssns")
+        sub(issns_el, "issn", issn)
+
+
 def build_publisher(parent: ET.Element, dspace_record: dict) -> None:
     publisher = (dspace_record.get("publisher_name") or
                  dspace_record.get("dc.publisher") or "").strip()
@@ -884,6 +903,9 @@ def build_record_element(
     if owner_uuid:
         sub(rec_el, "owner", attrib={"id": owner_uuid})
 
+    # urls — must precede electronicVersions in the XSD sequence
+    build_urls(rec_el, dspace_record, pure_record)
+
     # electronicVersions (from Pure + DSpace file metadata)
     build_electronic_versions(rec_el, pure_record, dspace_record, lang_uri, store_host, default_version)
 
@@ -899,11 +921,8 @@ def build_record_element(
     dspace_uuid = (dspace_record.get("uuid") or "").strip()
     _build_external_ids(rec_el, pure_record, dspace_uuid, dspace_record)
 
-    # funding text
+    # funding text — must follow externalIds in the XSD sequence
     build_funding_text(rec_el, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
-
-    # urls
-    build_urls(rec_el, dspace_record, pure_record)
 
     # Type-specific fields
     _add_type_specific_fields(rec_el, xml_tag, pure_record, dspace_record, lang_uri)
@@ -926,18 +945,24 @@ def _add_type_specific_fields(
 
     elif xml_tag == "chapterInBook":
         build_isbns(rec_el, dspace_record)
-        # host publication title from DSpace (no dedicated field in JSON sample,
-        # so derive from dc.title.alternative when present)
-        alt_title = (dspace_record.get("dc.title.alternative") or "").strip()
-        if alt_title:
-            sub(rec_el, "hostPublicationTitle", alt_title)
+        # hostPublicationTitle is mandatory (minOccurs=1 in XSD).
+        # Prefer dc.title.alternative; fall back to dc.relation.ispartof;
+        # if neither is present emit "—" so the record still validates.
+        alt_title = (
+            (dspace_record.get("dc.title.alternative") or "").strip()
+            or (dspace_record.get("dc.relation.ispartof") or "").strip()
+            or "—"
+        )
+        sub(rec_el, "hostPublicationTitle", alt_title)
         build_publisher(rec_el, dspace_record)
 
     elif xml_tag == "workingPaper":
         build_publisher(rec_el, dspace_record)
 
     elif xml_tag == "contributionToSpecialist":
-        build_journal(rec_el, dspace_record)
+        # journal is mandatory (minOccurs=1 in XSD); always emit it even if empty
+        # so that records without ISSN/journal title still validate.
+        build_journal_required(rec_el, dspace_record)
 
     elif xml_tag == "thesis":
         quality = (dspace_record.get("dc.type") or "").strip().lower()
@@ -1141,7 +1166,7 @@ def main() -> None:
     args = parse_args()
 
     today = datetime.now().strftime("%Y-%m-%d")
-    output_path = args.output or f"./xml_import/pure_import_{today}.xml"
+    output_path = args.output or f"./xml_import/{args.environment}_pure_import_{today}.xml"
 
     store_base_url = DSPACE_BASE_URLS[args.environment]
     store_host = urlsplit(store_base_url).netloc
