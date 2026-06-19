@@ -7,14 +7,15 @@ Matches records between a **DSpace CSV export** and a **Pure JSON export**, then
 ## Requirements
 
 - Python 3.10+
-- Standard library only (`csv`, `json`, `xml.etree.ElementTree`, `xml.dom.minidom`, `argparse`, `re`)
+- `python-dotenv` (for reading the optional `.env` API key file)
+- Standard library otherwise (`csv`, `json`, `xml.etree.ElementTree`, `xml.dom.minidom`, `argparse`, `re`, `urllib`, `mimetypes`)
 
 ---
 
 ## Usage
 
 ```bash
-# Minimal — output defaults to pure_import_YYYY-MM-DD.xml
+# Minimal — output defaults to ./xml_import/{environment}_pure_import_YYYY-MM-DD.xml
 python create_pure_xml.py --csv dspace.csv --json pure.json --environment test
 
 # Explicit output path, PROD environment
@@ -36,20 +37,29 @@ python create_pure_xml.py --csv dspace.csv --json pure.json --environment prod \
 |---|---|---|
 | `--csv` | Yes | Path to the DSpace CSV export file |
 | `--json` | Yes | Path to the Pure JSON export file |
-| `--environment` | Yes | Which DSpace environment to target: `test` or `prod`. Determines the host written into `<storeName>`/`<source>`, and the domain used when rewriting DSpace bitstream links. See [DSpace environments](#dspace-environments) below. |
+| `--environment` | Yes | Which DSpace environment to target: `test` or `prod`. Determines the host written into `<storeName>`/`<source>`, the domain used when rewriting DSpace bitstream links, and which Pure Journals API endpoint/API key is used. See [DSpace environments](#dspace-environments) below. |
 | `--default-version` | No | `<version>` value to use for files that exist only in DSpace (no Pure `versionType` to draw from). Defaults to `publishersversion`. |
-| `--output` | No | Output XML path. Defaults to `pure_import_YYYY-MM-DD.xml` in the working directory |
+| `--output` | No | Output XML path. Defaults to `./xml_import/{environment}_pure_import_YYYY-MM-DD.xml` |
 | `--modified-by` | No | Only include Pure records whose `modifiedBy` field equals this value |
 | `--modified-after` | No | Only include Pure records modified strictly after this date (`YYYY-MM-DD`) |
 
 ### DSpace environments
 
-| `--environment` | Base URL | Host written to `<storeName>` / `<source>` |
-|---|---|---|
-| `test` | `https://galway.dspace7-test.openrepository.com/` | `galway.dspace7-test.openrepository.com` |
-| `prod` | `https://researchrepository.universityofgalway.ie/` | `researchrepository.universityofgalway.ie` |
+| `--environment` | Base URL | Host written to `<storeName>` / `<source>` | Pure Journals API | API key env var |
+|---|---|---|---|---|
+| `test` | `https://galway.dspace7-test.openrepository.com/` | `galway.dspace7-test.openrepository.com` | `https://cust-uk-cc-dspace3.devel.elsevierpure.com/ws/api/journals/{uuid}` | `PURE_ROOT_API_KEY_TEST` |
+| `prod` | `https://researchrepository.universityofgalway.ie/` | `researchrepository.universityofgalway.ie` | `https://research.universityofgalway.ie/ws/api/journals/{uuid}` | `PURE_ROOT_API_KEY` |
 
 Any DSpace bitstream URL taken from the CSV's `pdf_links` column has its domain rewritten onto whichever host is selected — the path and query string are left untouched. URLs that don't come from DSpace (Pure-hosted file URLs, `hdl.handle.net` links) are never rewritten.
+
+### Pure API key (optional, journal lookups only)
+
+If a Pure record needs a `<journal>` but neither the Pure JSON nor the DSpace CSV has enough information (see [Journal resolution](#journal-resolution) below), the script can call the Pure Journals REST API as a last resort. The API key is read from:
+
+1. A `.env` file in the working directory (loaded via `python-dotenv`), or
+2. A real process environment variable of the same name,
+
+under the variable name shown in the table above for the selected `--environment`. Real environment variables take precedence over the `.env` file. If no key is found, the script still runs — journal lookups just fall back to whatever Pure JSON and the DSpace CSV already provide, and a warning is printed whenever an API call would have been needed.
 
 ---
 
@@ -65,20 +75,21 @@ Standard DSpace metadata export. The script uses the following columns:
 | `handle` | Fallback match key; also written as `<existingStores><existingStore><storeContentId>` and used to build the `<file id="...">` attribute for DSpace-only files |
 | `pdf_links` | Full DSpace bitstream URL for the item's file. Used as `<fileLocation>` (domain rewritten per `--environment`) when that file isn't already represented in the Pure JSON |
 | `pdf_handle_paths` | Old-style handle bitstream path (e.g. `/10379/17513/1/name.pdf`), parsed to recover the bitstream sequence number and filename for the DSpace-only `<file>` block |
+| `dc.title` | Title fallback used in unmatched-row warnings |
+| `dc.title.alternative` / `dc.relation.ispartof` | Host publication title for book chapters |
 | `dc.title.subtitle` | Subtitle |
 | `dc.description.abstract` | Abstract (if Pure has none) |
 | `dc.description.peer-reviewed` | Peer review flag fallback |
 | `dc.description.sponsorship` | Funding text |
 | `dc.identifier.doi` | DOI fallback if Pure has none |
 | `dc.identifier.uri` | Handle URL(s) written to `<urls>` |
-| `dc.identifier.issn` | ISSN written into `<journal>` and `<externalIds>` |
+| `dc.identifier.issn` | ISSN written into `<journal>` |
 | `dc.identifier.isbn` | ISBN written into `<printIsbns>` |
 | `dc.language.iso` | Language fallback |
 | `dc.publisher` / `publisher_name` | Publisher name |
 | `dc.rights` | Licence fallback (e.g. `CC BY-NC-ND`) |
-| `dc.type` | Publication type fallback |
+| `dc.type` | Publication type fallback, and thesis qualification detection (`phd`/`doctoral`/`master`) |
 | `dc.date.embargo` / `dc.description.embargo` | Embargo start/end dates |
-| `dc.title.alternative` | Host publication title for book chapters |
 | `journal_title` | Journal title |
 | `dc.identifier.journal` | Journal title fallback |
 
@@ -95,6 +106,7 @@ Array of research output objects as returned by the Pure REST API. The script re
 - `workflow.step`, `visibility.key`
 - `contributors[]` (name, role, correspondingAuthor)
 - `organizations[]`, `managingOrganization`
+- `journalAssociation.journal.uuid`, `journalAssociation.title.title`
 - `electronicVersions[]` (DOI, file, and link versions)
 - `identifiers[]` (to extract the DSpace UUID)
 - `links[]` (to extract Handle URLs)
@@ -109,7 +121,9 @@ For each Pure JSON record, the script attempts to find its counterpart in the DS
 1. **DSpace UUID** — looks for an entry in Pure's `identifiers[]` array where `idSource == "DSpace"`, then matches its `value` against the CSV `uuid` column.
 2. **Handle URL** — looks for entries in Pure's `links[]` array where `alias == "Handle"`, then matches the URL against the CSV `handle` column (bare handles like `10379/1234` are automatically prefixed with `http://hdl.handle.net/`).
 
-Pure records with no match in the CSV are skipped and reported in the console output.
+Pure records with no match in the CSV are simply skipped — this is not reported, since the DSpace CSV is treated as the authoritative list of what needs to end up in the import.
+
+**DSpace rows with no match in Pure are reported instead.** After matching, the script checks every `uuid`/`handle` in the DSpace CSV against what was actually consumed during matching, and prints one `WARNING` line per unmatched DSpace row (with its `uuid`, `handle`, and `dc.title`) to stderr. This surfaces DSpace items that would otherwise be silently dropped from the import.
 
 ### Duplicate resolution
 
@@ -131,44 +145,63 @@ The output conforms to the Pure Research Output Import schema (`v1.publication-i
 
 ### Publication type mapping
 
-The XML element tag and `subType` attribute are resolved from the Pure `type.uri` field. If the URI is not recognised, the script falls back to the DSpace `dc.type` string.
+The XML element tag and `subType` attribute are resolved from the Pure `type.uri` field via `PURE_TYPE_MAP`. If the URI is not recognised (or absent), the script falls back to the DSpace `dc.type` string via `DSPACE_TYPE_MAP`. If neither source provides a recognised type, the record is written as `<other subType="other">`.
 
-**From Pure `type.uri`:**
+`PURE_TYPE_MAP` is large (70+ entries) and covers every Pure research-output subtype currently in use, grouped by XML element. A representative sample:
 
 | Pure URI (suffix) | XML tag | subType |
 |---|---|---|
 | `contributiontojournal/article` | `contributionToJournal` | `article` |
-| `contributiontojournal/review` | `contributionToJournal` | `review` |
+| `contributiontojournal/systematicreview` | `contributionToJournal` | `systematicreview` |
 | `contributiontoconference/paper` | `contributionToConference` | `paper` |
-| `contributiontoconference/poster` | `contributionToConference` | `poster` |
 | `bookanthology/book` | `book` | `book` |
-| `bookanthology/commissioned_report` | `book` | `book` |
+| `bookanthology/edited_book` | `book` | `edited_book` |
 | `contributiontobookanthology/chapter` | `chapterInBook` | `chapter` |
+| `contributiontobookanthology/entry` | `chapterInBook` | `entry` |
 | `workingpaper/workingpaper` | `workingPaper` | `workingpaper` |
 | `thesis/doctoral` | `thesis` | `phd` |
 | `thesis/master` | `thesis` | `master` |
 | `nontextual/digitalorvisualproducts` | `nonTextual` | `digitalorvisualproducts` |
 | `patent/patent` | `patent` | `patent` |
 | `memorandum/academicmemorandum` | `memorandum` | `academicmemorandum` |
-| `other/other` | `other` | `other` |
+| `contributiontomemorandum/contributiontoacademicmemorandum` | `contributionToMemorandum` | `contributiontoacademicmemorandum` |
+| `contributiontoperiodical/article` | `contributionToPeriodical` | `article` |
+| `contributiontospecialistpublication/article` | `contributionToSpecialist` | `article` |
+| `othercontribution/other` | `other` | `other` |
 
-**DSpace `dc.type` fallback:**
+For the complete, authoritative list of every supported subtype, see the `PURE_TYPE_MAP` dictionary in the script itself.
+
+**DSpace `dc.type` fallback (`DSPACE_TYPE_MAP`):**
 
 | dc.type | XML tag | subType |
 |---|---|---|
 | `journal article` | `contributionToJournal` | `article` |
-| `review` / `review article` / `book review` | `contributionToJournal` | `review` |
+| `review article` | `contributionToJournal` | `systematicreview` |
+| `review` | `contributionToSpecialist` | `review` |
+| `book review` | `contributionToPeriodical` | `book` |
 | `conference paper` | `contributionToConference` | `paper` |
+| `conference output` | `contributionToConference` | `other` |
 | `conference poster` | `contributionToConference` | `poster` |
+| `conference proceedings` | `contributionToConference` | `other` |
 | `book` | `book` | `book` |
 | `book part` | `chapterInBook` | `chapter` |
 | `report` | `book` | `book` |
 | `working paper` | `workingPaper` | `workingpaper` |
-| `newspaper article` | `contributionToSpecialist` | `article` |
-| `video` / `interactive resource` | `nonTextual` | `digitalorvisualproducts` |
-| `data management plan` / `other` | `other` | `other` |
+| `newspaper article` | `contributionToPeriodical` | `article` |
+| `video` | `nonTextual` | `audiovisual_material` |
+| `interactive resource` | `nonTextual` | `web_publication` |
+| `data management plan` | `other` | `other` |
+| `other` | `other` | `other` |
 
-If neither source provides a recognised type, the record is written as `<other subType="other">`.
+### Journal resolution
+
+`<journal>` is mandatory for `contributionToJournal` and `contributionToSpecialist` records, so it's always resolved with the following priority:
+
+1. **Pure JSON** — `journalAssociation.journal.uuid` (→ `id` attribute) and `journalAssociation.title.title` (→ `title`).
+2. **DSpace CSV** — `journal_title` / `dc.identifier.journal` (→ title) and `dc.identifier.issn` (→ ISSNs), used only for whichever piece Pure JSON didn't already provide.
+3. **Pure Journals API** — only called when a journal UUID is known from Pure JSON but the title and/or ISSNs are still missing after steps 1–2. Since the lookup is by UUID, it can't help when Pure JSON has no `journalAssociation` at all. Requires the API key described in [Pure API key](#pure-api-key-optional-journal-lookups-only).
+
+If nothing is found anywhere, the record is **skipped** (not exported) and a warning is printed, since an empty `<journal/>` would not pass schema validation.
 
 ### Electronic versions
 
@@ -236,43 +269,50 @@ Access is taken from the Pure `accessType.uri`. If a `dc.date.embargo` value is 
 
 | Pure value | XML value |
 |---|---|
-| workflow `validated` | `approved` |
+| workflow `validated` | `validated` |
 | workflow `approved` | `approved` |
-| workflow `forApproval` / `pendingApproval` | `forApproval` |
+| workflow `forApproval` | `forApproval` |
+| workflow `entryInProgress` | `entryInProgress` |
+| (unrecognised/missing workflow step) | `forApproval` |
 | visibility `FREE` | `Public` |
 | visibility `BACKEND` / `CAMPUS` / `RESTRICTED` | `Restricted` |
+| (unrecognised/missing visibility key) | `Public` |
+
+### Type-specific fields
+
+Depending on the resolved XML tag, additional elements are written:
+
+| XML tag | Extra fields written |
+|---|---|
+| `contributionToJournal` | `<journal>` (record is skipped if it can't be resolved — see [Journal resolution](#journal-resolution)) |
+| `contributionToSpecialist` | `<journal>` (same skip behaviour as above) |
+| `book` | `<printIsbns>`, `<publisher>` |
+| `chapterInBook` | `<printIsbns>`, `<hostPublicationTitle>` (from `dc.title.alternative` / `dc.relation.ispartof`, falling back to an em dash if neither is present), `<publisher>` |
+| `workingPaper` | `<publisher>` |
+| `thesis` | `<qualification>` (`phd` or `mphil`, guessed from `dc.type`; defaults to `phd`), `<publisher>` |
 
 ---
 
 ## Console output
 
-The script prints a short summary to stdout on each run:
+The script prints a short summary to stdout on each run, and also writes the **same console output** to a plain-text `.log` file alongside the XML (same directory and base filename, `.log` extension instead of `.xml`):
 
 ```
-Environment: prod → https://researchrepository.universityofgalway.ie/ (store host: researchrepository.universityofgalway.ie)
+Environment: prod -> https://researchrepository.universityofgalway.ie/ (store host: researchrepository.universityofgalway.ie)
+Pure API key: found (PURE_ROOT_API_KEY).
 Loading DSpace CSV: dspace.csv
-  → 64 records by UUID, 64 by Handle loaded.
+  -> 64 records by UUID, 64 by Handle loaded.
 Loading Pure JSON: pure.json
-  → 120 records loaded.
-  → 115 records after filtering.
-Matching records…
-  → 98 matched, 17 unmatched Pure records.
-  → 98 records after duplicate resolution.
-Building XML…
-XML written to: pure_import_2026-06-16.xml
-  → 98 publication element(s) exported.
+  -> 120 records loaded.
+  -> 115 records after filtering.
+Matching records...
+  WARNING: DSpace row not matched to any Pure record -- uuid='a1b2c3d4-...' handle='10379/17513' title='Some Title'
+  -> 98 matched, 2 DSpace rows without a Pure match.
+  -> 98 records after duplicate resolution.
+Building XML...
+XML written to: ./xml_import/prod_pure_import_2026-06-19.xml
+  -> 98 publication element(s) exported.
+Log written to: ./xml_import/prod_pure_import_2026-06-19.log
 ```
 
-Warnings about skipped or duplicate records are written to stderr.
-
----
-
-## Extending the script
-
-**Adding a new publication type:** add an entry to `PURE_TYPE_MAP` (keyed on the full Pure type URI) and/or `DSPACE_TYPE_MAP` (keyed on the lowercased `dc.type` string), both mapping to `(xml_tag, subType)`. If the new type needs type-specific child elements (e.g. a `<conference>` block), add a branch in `_add_type_specific_fields()`.
-
-**Adding a new licence:** add an entry to `LICENSE_MAP` (keyed on the URI suffix) and to `RIGHTS_TO_LICENSE` (keyed on the lowercased `dc.rights` string).
-
-**Adding a new field:** most field-writing logic lives in named `build_*` functions called from `build_record_element()`. Add a new `build_*` function and call it there.
-
-**Adding a new DSpace environment:** add an entry to `DSPACE_BASE_URLS` (e.g. `"staging": "https://..."`) — it automatically becomes a valid `--environment` choice.
+Warnings about unmatched DSpace rows, duplicate Pure records, missing journal info, and missing API keys are all written to stderr (and are still captured in the `.log` file).
