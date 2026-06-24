@@ -103,14 +103,16 @@ Array of research output objects as returned by the Pure REST API. The script re
 - `title.value`, `abstract`
 - `language.uri`
 - `peerReview`, `publicationStatuses`
+- `category.uri` (publication category; defaults to `research`)
 - `workflow.step`, `visibility.key`
-- `contributors[]` (name, role, correspondingAuthor)
+- `contributors[]` — name, role, correspondingAuthor; `person.uuid` (internal) or `externalPerson.uuid` (external) used as the `<person id="...">` attribute
 - `organizations[]`, `managingOrganization`
 - `journalAssociation.journal.uuid`, `journalAssociation.title.title`
 - `electronicVersions[]` (DOI, file, and link versions)
-- `identifiers[]` (to extract the DSpace UUID)
-- `links[]` (to extract Handle URLs)
+- `identifiers[]` (to extract the DSpace UUID for matching)
+- `links[]` — Handle URLs (for matching); repository DOIs (`10.13025/` prefix, promoted to `<electronicVersionDOI>`); all other non-DOI links written to `<urls>`
 - `modifiedBy`, `modifiedDate` (for filtering and duplicate resolution)
+- `portalUrl` (written to `<urls>`)
 
 ---
 
@@ -142,6 +144,7 @@ The output conforms to the Pure Research Output Import schema (`v1.publication-i
 | Pure `pureId` | `id` attribute on the publication element, e.g. `<contributionToJournal id="19125272" subType="article">` |
 | DSpace UUID | `<externalIds><id type="DSpace">…</id></externalIds>` |
 | DSpace Handle | `<existingStores><existingStore><storeContentId>…</storeContentId></existingStore></existingStores>` |
+| Pure `person.uuid` / `externalPerson.uuid` | `id` attribute on each `<person>` element inside `<persons>` |
 
 ### Publication type mapping
 
@@ -178,7 +181,7 @@ For the complete, authoritative list of every supported subtype, see the `PURE_T
 | `journal article` | `contributionToJournal` | `article` |
 | `review article` | `contributionToJournal` | `systematicreview` |
 | `review` | `contributionToSpecialist` | `review` |
-| `book review` | `contributionToPeriodical` | `book` |
+| `book review` | `other` | `other` |
 | `conference paper` | `contributionToConference` | `paper` |
 | `conference output` | `contributionToConference` | `other` |
 | `conference poster` | `contributionToConference` | `poster` |
@@ -187,7 +190,7 @@ For the complete, authoritative list of every supported subtype, see the `PURE_T
 | `book part` | `chapterInBook` | `chapter` |
 | `report` | `book` | `book` |
 | `working paper` | `workingPaper` | `workingpaper` |
-| `newspaper article` | `contributionToPeriodical` | `article` |
+| `newspaper article` | `contributionToSpecialist` | `article` |
 | `video` | `nonTextual` | `audiovisual_material` |
 | `interactive resource` | `nonTextual` | `web_publication` |
 | `data management plan` | `other` | `other` |
@@ -205,33 +208,55 @@ If nothing is found anywhere, the record is **skipped** (not exported) and a war
 
 ### Electronic versions
 
-All electronic versions present in the Pure JSON are written:
+Electronic versions are resolved across three sources in priority order.
+
+#### Repository DOIs in `links[]`
+
+Before processing `electronicVersions`, the script scans the Pure JSON `links[]` array for any URL containing the repository DOI prefix `10.13025/`. These are promoted to `<electronicVersionDOI>` elements with fixed metadata — they are not written to `<urls>`:
+
+| Field | Value |
+|---|---|
+| `<version>` | `authorsversion` |
+| `<licence>` | `cc_by` |
+| `<publicAccess>` | `open` |
+| `<doi>` | bare DOI extracted from the link URL (e.g. `10.13025/18019`) |
+
+#### Pure `electronicVersions[]`
 
 | Pure `typeDiscriminator` | XML element |
 |---|---|
 | `DoiElectronicVersion` | `<electronicVersionDOI>` |
-| `FileElectronicVersion` | `<electronicVersionFile>` (includes `fileLocation` pointing at the Pure file URL) |
+| `FileElectronicVersion` | `<electronicVersionFile>` — see file matching rules below |
 | `LinkElectronicVersion` | `<electronicVersionLink>` |
 
-If Pure carries no electronic versions but the DSpace record has a `dc.identifier.doi`, a `<electronicVersionDOI>` element is generated from it.
+If Pure carries no electronic versions but the DSpace record has a `dc.identifier.doi`, a `<electronicVersionDOI>` is generated from it as a fallback.
 
-### DSpace-only files
+#### File matching rules
 
-Pure is always checked first. If the DSpace CSV row references a bitstream (via `pdf_links` / `pdf_handle_paths`) whose filename doesn't match any `fileName` already present among the record's Pure `FileElectronicVersion` entries, an extra `<electronicVersionFile>` is appended so the file isn't silently dropped from the import:
+For each `FileElectronicVersion` in the Pure JSON, the script looks up whether a file with the same normalised filename exists in the DSpace CSV (`pdf_links`/`pdf_handle_paths`). The three resulting cases — which can all coexist within a single record — are:
 
-| Field | Source |
+| Case | `<filename>` | `<fileLocation>` | `<file id="...">` |
+|---|---|---|---|
+| **DSpace + Pure match** — filename found in both | DSpace (`pdf_handle_paths`) | DSpace URL (`pdf_links`, domain rewritten per `--environment`) | Pure `fileId` |
+| **Pure only** — Pure file has no DSpace counterpart | Pure `fileName` | Pure file URL | Pure `fileId` |
+| **DSpace only** — DSpace file has no Pure counterpart | DSpace (`pdf_handle_paths`) | DSpace URL (domain rewritten) | *omitted* — Pure assigns one after upload |
+
+DSpace-only files (case 3) are appended after all Pure `FileElectronicVersion` entries are processed. Each semicolon-separated entry in `pdf_links` / `pdf_handle_paths` produces a separate `<electronicVersionFile>` element. Additional DSpace-only fields:
+
+| Field | Value |
 |---|---|
-| `<file id="...">` | `{handle}:{sequence}:{filename}` — sequence and filename parsed out of `pdf_handle_paths`, handle from the CSV `handle` column |
-| `<filename>` | Filename parsed out of `pdf_handle_paths` |
-| `<fileLocation>` | The `pdf_links` URL, with its domain rewritten onto the selected `--environment` |
 | `<mimetype>` | Guessed from the filename extension (defaults to `application/pdf`) |
-| `<filesize>` | Omitted — the CSV doesn't carry a size for these bitstreams |
+| `<filesize>` | Omitted — the CSV doesn't carry a size for DSpace-only bitstreams |
 | `<source>` | The selected `--environment`'s host |
 | `<externalRepositoryState>` | Always `STORED` |
-| `<version>` | `--default-version` (default `publishersversion`), since there's no Pure `versionType` to draw from |
-| `<licence>` / `<publicAccess>` | Same DSpace fallback as the rest of the script: `dc.rights` → licence, `dc.date.embargo` → embargoed, otherwise open |
+| `<version>` | `--default-version` (default `publishersversion`) |
+| `<licence>` / `<publicAccess>` | `dc.rights` → licence; `dc.date.embargo` → embargoed, otherwise open |
 
 Filename comparison is case-insensitive and URL-decodes both sides, so e.g. `Paper.PDF` and `paper.pdf` are treated as the same file.
+
+### Publication category
+
+Every record gets a `<publicationCategory>` element written between `<peerReviewed>` and `<publicationStatuses>`. The value is taken from `category.uri` in the Pure JSON (trailing path segment only, e.g. `research` from `/dk/atira/pure/researchoutput/category/research`), defaulting to `research` when the field is absent.
 
 ### Existing stores
 
@@ -248,6 +273,10 @@ Every matched record gets an `<existingStores><existingStore>` block, telling Pu
 ```
 
 `storeName` is the selected `--environment`'s host, `storeContentId` is the DSpace Handle (CSV `handle` column — not the UUID), and `updateRequired` is always `true`. This block is added whenever the matched DSpace CSV row has a `handle` value, independent of whether any file was found for the record.
+
+### URLs
+
+`dc.identifier.uri` (from the DSpace CSV) and `portalUrl` (from the Pure JSON) are written to `<urls>`. Non-Handle, non-repository-DOI entries from Pure's `links[]` array are also included. Handle links are skipped (used for matching only) and repository DOIs (`10.13025/`) are skipped because they are promoted to `<electronicVersionDOI>` instead.
 
 ### Licence and access
 
