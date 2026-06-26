@@ -168,7 +168,7 @@ The XML element tag and `subType` attribute are resolved from the Pure `type.uri
 | `patent/patent` | `patent` | `patent` |
 | `memorandum/academicmemorandum` | `memorandum` | `academicmemorandum` |
 | `contributiontomemorandum/contributiontoacademicmemorandum` | `contributionToMemorandum` | `contributiontoacademicmemorandum` |
-| `contributiontoperiodical/article` | `contributionToPeriodical` | `article` |
+| `contributiontoperiodical/article` | `contributionToSpecialist` | `article` |
 | `contributiontospecialistpublication/article` | `contributionToSpecialist` | `article` |
 | `othercontribution/other` | `other` | `other` |
 
@@ -180,8 +180,8 @@ For the complete, authoritative list of every supported subtype, see the `PURE_T
 |---|---|---|
 | `journal article` | `contributionToJournal` | `article` |
 | `review article` | `contributionToJournal` | `systematicreview` |
-| `review` | `contributionToSpecialist` | `review` |
-| `book review` | `other` | `other` |
+| `review` | `contributionToJournal` | `systematicreview` |
+| `book review` | `contributionToSpecialist` | `book` |
 | `conference paper` | `contributionToConference` | `paper` |
 | `conference output` | `contributionToConference` | `other` |
 | `conference poster` | `contributionToConference` | `poster` |

@@ -205,14 +205,12 @@ PURE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/electronic_articles":                      ("other", "electronic_articles"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/policy_contribution":                      ("other", "policy_contribution"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontospecialistpublication/article":                ("contributionToSpecialist", "article"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontospecialistpublication/review":                 ("contributionToSpecialist", "review"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/article":                           ("contributionToPeriodical", "article"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/book":                              ("contributionToPeriodical", "book"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/review":                            ("contributionToPeriodical", "review"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/editorial":                         ("contributionToPeriodical", "editorial"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/featured":                          ("contributionToPeriodical", "featured"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/letter":                            ("contributionToPeriodical", "letter"),
-    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/special":                           ("contributionToPeriodical", "special"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/article":                           ("contributionToSpecialist", "article"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/book":                              ("contributionToSpecialist", "book"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/editorial":                         ("contributionToSpecialist", "editorial"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/featured":                          ("contributionToSpecialist", "featured"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/letter":                            ("contributionToSpecialist", "letter"),
+    "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoperiodical/special":                           ("contributionToSpecialist", "special"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/patent/patent":                                              ("patent", "patent"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/memorandum/academicmemorandum":                              ("memorandum", "academicmemorandum"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/memorandum/qahearing":                                       ("memorandum", "qahearing"),
@@ -223,8 +221,8 @@ PURE_TYPE_MAP: dict[str, tuple[str, str]] = {
 DSPACE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "journal article":        ("contributionToJournal", "article"),
     "review article":         ("contributionToJournal", "systematicreview"),
-    "review":                 ("contributionToSpecialist", "review"),
-    "book review":            ("contributionToPeriodical", "book"),
+    "review":                 ("contributionToJournal", "systematicreview"),
+    "book review":            ("contributionToSpecialist", "book"),
     "conference paper":       ("contributionToConference", "paper"),
     "conference output":      ("contributionToConference", "other"),
     "conference poster":      ("contributionToConference", "poster"),
@@ -233,7 +231,7 @@ DSPACE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "book part":              ("chapterInBook", "chapter"),
     "report":                 ("book", "book"),
     "working paper":          ("workingPaper", "workingpaper"),
-    "newspaper article":      ("contributionToPeriodical", "article"),
+    "newspaper article":      ("contributionToSpecialist", "article"),
     "video":                  ("nonTextual", "audiovisual_material"),
     "interactive resource":   ("nonTextual", "web_publication"),
     "data management plan":   ("other", "other"),
@@ -362,6 +360,43 @@ def parse_pdf_handle_path(path: str, handle: str) -> tuple[str, str] | tuple[Non
 def guess_mimetype(filename: str) -> str:
     guessed, _ = mimetypes.guess_type(filename or "")
     return guessed or "application/pdf"
+
+
+def parse_dspace_files(
+    pdf_links: str,
+    pdf_handle_paths: str,
+    handle: str,
+    store_host: str,
+) -> list[tuple[str, str, str]]:
+    """
+    Parse the (possibly semicolon-separated) pdf_links and pdf_handle_paths
+    CSV columns into a list of (sequence, filename, file_location) tuples,
+    one per file, with the URL rewritten onto store_host.
+
+    A row with a single file produces a one-element list.
+    A row like:
+        pdf_links:        "https://…/uuid1/content ; https://…/uuid2/content"
+        pdf_handle_paths: "/10379/123/1/a.pdf ; /10379/123/4/b.pdf"
+    produces two tuples.
+
+    If pdf_handle_paths is absent or has fewer entries than pdf_links, the
+    filename falls back to the last path-segment of the corresponding URL.
+    """
+    links = [l.strip() for l in (pdf_links or "").split(";") if l.strip()]
+    paths = [p.strip() for p in (pdf_handle_paths or "").split(";") if p.strip()]
+
+    result: list[tuple[str, str, str]] = []
+    for i, raw_url in enumerate(links):
+        file_location = rebuild_url_for_environment(raw_url, store_host)
+        raw_path = paths[i] if i < len(paths) else ""
+        sequence, filename = parse_pdf_handle_path(raw_path, handle)
+        if not filename:
+            # Fallback: decode the last URL path segment
+            from urllib.parse import urlsplit, unquote as _unq
+            filename = _unq(urlsplit(raw_url).path.rstrip("/").split("/")[-1]) or raw_url
+            sequence = sequence or "1"
+        result.append((sequence, filename, file_location))
+    return result
  
  
 # ---------------------------------------------------------------------------
@@ -379,8 +414,8 @@ def parse_journal_api_response(data: dict) -> dict:
     issn_pool = active_issns or all_issns
     issns = [i["issn"].strip() for i in issn_pool if (i.get("issn") or "").strip()]
  
-    publisher_uuid = ((data.get("publisher") or {}).get("uuid") or "").strip()
-    return {"title": title, "issns": issns, "publisher_uuid": publisher_uuid}
+    publisher_pure_id = str((data.get("publisher") or {}).get("pureId") or "").strip()
+    return {"title": title, "issns": issns, "publisher_pure_id": publisher_pure_id}
  
  
 def fetch_journal_from_api(
@@ -625,7 +660,13 @@ def build_persons(parent: ET.Element, pure_record: dict) -> None:
         name = contrib.get("name", {})
         first = (name.get("firstName") or "").strip()
         last  = (name.get("lastName")  or "").strip()
-        person_el = sub(author_el, "person")
+        pure_person_uuid = (
+            (contrib.get("person") or {}).get("uuid")
+            or (contrib.get("externalPerson") or {}).get("uuid")
+            or ""
+        )
+        person_attrib = {"id": pure_person_uuid} if pure_person_uuid else None
+        person_el = sub(author_el, "person", attrib=person_attrib)
         if first:
             sub(person_el, "firstName", first)
         if last:
@@ -634,6 +675,24 @@ def build_persons(parent: ET.Element, pure_record: dict) -> None:
             sub(author_el, "correspondingAuthor", "true")
  
  
+REPOSITORY_DOI_PREFIX = "10.13025/"
+
+def is_repository_doi(doi_or_url: str) -> bool:
+    """Return True if the value is a repository DOI (10.13025/ prefix)."""
+    s = (doi_or_url or "").strip()
+    # Accept bare DOIs ("10.13025/xxxxx") and URL forms ("https://doi.org/10.13025/…")
+    return "10.13025/" in s
+
+
+def extract_doi_from_link(url: str) -> str:
+    """Extract the bare DOI from a doi.org URL or return the value unchanged."""
+    url = (url or "").strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/"):
+        if url.lower().startswith(prefix):
+            return url[len(prefix):]
+    return url
+
+
 def build_electronic_versions(
     parent: ET.Element,
     pure_record: dict,
@@ -647,15 +706,15 @@ def build_electronic_versions(
     has_embargo   = bool((dspace_record.get("dc.date.embargo") or "").strip())
     embargo_start = (dspace_record.get("dc.date.embargo") or "").strip()
     embargo_desc  = (dspace_record.get("dc.description.embargo") or "").strip()
- 
+
     ev_el: ET.Element | None = None
- 
+
     def ensure_ev_el() -> ET.Element:
         nonlocal ev_el
         if ev_el is None:
             ev_el = sub(parent, "electronicVersions")
         return ev_el
- 
+
     def _fill_common(node: ET.Element, version: str, licence: str, access: str) -> None:
         sub(node, "version", version)
         if licence:
@@ -669,10 +728,38 @@ def build_electronic_versions(
         else:
             if access:
                 sub(node, "publicAccess", access)
- 
-    matched_filenames: set[str] = set()
+
+    # ── Repository DOIs stored as links[] in the Pure JSON ──────────────────
+    # Pure sometimes records a repository DOI (prefix 10.13025/) as a plain
+    # URL link rather than a DoiElectronicVersion. Emit them here as
+    # DoiElectronicVersion: authorsversion, open access, CC BY 4.0.
+    for link in pure_record.get("links", []):
+        link_url = (link.get("url") or "").strip()
+        if is_repository_doi(link_url):
+            doi_val = extract_doi_from_link(link_url)
+            doi_el = sub(ensure_ev_el(), "electronicVersionDOI")
+            sub(doi_el, "version", "authorsversion")
+            sub(doi_el, "licence", "cc_by")
+            sub(doi_el, "publicAccess", "open")
+            sub(doi_el, "doi", doi_val)
+
+    # ── Build filename → (sequence, dspace_url) lookup from the CSV ─────────
+    handle   = (dspace_record.get("handle") or "").strip()
+    pdf_link = (dspace_record.get("pdf_links") or "").strip()
+    dspace_files = parse_dspace_files(
+        pdf_link,
+        dspace_record.get("pdf_handle_paths") or "",
+        handle,
+        store_host,
+    )
+    dspace_by_filename: dict[str, tuple[str, str]] = {
+        normalize_filename_for_match(fn): (seq, url)
+        for seq, fn, url in dspace_files
+    }
+    # Track which DSpace files were consumed by a Pure FileElectronicVersion
+    matched_dspace_norms: set[str] = set()
     file_idx = 0
- 
+
     for ev in evs:
         disc        = ev.get("typeDiscriminator", "")
         licence_uri = ev.get("licenseType", {}).get("uri", "")
@@ -681,7 +768,7 @@ def build_electronic_versions(
         access      = map_access(access_uri)
         version_uri = ev.get("versionType", {}).get("uri", "")
         version     = map_version(version_uri)
- 
+
         if disc == "DoiElectronicVersion":
             doi_val = ev.get("doi", "").strip()
             if not doi_val:
@@ -689,7 +776,7 @@ def build_electronic_versions(
             doi_el = sub(ensure_ev_el(), "electronicVersionDOI")
             _fill_common(doi_el, version, licence, access)
             sub(doi_el, "doi", doi_val)
- 
+
         elif disc == "FileElectronicVersion":
             file_block = ev.get("file", {})
             file_url   = file_block.get("url", "").strip()
@@ -698,19 +785,40 @@ def build_electronic_versions(
             file_size  = str(file_block.get("size", ""))
             file_id    = file_block.get("fileId", "").strip()
             file_idx  += 1
-            if file_name:
-                matched_filenames.add(normalize_filename_for_match(file_name))
-            if not file_url:
+
+            if not file_url and not file_name:
                 continue
-            fev_el = sub(ensure_ev_el(), "electronicVersionFile")
-            _fill_common(fev_el, version, licence, access)
-            file_el = sub(fev_el, "file", attrib={"id": file_id or f"file{file_idx}"})
-            sub(file_el, "filename", file_name or file_url.split("/")[-1])
-            sub(file_el, "fileLocation", file_url)
-            sub(file_el, "mimetype", mime_type)
-            if file_size:
-                sub(file_el, "filesize", file_size)
- 
+
+            norm = normalize_filename_for_match(file_name) if file_name else ""
+
+            if norm and norm in dspace_by_filename:
+                # ── Case 1: DSpace + Pure match ─────────────────────────────
+                # Use DSpace filename and URL; keep Pure file ID.
+                seq, dspace_url = dspace_by_filename[norm]
+                matched_dspace_norms.add(norm)
+                fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
+                _fill_common(fev_el, version, licence, access)
+                # Pure ID preserved as the file element's id attribute.
+                file_el = sub(fev_el, "file", attrib={"id": file_id} if file_id else None)
+                sub(file_el, "filename", file_name)
+                sub(file_el, "fileLocation", dspace_url)
+                sub(file_el, "mimetype", mime_type)
+                if file_size:
+                    sub(file_el, "filesize", file_size)
+            else:
+                # ── Case 3: Pure only (no DSpace counterpart) ───────────────
+                # Use Pure filename, Pure link, and Pure file ID.
+                if not file_url:
+                    continue
+                fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
+                _fill_common(fev_el, version, licence, access)
+                file_el = sub(fev_el, "file", attrib={"id": file_id} if file_id else None)
+                sub(file_el, "filename", file_name or file_url.split("/")[-1])
+                sub(file_el, "fileLocation", file_url)
+                sub(file_el, "mimetype", mime_type)
+                if file_size:
+                    sub(file_el, "filesize", file_size)
+
         elif disc == "LinkElectronicVersion":
             link_url = ev.get("url", "").strip()
             if not link_url:
@@ -718,7 +826,7 @@ def build_electronic_versions(
             lev_el = sub(ensure_ev_el(), "electronicVersionLink")
             _fill_common(lev_el, version, licence, access)
             sub(lev_el, "link", link_url)
- 
+
     if ev_el is None or len(ev_el) == 0:
         dois = (dspace_record.get("dc.identifier.doi") or "").strip()
         if dois:
@@ -729,23 +837,21 @@ def build_electronic_versions(
                     if dc_rights_licence:
                         sub(doi_el, "licence", dc_rights_licence)
                     sub(doi_el, "doi", doi_raw)
- 
-    pdf_link = (dspace_record.get("pdf_links") or "").strip()
-    handle   = (dspace_record.get("handle") or "").strip()
-    if pdf_link and handle:
-        sequence, filename = parse_pdf_handle_path(
-            dspace_record.get("pdf_handle_paths") or "", handle
-        )
-        if filename and normalize_filename_for_match(filename) not in matched_filenames:
-            file_location = rebuild_url_for_environment(pdf_link, store_host)
-            fev_el = sub(ensure_ev_el(), "electronicVersionFile")
-            _fill_common(fev_el, version=default_version, licence=dc_rights_licence, access="open")
-            file_el = sub(fev_el, "file", attrib={"id": f"{handle}:{sequence}:{filename}"})
-            sub(file_el, "filename", filename)
-            sub(file_el, "fileLocation", file_location)
-            sub(file_el, "mimetype", guess_mimetype(filename))
-            sub(file_el, "source", store_host)
-            sub(file_el, "externalRepositoryState", "STORED")
+
+    # ── Case 2: DSpace only (no matching Pure FileElectronicVersion) ─────────
+    # Use DSpace filename and URL; no id (Pure will assign one after upload).
+    for seq, filename, file_location in dspace_files:
+        if normalize_filename_for_match(filename) in matched_dspace_norms:
+            continue
+        fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
+        _fill_common(fev_el, version=default_version, licence=dc_rights_licence, access="open")
+        # No id attribute — Pure assigns one after the file is uploaded.
+        file_el = sub(fev_el, "file")
+        sub(file_el, "filename", filename)
+        sub(file_el, "fileLocation", file_location)
+        sub(file_el, "mimetype", guess_mimetype(filename))
+        sub(file_el, "source", store_host)
+        sub(file_el, "externalRepositoryState", "STORED")
  
  
 def build_existing_stores(parent: ET.Element, dspace_record: dict, store_host: str) -> None:
@@ -754,7 +860,7 @@ def build_existing_stores(parent: ET.Element, dspace_record: dict, store_host: s
         return
     es_el = sub(parent, "existingStores")
     e_el  = sub(es_el, "existingStore")
-    sub(e_el, "storeName", store_host)
+    sub(e_el, "storeName", "DSpace")
     sub(e_el, "updateRequired", "true")
     sub(e_el, "storeContentId", handle)
  
@@ -779,13 +885,13 @@ def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> No
     handle_raw = (dspace_record.get("dc.identifier.uri") or "").strip()
     portal_url = pure_record.get("portalUrl", "").strip()
     urls_el = None
- 
+
     def ensure_urls() -> ET.Element:
         nonlocal urls_el
         if urls_el is None:
             urls_el = sub(parent, "urls")
         return urls_el
- 
+
     if handle_raw:
         for raw in handle_raw.split(";"):
             raw = raw.strip()
@@ -801,6 +907,22 @@ def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> No
         desc_el = sub(url_el, "description")
         text_el(desc_el, "text", "Pure portal link")
         sub(url_el, "type", "unspecified")
+
+    # Add any Pure links[] that are NOT repository DOIs (those are promoted to
+    # DoiElectronicVersion in build_electronic_versions).
+    for link in pure_record.get("links", []):
+        alias    = (link.get("alias") or "").strip()
+        link_url = (link.get("url") or "").strip()
+        # Skip Handle links (used for matching only) and repository DOIs
+        # (promoted to electronicVersionDOI with authorsversion/cc_by/open).
+        if not link_url or alias == "Handle" or is_repository_doi(link_url):
+            continue
+        url_el = sub(ensure_urls(), "url")
+        sub(url_el, "url", link_url)
+        if alias:
+            desc_el = sub(url_el, "description")
+            text_el(desc_el, "text", alias)
+        sub(url_el, "type", "unspecified")
  
  
 def resolve_journal_info(
@@ -810,9 +932,11 @@ def resolve_journal_info(
     api_token: str | None,
     api_cache: dict,
 ) -> dict:
-    journal_assoc = pure_record.get("journalAssociation") or {}
-    journal_uuid  = ((journal_assoc.get("journal") or {}).get("uuid") or "").strip()
-    title         = ((journal_assoc.get("title") or {}).get("title") or "").strip()
+    journal_assoc  = pure_record.get("journalAssociation") or {}
+    journal_obj    = journal_assoc.get("journal") or {}
+    journal_uuid   = (journal_obj.get("uuid") or "").strip()
+    journal_pure_id = str(journal_obj.get("pureId") or "").strip()
+    title          = ((journal_assoc.get("title") or {}).get("title") or "").strip()
     if not title:
         title = (dspace_record.get("journal_title") or "").strip()
     if not title:
@@ -821,7 +945,7 @@ def resolve_journal_info(
     csv_issn = (dspace_record.get("dc.identifier.issn") or "").strip()
     if csv_issn:
         issns = [v.strip() for v in re.split(r"[;,]", csv_issn) if v.strip()]
-    publisher_uuid = ""
+    publisher_pure_id = ""
     if journal_uuid and (not title or not issns):
         api_data = fetch_journal_from_api(journal_uuid, environment, api_token, api_cache)
         if api_data:
@@ -829,9 +953,15 @@ def resolve_journal_info(
                 title = api_data["title"]
             if not issns and api_data.get("issns"):
                 issns = api_data["issns"]
-            if api_data.get("publisher_uuid"):
-                publisher_uuid = api_data["publisher_uuid"]
-    return {"uuid": journal_uuid, "title": title, "issns": issns, "publisher_uuid": publisher_uuid}
+            if api_data.get("publisher_pure_id"):
+                publisher_pure_id = api_data["publisher_pure_id"]
+    return {
+        "uuid": journal_uuid,
+        "pure_id": journal_pure_id,
+        "title": title,
+        "issns": issns,
+        "publisher_pure_id": publisher_pure_id,
+    }
  
  
 def build_journal(
@@ -849,17 +979,17 @@ def build_journal(
     an empty <journal/> fails schema validation.
     """
     info = resolve_journal_info(pure_record, dspace_record, environment, api_token, api_cache)
-    if not info["uuid"] and not info["title"] and not info["issns"]:
+    if not info["uuid"] and not info["pure_id"] and not info["title"] and not info["issns"]:
         return False
-    j_el = sub(parent, "journal", attrib={"id": info["uuid"]} if info["uuid"] else None)
+    j_el = sub(parent, "journal", attrib={"id": info["pure_id"]} if info["pure_id"] else None)
     if info["title"]:
         sub(j_el, "title", info["title"])
     if info["issns"]:
         issns_el = sub(j_el, "printIssns")
         for issn in info["issns"]:
             sub(issns_el, "issn", issn)
-    if info["publisher_uuid"]:
-        sub(j_el, "publisher", attrib={"id": info["publisher_uuid"]})
+    if info["publisher_pure_id"]:
+        sub(j_el, "publisher", attrib={"id": info["publisher_pure_id"]})
     return True
  
  
@@ -917,6 +1047,20 @@ def build_record_element(
         peer_str = (dspace_record.get("dc.description.peer-reviewed") or "").strip().lower()
         peer = peer_str == "peer-reviewed"
     sub(rec_el, "peerReviewed", "true" if peer else "false")
+
+    # publicationCategory must come immediately after peerReviewed and before
+    # publicationStatuses (XSD sequence order). Pure's category URIs live under
+    # /dk/atira/pure/researchoutput/category/. All records default to "research"
+    # which avoids the "No publication category specified" importer warning.
+    category_uri = (
+        (pure_record.get("category") or {}).get("uri")
+        or "/dk/atira/pure/researchoutput/category/research"
+    )
+    # publicationCategory takes only the trailing classification token,
+    # not the full URI. Strip everything up to and including the last "/".
+    category_val = category_uri.rstrip("/").rsplit("/", 1)[-1]
+    sub(rec_el, "publicationCategory", category_val)
+
     build_publication_statuses(rec_el, pure_record)
     workflow_step = pure_record.get("workflow", {}).get("step", "")
     workflow_val  = map_workflow(workflow_step)
@@ -940,6 +1084,10 @@ def build_record_element(
             org_uuid = org.get("uuid", "")
             if org_uuid:
                 sub(orgs_el, "organisation", attrib={"id": org_uuid})
+        # If no org had a uuid, remove the empty <organisations/> element
+        # to avoid schema validation failure (minOccurs=1 on <organisation>).
+        if len(orgs_el) == 0:
+            rec_el.remove(orgs_el)
     managing_org = pure_record.get("managingOrganization", {})
     owner_uuid   = managing_org.get("uuid", "")
     if owner_uuid:
@@ -968,13 +1116,18 @@ def _add_type_specific_fields(
     api_token: str | None,
     api_cache: dict,
 ) -> None:
-    if xml_tag == "contributionToJournal":
+    if xml_tag in ("contributionToJournal", "contributionToSpecialist", "contributionToSpecialist"):
         if not build_journal(rec_el, pure_record, dspace_record, environment, api_token, api_cache):
-            raise ValueError(
-                f"skipping pureId={pure_record.get('pureId', '?')} "
-                f"(contributionToJournal) -- no journal info found in Pure JSON, "
-                f"DSpace CSV, or the API; an empty <journal/> would not validate."
+            # No journal information available — downgrade to <other> rather than
+            # skipping the record entirely, and warn so the gap can be reviewed.
+            print(
+                f"  WARNING: pureId={pure_record.get('pureId', '?')} mapped as "
+                f"{xml_tag!r} but no journal info found; downgrading to <other>.",
+                file=sys.stderr,
             )
+            rec_el.tag = f"{{{PUB_NS}}}other"
+            rec_el.set("subType", "other")
+            # <other> needs no type-specific child elements — nothing more to do.
     elif xml_tag in ("book",):
         build_isbns(rec_el, dspace_record)
         build_publisher(rec_el, dspace_record)
@@ -989,13 +1142,6 @@ def _add_type_specific_fields(
         build_publisher(rec_el, dspace_record)
     elif xml_tag == "workingPaper":
         build_publisher(rec_el, dspace_record)
-    elif xml_tag == "contributionToSpecialist":
-        if not build_journal(rec_el, pure_record, dspace_record, environment, api_token, api_cache):
-            raise ValueError(
-                f"skipping pureId={pure_record.get('pureId', '?')} "
-                f"(contributionToSpecialist) -- no journal info found in Pure JSON, "
-                f"DSpace CSV, or the API; an empty <journal/> would not validate."
-            )
     elif xml_tag == "thesis":
         quality = (dspace_record.get("dc.type") or "").strip().lower()
         if "phd" in quality or "doctoral" in quality:
@@ -1238,11 +1384,9 @@ def main() -> None:
     matched_dspace_handles: set[str] = set()
 
     matched: list[tuple[dict, dict]] = []
-    unmatched_pure = 0
     for pure_rec in json_records:
         dspace_rec = find_csv_record(pure_rec, csv_by_uuid, csv_by_handle)
         if dspace_rec is None:
-            unmatched_pure += 1
             continue
         # Track which DSpace identifiers were consumed.
         d_uuid = (dspace_rec.get("uuid") or "").strip()
@@ -1289,7 +1433,6 @@ def main() -> None:
 
     print(
         f"  -> {len(matched)} matched, "
-        f"{unmatched_pure} Pure records without a DSpace match, "
         f"{len(unmatched_dspace_rows)} DSpace rows without a Pure match."
     )
  
