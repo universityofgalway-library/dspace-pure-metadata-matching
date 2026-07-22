@@ -124,6 +124,8 @@ def _start_logging(log_path: str):
 
 HANDLE_BASE_URL = "http://hdl.handle.net/"
 
+REPOSITORY_DOI_PREFIX = "10.13025/"
+
 DSPACE_BASE_URLS: dict[str, str] = {
     "test": "https://galway.dspace7-test.openrepository.com/",
     "temp": "https://galway.dspace7-test.openrepository.com/",
@@ -610,6 +612,23 @@ def lang_attr(lang_uri: str) -> dict:
         return {"lang": lang}
     else:
         return {"lang": lang, "country": country}
+    
+
+def _extract_localized_text(field) -> str:
+    """Extract a plain string from a value that may be a plain string,
+    {"value": "..."} , or a localized dict like {"en_GB": "..."}.
+    """
+    if not field:
+        return ""
+    if isinstance(field, str):
+        return field.strip()
+    if isinstance(field, dict):
+        if "value" in field:
+            return (field.get("value") or "").strip()
+        for v in field.values():
+            if v:
+                return str(v).strip()
+    return ""
  
  
 # ---------------------------------------------------------------------------
@@ -733,37 +752,78 @@ def build_abstract(parent: ET.Element, pure_record: dict, lang_uri: str) -> None
         return
     abs_el = sub(parent, "abstract")
     text_el(abs_el, "text", abstract_text, attrib=lang_attr(lang_uri))
+
+
+def build_author_organisations(author_el: ET.Element, contrib: dict) -> None:
+    """Build <organisations> under a single <author>, from both the
+    contributor's internal 'organizations' and external 'externalOrganizations'
+    lists in the Pure JSON.
+    """
+    orgs = list(contrib.get("organizations", []) or [])
+    orgs.extend(contrib.get("externalOrganizations", []) or [])
+    if not orgs:
+        return
+
+    orgs_el = sub(author_el, "organisations")
+    for org in orgs:
+        org_uuid = (org.get("uuid") or "").strip()
+        org_name = _extract_localized_text(org.get("name"))
+        org_el = sub(orgs_el, "organisation", attrib={"id": org_uuid} if org_uuid else None)
+        if org_name:
+            name_el = sub(org_el, "name")
+            text_el(name_el, "text", org_name)
+
+    if len(orgs_el) == 0:
+        author_el.remove(orgs_el)
  
  
 def build_persons(parent: ET.Element, pure_record: dict) -> None:
     contributors = pure_record.get("contributors", [])
     if not contributors:
         return
-    persons_el = sub(parent, "persons")
+
+    persons_el: ET.Element | None = None
+
+    def ensure_persons() -> ET.Element:
+        nonlocal persons_el
+        if persons_el is None:
+            persons_el = sub(parent, "persons")
+        return persons_el
+
     for contrib in contributors:
         role_uri = contrib.get("role", {}).get("uri", "")
         role_val = map_role(role_uri)
-        author_el = sub(persons_el, "author")
-        sub(author_el, "role", role_val)
         name = contrib.get("name", {})
         first = (name.get("firstName") or "").strip()
         last  = (name.get("lastName")  or "").strip()
-        pure_person_uuid = (
-            (contrib.get("person") or {}).get("uuid")
-            or (contrib.get("externalPerson") or {}).get("uuid")
-            or ""
+
+        internal_uuid = (contrib.get("person") or {}).get("uuid")
+        external_uuid = (contrib.get("externalPerson") or {}).get("uuid")
+        is_external = (
+            contrib.get("typeDiscriminator") == "ExternalContributorAssociation"
+            or (external_uuid and not internal_uuid)
         )
-        person_attrib = {"id": pure_person_uuid} if pure_person_uuid else None
-        person_el = sub(author_el, "person", attrib=person_attrib)
+
+        author_el = sub(ensure_persons(), "author")
+        sub(author_el, "role", role_val)
+
+        person_attrib = {}
+        uuid_value = external_uuid if is_external else internal_uuid
+        if uuid_value:
+            person_attrib["id"] = uuid_value
+        if is_external:
+            person_attrib["origin"] = "external"
+
+        person_el = sub(author_el, "person", attrib=person_attrib or None)
+
         if first:
             sub(person_el, "firstName", first)
         if last:
             sub(person_el, "lastName", last)
         if contrib.get("correspondingAuthor"):
             sub(author_el, "correspondingAuthor", "true")
+        build_author_organisations(author_el, contrib)
  
- 
-REPOSITORY_DOI_PREFIX = "10.13025/"
 
 def is_repository_doi(doi_or_url: str) -> bool:
     """Return True if the value is a repository DOI (10.13025/ prefix)."""
