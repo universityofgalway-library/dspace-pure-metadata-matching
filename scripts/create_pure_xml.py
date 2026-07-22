@@ -145,6 +145,88 @@ PURE_API_KEY_VARS: dict[str, str] = {
 PUB_NS  = "v1.publication-import.base-uk.pure.atira.dk"
 CMN_NS  = "v3.commons.pure.atira.dk"
 
+NO_COUNTRY_LANGS =["unk", "mul", "und", "la", "lad"]
+
+
+LANG_MAP = {
+    "eng": "en_IE",
+    "fre": "fr_FR",
+    "fra": "fr_FR",
+    "ger": "de_DE",
+    "deu": "de_DE",
+    "spa": "es_ES",
+    # Celtic
+    "gle": "ga_IE",  # Irish
+    "wel": "cy_GB",  # Welsh
+    "cym": "cy_GB",  # Welsh (alternative code)
+    "bre": "br_FR",  # Breton
+    "cor": "kw_GB",  # Cornish
+    "gla": "gd_GB",  # Scottish Gaelic
+    "sga": "ga",     # Old Irish
+    "mga": "ga",     # Middle Irish
+    # Germanic
+    "dut": "nl_NL",
+    "nld": "nl_NL",
+    "por": "pt_PT",
+    "ita": "it_IT",
+    "swe": "sv_SE",
+    "nor": "nb_NO",
+    "nob": "nb_NO",
+    "nno": "nn_NO",
+    "dan": "da_DK",
+    "fin": "fi_FI",
+    "isl": "is_IS",
+    # Slavic
+    "rus": "ru_RU",
+    "pol": "pl_PL",
+    "ces": "cs_CZ",
+    "cze": "cs_CZ",
+    "slk": "sk_SK",
+    "slo": "sk_SK",
+    "hrv": "hr_HR",
+    "srp": "sr_RS",
+    "bul": "bg_BG",
+    "ukr": "uk_UA",
+    "bel": "be_BY",
+    "slv": "sl_SI",
+    "mkd": "mk_MK",
+    # Asian
+    "zho": "zh_CN",
+    "chi": "zh_CN",
+    "jpn": "ja_JP",
+    "kor": "ko_KR",
+    "hin": "hi_IN",
+    "ara": "ar_SA",
+    "tur": "tr_TR",
+    "vie": "vi_VN",
+    "tha": "th_TH",
+    "ind": "id_ID",
+    "msa": "ms_MY",
+    "may": "ms_MY",
+    "fas": "fa_IR",
+    "per": "fa_IR",
+    "heb": "he_IL",
+    "urd": "ur_PK",
+    "ben": "bn_BD",
+    # Other European
+    "cat": "ca_ES",
+    "eus": "eu_ES",
+    "glg": "gl_ES",
+    "ron": "ro_RO",
+    "rum": "ro_RO",
+    "hun": "hu_HU",
+    "ell": "el_GR",
+    "gre": "el_GR",
+    "lad": "lad",
+    "lat": "la",
+    "lav": "lv_LV",
+    "lit": "lt_LT",
+    "est": "et_EE",
+    "afr": "af_ZA",
+    "sqi": "sq_AL",
+    "alb": "sq_AL",
+}
+
 PURE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article":                  ("contributionToJournal", "article"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview":         ("contributionToJournal", "systematicreview"),
@@ -524,7 +606,10 @@ def parse_pure_language(lang_uri: str) -> tuple[str, str]:
  
 def lang_attr(lang_uri: str) -> dict:
     lang, country = parse_pure_language(lang_uri)
-    return {"lang": lang, "country": country}
+    if lang in NO_COUNTRY_LANGS:
+        return {"lang": lang}
+    else:
+        return {"lang": lang, "country": country}
  
  
 # ---------------------------------------------------------------------------
@@ -1071,11 +1156,18 @@ def build_record_element(
         sub(rec_el, "workflow", workflow_val)
     if lang_uri:
         lang, country = parse_pure_language(lang_uri)
-        sub(rec_el, "language", f"{lang}_{country}")
+        sub(rec_el, "language", lang if lang in NO_COUNTRY_LANGS else f"{lang}_{country}")
     else:
-        dc_lang = (dspace_record.get("dc.language.iso") or "").strip()
+        dc_lang = (dspace_record.get("dc.language.iso") or "").strip().lower()
         if dc_lang:
-            sub(rec_el, "language", dc_lang)
+            mapped_lang = LANG_MAP.get(dc_lang, "und")
+            if mapped_lang == "und" and dc_lang not in LANG_MAP:
+                print(
+                    f"  WARNING: pureId={pure_record.get('pureId', '?')} has "
+                    f"unmapped dc.language.iso={dc_lang!r} — defaulting to 'und'.",
+                    file=sys.stderr,
+                )
+            sub(rec_el, "language", mapped_lang)
     build_title(rec_el, pure_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
     build_subtitle(rec_el, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
     build_abstract(rec_el, pure_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
@@ -1303,7 +1395,7 @@ def parse_args() -> argparse.Namespace:
                         ))
     parser.add_argument("--output", default=None, metavar="XML_FILE",
                         help=("Output XML path. Defaults to "
-                              "pure_import_YYYY-MM-DD.xml in the current directory."))
+                              "pure_import_YYYY-MM-DD.xml in the ./xml_import/ directory."))
     parser.add_argument("--modified-by", default=None, metavar="USER",
                         help="Only include Pure records whose modifiedBy equals USER.")
     parser.add_argument("--modified-after", default=None, metavar="YYYY-MM-DD",

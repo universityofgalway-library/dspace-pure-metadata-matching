@@ -137,7 +137,7 @@ LANG_MAP = {
     "deu": "de_DE",
     "spa": "es_ES",
     # Celtic
-    "gle": "ga",
+    "gle": "ga_IE",  # Irish
     "wel": "cy_GB",  # Welsh
     "cym": "cy_GB",  # Welsh (alternative code)
     "bre": "br_FR",  # Breton
@@ -198,6 +198,7 @@ LANG_MAP = {
     "hun": "hu_HU",
     "ell": "el_GR",
     "gre": "el_GR",
+    "lad": "lad",
     "lat": "la",
     "lav": "lv_LV",
     "lit": "lt_LT",
