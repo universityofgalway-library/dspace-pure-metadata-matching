@@ -126,16 +126,19 @@ HANDLE_BASE_URL = "http://hdl.handle.net/"
 
 DSPACE_BASE_URLS: dict[str, str] = {
     "test": "https://galway.dspace7-test.openrepository.com/",
+    "temp": "https://galway.dspace7-test.openrepository.com/",
     "prod": "https://researchrepository.universityofgalway.ie/",
 }
 
 PURE_JOURNAL_API_URLS: dict[str, str] = {
     "test": "https://cust-uk-cc-dspace3.devel.elsevierpure.com/ws/api/journals/{uuid}",
+    "temp": "https://galway-test.elsevierpure.com/ws/api/journals/{uuid}",
     "prod": "https://research.universityofgalway.ie/ws/api/journals/{uuid}",
 }
 
 PURE_API_KEY_VARS: dict[str, str] = {
     "test": "PURE_ROOT_API_KEY_TEST",
+    "temp": "PURE_ROOT_API_KEY",
     "prod": "PURE_ROOT_API_KEY",
 }
 

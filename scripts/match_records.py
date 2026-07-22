@@ -29,18 +29,19 @@ COLLECT_EXTERNAL_ORGS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
-DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_all_items_with_collection_uuids_pdfs_20260422.csv"
-PURE_JSON = "./pure_research_outputs/pure_research-outputs_2026-04-27.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv"
+PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-07-22.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_merged_all_authors_strict_with_allow_block_cachefirst_20260720.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-27.json"
-OUTPUT_DIR = f"./record_matching/prod_all_output_{TODAY}"
+PUBLISHER_MAPPING_JSON = "./pure_entities/2026-07-16/pure_temp_publishers_2026-07-22.json"
+OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 NO_AUTHOR_CSV = os.path.join(OUTPUT_DIR, f"no_author_records_{TODAY}.csv")
 
-USE_TEST_ENV = False  # Set to False to use production environment
+USE_TEST_ENV = False  # Set to True to use UAT/staging environment
+USE_TEMP_ENV = False  # Set to True to use TEMP environment (uses same API key as Production)
 
 ORG_CONFIG_PATH = (
     "./scripts/test_orgs_config.json"
@@ -1159,11 +1160,19 @@ def process_contributors(
             if existing_contributors:
                 if uuid_value in existing_by_uuid:
                     print(f"        ℹ️ Contributor already exists (by UUID), using existing: {first} {last}")
-                    final_contributors.append(existing_by_uuid[uuid_value])
+                    existing_contrib = dict(existing_by_uuid[uuid_value])
+                    if existing_contrib.get("name", {}).get("firstName") != first or existing_contrib.get("name", {}).get("lastName") != last:
+                        print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {first} {last}")
+                    existing_contrib["name"] = {"firstName": first, "lastName": last}
+                    final_contributors.append(existing_contrib)
                     continue
                 if name_key in existing_by_name:
                     print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
-                    final_contributors.append(existing_by_name[name_key])
+                    existing_contrib = dict(existing_by_name[name_key])
+                    if existing_contrib.get("name", {}).get("firstName") != first or existing_contrib.get("name", {}).get("lastName") != last:
+                        print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {first} {last}")
+                    existing_contrib["name"] = {"firstName": first, "lastName": last}
+                    final_contributors.append(existing_contrib)
                     continue
 
             contributor = build_contributor(
