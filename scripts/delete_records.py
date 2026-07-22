@@ -183,6 +183,12 @@ def main():
         help="Use UAT (--test) or Production (default)"
     )
     parser.add_argument(
+        "--temp",
+        action="store_true",
+        default=False,
+        help="Use TEMP environment (uses same API key as Production)"
+    )
+    parser.add_argument(
         "--dry-run", 
         action="store_true",
         help="Show what would be deleted without actually deleting"
@@ -200,12 +206,12 @@ def main():
         return
     
     # Set base URL
-    BASE_URL = (
-        "https://galway-staging.elsevierpure.com/ws/api" 
-        if args.test 
-        else "https://research.universityofgalway.ie/ws/api"
-    )
-    
+    if args.test:
+        BASE_URL = "https://galway-staging.elsevierpure.com/ws/api"
+    elif args.temp:
+        BASE_URL = "https://galway-test.elsevierpure.com/ws/api"
+    else:
+        BASE_URL = "https://research.universityofgalway.ie/ws/api"
     HEADERS = {
         "accept": "application/json",
         "api-key": API_KEY

@@ -73,7 +73,7 @@ Optional columns used when present:
 
 | Column | Description |
 |---|---|
-| `pdf_handle_paths` | Semicolon-separated paths to DSpace PDFs, E.g. `/10379/4728/1/file.pdf`. Used for PDF matching against Pure file records. |
+| `pdf_handle_paths` | Semicolon-separated paths to DSpace PDFs, e.g. `/10379/4728/1/file.pdf`. Used for PDF matching against Pure file records. |
 
 ### Pure JSON
 

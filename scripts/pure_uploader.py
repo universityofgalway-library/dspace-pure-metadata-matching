@@ -346,6 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--file", help="Single JSON file to upload")
     parser.add_argument("--mode", choices=["create", "update"], help="Mode for single file upload")
     parser.add_argument("--test", action="store_true", default=False, help="Send data to UAT (--test) or Production (default)")
+    parser.add_argument("--temp", action="store_true", default=False, help="Send data to TEMP (uses same API key as Production)")
     parser.add_argument("--data", default= "research-outputs", choices=["research-outputs", "persons", "external-persons", 
                         "journals", "events", "organizations", "external-organizations", "publishers"], help="What data to upload to Pure")
     parser.add_argument("--log-dir", default=None, help="Directory to save logs (default: ./logs/uploader_logs next to the input file or folder)")
@@ -374,7 +375,12 @@ if __name__ == "__main__":
     if not API_KEY:
         print(f"⚠️ WARNING: {api_key_var} not found in environment variables.")
 
-    PURE_BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/" if args.test == True else "https://research.universityofgalway.ie/ws/api/"
+    if args.test:
+        PURE_BASE_URL = "https://galway-staging.elsevierpure.com/ws/api/"
+    elif args.temp:
+        PURE_BASE_URL = "https://galway-test.elsevierpure.com/ws/api/"
+    else:
+        PURE_BASE_URL = "https://research.universityofgalway.ie/ws/api/"
 
     HEADERS = {
             "accept": "application/json",
@@ -394,14 +400,14 @@ if __name__ == "__main__":
         if not os.path.isdir(args.folder):
             print(f"Folder not found: {args.folder}")
             sys.exit(1)
-        successes, failures, total_files = process_folder(args.folder, args.mode, args.data, session, error_log, LOG_DIR, args.test)
+        successes, failures, total_files = process_folder(args.folder, args.mode, args.data, session, error_log, LOG_DIR, args.test or args.temp)
         print(f"\n✅ Done. {successes} records succeeded, {failures} failed across {total_files} files.")
         success_count = successes
     elif args.file:
         if not os.path.isfile(args.file):
             print(f"File not found: {args.file}")
             sys.exit(1)
-        success_count, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR, args.test)
+        success_count, results = process_single_file(args.file, args.mode, args.data, session, error_log, LOG_DIR, args.test or args.temp)
         print(f"\n✅ Single file results: {success_count} records succeeded")
         # print(f"Details: {results}")
     else:

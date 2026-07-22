@@ -395,9 +395,8 @@ def run_journals(
     log_dir: Path | None = None,
     sample: bool = False,
 ) -> tuple[list[dict], list[dict]]:
-    default_dir = Path("./unmatched_records")
-    output_create = output_create or default_dir / f"journals_to_create_{NOW_TS}.json"
-    output_update = output_update or default_dir / f"journals_to_update_{NOW_TS}.json"
+    output_create = output_create or existing_path.parent / f"journals_to_create_{NOW_TS}.json"
+    output_update = output_update or existing_path.parent / f"journals_to_update_{NOW_TS}.json"
     logger = _make_logger("journals", output_create.parent, log_dir)
 
     try:
@@ -542,7 +541,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "publishers": [("csv",              "--csv"),
                        ("publishers",       "--publishers")],
         "journals":   [("csv",              "--csv"),
-                       ("journals_existing","--journals-existing")],
+                       ("journals","--journals")],
     }
     errors = []
     for cmd in commands:
@@ -580,7 +579,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if "journals" in commands:
         run_journals(
             csv_path=Path(args.csv),
-            existing_path=Path(args.journals_existing),
+            existing_path=Path(args.journals),
             output_create=Path(args.journals_output_create) if args.journals_output_create else None,
             output_update=Path(args.journals_output_update) if args.journals_output_update else None,
             log_dir=log_dir,
@@ -637,7 +636,7 @@ def _add_multi_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--authors-output", dest="authors_output", help="Output path for authors.")
     p.add_argument("--funders-output",    dest="funders_output",    help="Output path for funders.")
     p.add_argument("--publishers-output", dest="publishers_output", help="Output path for publishers.")
-    p.add_argument("--journals-existing",      dest="journals_existing",      help="Existing journals JSON.")
+    p.add_argument("--journals",      dest="journals",      help="Existing journals JSON.")
     p.add_argument("--journals-output-create", dest="journals_output_create", help="Output path for journals to create.")
     p.add_argument("--journals-output-update", dest="journals_output_update", help="Output path for journals to update.")
     _add_log_dir_arg(p)
@@ -755,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
             "      --commands authors funders publishers journals \\\n"
             "      --authors-input authors.json \\\n"
             "      --csv items.csv --organisations orgs.json \\\n"
-            "      --journals-existing journals.json"
+            "      --journals journals.json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -779,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python prepare_uploads.py all \\\n"
             "      --authors-input authors.json \\\n"
             "      --csv items.csv --organisations orgs.json \\\n"
-            "      --journals-existing journals.json"
+            "      --journals journals.json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

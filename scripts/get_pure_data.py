@@ -21,7 +21,7 @@ ALL_DATA_TYPES = [
     "publishers"
 ]
 
-def fetch_all(data_type, base_url, api_key="", test=False):
+def fetch_all(data_type, base_url, api_key=""):
     """
     Fetch all data from the Elsevier Pure API, handling pagination.
     Returns a list of all items.
@@ -118,17 +118,17 @@ def save_research_outputs_by_type(items, output_dir, filename_prefix):
             json.dump(type_items, f, indent=2, ensure_ascii=False)
         print(f"📄 Saved {len(type_items)} items of type '{type_key}' to: {filepath}")
 
-def fetch_and_save_data_type(data_type, api_key, test, output_dir, split_by_type, filename_prefix=None):
+def fetch_and_save_data_type(data_type, api_key, env_label, output_dir, split_by_type, filename_prefix=None):
     """
     Fetch and save a single data type.
     """
     # Determine filename prefix
     if not filename_prefix:
-        filename_prefix = f"pure_{data_type}"
+        filename_prefix = f"pure_{env_label}_{data_type}"
 
     try:
         # Fetch all data
-        all_data = fetch_all(data_type, base_url, api_key=api_key, test=test)
+        all_data = fetch_all(data_type, base_url, api_key=api_key)
         
         # Save data
         if data_type == "research-outputs" and split_by_type:
@@ -156,6 +156,12 @@ if __name__ == "__main__":
         action="store_true",
         default=False, 
         help="Get data from UAT (--test True) or Production (--test False)"
+    )
+    parser.add_argument(
+        "--temp",
+        action="store_true",
+        default=False,
+        help="Get data from TEMP (uses same API key as Production)"
     )
     parser.add_argument(
         "--data", 
@@ -201,8 +207,14 @@ if __name__ == "__main__":
     
     if args.api_endpoint:
         base_url = args.api_endpoint
+    elif args.test:
+        base_url = 'https://galway-staging.elsevierpure.com/ws/api/'
+    elif args.temp:
+        base_url = 'https://galway-test.elsevierpure.com/ws/api/'
     else:
-        base_url = 'https://galway-staging.elsevierpure.com/ws/api/' if test == True else 'https://research.universityofgalway.ie/ws/api/'
+        base_url = 'https://research.universityofgalway.ie/ws/api/'
+
+    env_label = "test" if args.test else "temp" if args.temp else "prod"
 
     # Determine which data types to fetch
     if args.data == "all":
@@ -223,7 +235,7 @@ if __name__ == "__main__":
         success = fetch_and_save_data_type(
             data_type=data_type,
             api_key=API_KEY,
-            test=args.test,
+            env_label=env_label,
             output_dir=args.output_dir,
             split_by_type=args.split_by_type,
             filename_prefix=args.filename_prefix

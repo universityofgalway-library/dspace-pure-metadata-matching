@@ -16,10 +16,11 @@ Usage:
 
 .env file must contain:
     PURE_ROOT_API_KEY_TEST=your_key_here   (UAT)
-    PURE_ROOT_API_KEY=your_key_here        (Production)
+    PURE_ROOT_API_KEY=your_key_here        (Production & TEMP)
 
 Options:
-    --test / --no-test      Use UAT (default) or Production environment
+    --test                  Use UAT environment
+    --temp                  Use TEMP environment
     --source                Where to get PDFs: 'dspace' (default) or 'local'
     --save-locally          Also save downloaded PDFs to disk (dspace source only)
     --pdf-dir               Save/read directory for PDFs (default: ./dspace_pdfs)
@@ -720,10 +721,10 @@ def main():
                         help="Path to DSpace CSV export")
     parser.add_argument("--pure-json",        required=True,
                         help="Path to Pure research-outputs JSON")
-    parser.add_argument("--test",             action="store_true", default=True,
-                        help="Use UAT environment (default).")
-    parser.add_argument("--no-test",          dest="test", action="store_false",
-                        help="Use Production environment.")
+    parser.add_argument("--test",             action="store_true", default=False,
+                        help="Use UAT environment.")
+    parser.add_argument("--temp",             action="store_true", default=False,
+                        help="Use TEMP environment (uses same API key as Production).")
     parser.add_argument("--save-locally",     action="store_true", default=False,
                         help="Also save downloaded PDFs to disk (dspace source only).")
     parser.add_argument("--log-dir",          default="./pdf_upload_logs",
@@ -745,11 +746,12 @@ def main():
     api_key_var = "PURE_ROOT_API_KEY_TEST" if args.test else "PURE_ROOT_API_KEY"
     api_key     = os.getenv(api_key_var, "")
 
-    base_url = (
-        "https://galway-staging.elsevierpure.com/ws/api/"
-        if args.test else
-        "https://research.universityofgalway.ie/ws/api/"
-    )
+    if args.test:
+        base_url = "https://galway-staging.elsevierpure.com/ws/api/"
+    elif args.temp:
+        base_url = "https://galway-test.elsevierpure.com/ws/api/"
+    else:
+        base_url = "https://research.universityofgalway.ie/ws/api/"
 
     pure_file_upload_url = f"{base_url}research-outputs/file-uploads"
 
@@ -805,7 +807,7 @@ def main():
             print(f"❌ {label} not found: {path}")
             sys.exit(1)
 
-    env_label = "UAT" if args.test else "PRODUCTION"
+    env_label = "UAT" if args.test else "TEMP" if args.temp else "PRODUCTION"
     print(f"{'='*70}")
     print(f"  PDF Upload to Pure — {RUN_TS}")
     print(f"  Environment       : {env_label}")
@@ -976,6 +978,9 @@ def main():
         failed_paths            = []
         failed_upload_paths     = []
         failed_put_paths        = []
+        all_pure_file_ids       = []
+        all_pure_file_pure_ids  = []
+        all_pure_file_names     = []
 
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
@@ -1093,9 +1098,9 @@ def main():
                                     session, base_url, pure_uuid,
                                     expected_file_name=matched_ev_name,
                                 )
-                                entry["pure_file_id"]   = p_file_id
+                                entry["pure_file_id"]      = p_file_id
                                 entry["pure_file_pure_id"] = p_file_pure_id
-                                entry["pure_file_name"] = p_file_name
+                                entry["pure_file_name"]    = p_file_name
                                 if p_file_id:
                                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
                                 counters["metadata_updated"] += 1
@@ -1113,8 +1118,6 @@ def main():
                                 entry["detail"] = f"Metadata update failed: {detail}"
                                 results.append(entry)
                                 failed_rows.append(entry)
-                                matched_ref_writer.writerow(entry)
-                                matched_ref_fh.flush()
                                 metadata_update_handled = True
                             continue
                         elif changed and args.dry_run:
@@ -1124,23 +1127,14 @@ def main():
                         else:
                             print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
                             if matching_ev:
-                                entry["pure_file_id"]   = matching_ev.get("file", {}).get("fileId", "")
+                                entry["pure_file_id"]      = matching_ev.get("file", {}).get("fileId", "")
                                 entry["pure_file_pure_id"] = matching_ev.get("file", {}).get("pureId", "") if matching_ev else ""
-                                entry["pure_file_name"] = matching_ev.get("file", {}).get("fileName", "")
+                                entry["pure_file_name"]    = matching_ev.get("file", {}).get("fileName", "")
+                                all_pure_file_ids.append(entry["pure_file_id"])
+                                all_pure_file_pure_ids.append(str(entry["pure_file_pure_id"]))
+                                all_pure_file_names.append(entry["pure_file_name"])
                             counters["already_has_fev"] += 1
                             skipped_paths.append(safe_file_name)
-                            matched_ref_writer.writerow({
-                                "handle":         entry["handle"],
-                                "dspace_uuid":    entry["dspace_uuid"],
-                                "pure_uuid":      pure_uuid,
-                                "pure_id":        entry["pure_id"],
-                                "title":          entry["title"],
-                                "dspace_file_id": single_path,
-                                "pure_file_id":   entry["pure_file_id"] or "",
-                                "pure_file_pure_id": entry["pure_file_pure_id"] or "",
-                                "pure_file_name": entry["pure_file_name"] or "",
-                            })
-                            matched_ref_fh.flush()
                         continue
 
             # 3. Dry run
@@ -1205,25 +1199,15 @@ def main():
                     session, base_url, pure_uuid,
                     expected_file_name=safe_file_name,
                 )
-                entry["pure_file_id"]   = p_file_id
-                entry["pure_file_pure_id"] = p_file_pure_id
-                entry["pure_file_name"] = p_file_name
+                if p_file_id:
+                    all_pure_file_ids.append(p_file_id)
+                if p_file_pure_id:
+                    all_pure_file_pure_ids.append(str(p_file_pure_id))
+                if p_file_name:
+                    all_pure_file_names.append(p_file_name)
                 if p_file_id:
                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
                 any_success = True
-                # Write matched_ref row immediately (before the outer loop closes)
-                matched_ref_writer.writerow({
-                    "handle":         entry["handle"],
-                    "dspace_uuid":    entry["dspace_uuid"],
-                    "pure_uuid":      pure_uuid,
-                    "pure_id":        entry["pure_id"],
-                    "title":          entry["title"],
-                    "dspace_file_id": single_path,
-                    "pure_file_id":   p_file_id,
-                    "pure_file_pure_id": p_file_pure_id,
-                    "pure_file_name": p_file_name,
-                })
-                matched_ref_fh.flush()
                 # Update in-memory record so subsequent files in this row
                 # see the newly added FileEV for the skip check
                 pure_record.setdefault("electronicVersions", []).append(file_ev)
@@ -1237,7 +1221,19 @@ def main():
             continue
 
         # Consolidate entry status across all paths for this row
-        entry["upload_key"] = "; ".join(uploaded_keys) if uploaded_keys else None
+        entry["upload_key"]         = "; ".join(uploaded_keys)          if uploaded_keys          else None
+        entry["pure_file_id"]       = "; ".join(all_pure_file_ids)      if all_pure_file_ids      else None
+        entry["pure_file_pure_id"]  = "; ".join(all_pure_file_pure_ids) if all_pure_file_pure_ids else None
+        entry["pure_file_name"]     = "; ".join(all_pure_file_names)    if all_pure_file_names    else None
+        entry["dspace_file_id"]     = "; ".join(pdf_paths)
+
+        # A record belongs in matched_ref_csv only when every DSpace PDF has a
+        # confirmed Pure file — i.e. all paths either uploaded successfully or
+        # were already present. Partial or fully-failed rows must not appear there.
+        all_dspace_files_in_pure = (
+            len(all_pure_file_ids) > 0
+            and len(all_pure_file_ids) == len(pdf_paths)
+        )
 
         if args.dry_run:
             entry["status"] = "dry_run"
@@ -1247,14 +1243,12 @@ def main():
 
         if not uploaded_keys and not skipped_paths:
             if failed_put_paths and not failed_upload_paths:
-                # Files uploaded successfully to Pure temp storage but PUT to record failed
+                # Files reached Pure temp storage but PUT to record failed
                 entry["status"] = "put_failed"
                 entry["detail"] = f"PUT failed: {'; '.join(failed_put_paths)}"
                 results.append(entry)
                 failed_rows.append(entry)
                 counters["put_fail"] += 1
-                matched_ref_writer.writerow(entry)
-                matched_ref_fh.flush()
             else:
                 # Every path failed at the upload stage
                 entry["status"] = "pdf_upload_failed"
@@ -1262,9 +1256,6 @@ def main():
                 results.append(entry)
                 failed_rows.append(entry)
                 counters["pdf_fail"] += 1
-                # Still record in matched_ref so failed files are traceable
-                matched_ref_writer.writerow(entry)
-                matched_ref_fh.flush()
         elif any_fail and any_success:
             entry["status"] = "partial_success"
             entry["detail"] = (
@@ -1275,13 +1266,7 @@ def main():
             results.append(entry)
             success_rows.append(entry)
             counters["success"] += 1
-            # Per-file rows were already written inside the inner loop for successes;
-            # write a summary row here covering the whole DSpace item
-            matched_ref_writer.writerow(entry)
-            matched_ref_fh.flush()
         elif not uploaded_keys and skipped_paths:
-            # All paths skipped — existing FileEVs matched
-            # (matched_ref rows were already written per-file in the inner loop)
             entry["status"] = "skipped_existing_fev"
             entry["detail"] = f"All files already exist in Pure with same name and size: {'; '.join(skipped_paths)}"
             results.append(entry)
@@ -1293,7 +1278,10 @@ def main():
             results.append(entry)
             success_rows.append(entry)
             counters["success"] += 1
-            # Per-file rows already written in the inner loop; nothing extra needed here
+
+        if all_dspace_files_in_pure:
+            matched_ref_writer.writerow(entry)
+            matched_ref_fh.flush()
 
     # ---- Summary & logs ----------------------------------------------------
     matched_ref_fh.close()   # flush and close the continuously-written CSV
