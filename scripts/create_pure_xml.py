@@ -61,7 +61,7 @@ Journal (<journal>):
 Usage:
     python create_pure_xml.py --csv input.csv --json input.json --environment test
     python create_pure_xml.py --csv input.csv --json input.json --environment prod --output out.xml
-    python create_pure_xml.py --csv input.csv --json input.json --environment test \\
+    python create_pure_xml.py --csv input.csv --json input.json --environment temp \\
         --modified-by "john@example.com" --modified-after "2025-01-01"
 """
 
@@ -121,6 +121,9 @@ def _start_logging(log_path: str):
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+_XML_ILLEGAL_CHARS_RE = re.compile(
+    "[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
+)
 
 HANDLE_BASE_URL = "http://hdl.handle.net/"
 
@@ -550,15 +553,21 @@ def fetch_journal_from_api(
 def load_csv_records(csv_path: str) -> tuple[dict[str, dict], dict[str, dict]]:
     by_handle: dict[str, dict] = {}
     by_uuid:   dict[str, dict] = {}
+    skipped_not_publications = 0
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
+            if "Publications" not in (row.get("collection_names", "") or ""):
+                skipped_not_publications += 1
+                continue
             raw_handle = row.get("handle", "").strip()
             if raw_handle:
                 by_handle[build_handle_url(raw_handle)] = row
             dspace_uuid = row.get("uuid", "").strip()
             if dspace_uuid:
                 by_uuid[dspace_uuid] = row
+    if skipped_not_publications:
+        print(f"  -> Skipped {skipped_not_publications} CSV row(s) not in the Publications collection.")
     return by_handle, by_uuid
  
  
@@ -681,22 +690,33 @@ def rights_to_licence(rights: str) -> str:
 # XML element helpers
 # ---------------------------------------------------------------------------
  
+def strip_illegal_xml_chars(text: str) -> str:
+    """Remove characters that are not valid in XML 1.0 (e.g. stray control
+    characters like \\x0B, \\x0C, or NUL bytes that sometimes appear in
+    CSV/JSON source data). ElementTree will serialize them without
+    complaint, but a subsequent parse (e.g. via minidom) rejects them as
+    'not well-formed'."""
+    if not text:
+        return text
+    return _XML_ILLEGAL_CHARS_RE.sub("", text)
+
+
 def sub(parent: ET.Element, tag: str, text: str | None = None,
         attrib: dict | None = None, ns: str = PUB_NS) -> ET.Element:
     full_tag = f"{{{ns}}}{tag}" if ns else tag
     el = ET.SubElement(parent, full_tag, attrib=attrib or {})
     if text is not None:
-        el.text = text
+        el.text = strip_illegal_xml_chars(text)
     return el
- 
- 
+
+
 def ns2(tag: str) -> str:
     return f"{{{CMN_NS}}}{tag}"
- 
- 
+
+
 def text_el(parent: ET.Element, tag: str, text: str, attrib: dict | None = None) -> ET.Element:
     el = ET.SubElement(parent, ns2("text"), attrib=attrib or {})
-    el.text = text
+    el.text = strip_illegal_xml_chars(text)
     return el
  
  
