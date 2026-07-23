@@ -125,6 +125,8 @@ _XML_ILLEGAL_CHARS_RE = re.compile(
     "[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
 )
 
+ISSN_RE = re.compile(r"\b(\d{4}-\d{3}[\dXx])\b")
+
 HANDLE_BASE_URL = "http://hdl.handle.net/"
 
 REPOSITORY_DOI_PREFIX = "10.13025/"
@@ -377,7 +379,7 @@ ROLE_MAP: dict[str, str] = {
 
  
 # ---------------------------------------------------------------------------
-# ID / handle utilities
+# ID utilities
 # ---------------------------------------------------------------------------
  
 def build_handle_url(raw_handle: str) -> str:
@@ -487,7 +489,18 @@ def parse_dspace_files(
             sequence = sequence or "1"
         result.append((sequence, filename, file_location))
     return result
- 
+
+
+def _extract_valid_issns(raw: str) -> list[str]:
+    """Pull well-formed NNNN-NNNN ISSNs out of messy free-text and dedupe."""
+    found = []
+    for chunk in re.split(r"[;,]", raw):
+        m = ISSN_RE.search(chunk)
+        if m:
+            candidate = m.group(1).upper()
+            if candidate not in found:
+                found.append(candidate)
+    return found
  
 # ---------------------------------------------------------------------------
 # Pure Journals API fallback
@@ -1112,7 +1125,7 @@ def resolve_journal_info(
     issns: list[str] = []
     csv_issn = (dspace_record.get("dc.identifier.issn") or "").strip()
     if csv_issn:
-        issns = [v.strip() for v in re.split(r"[;,]", csv_issn) if v.strip()]
+        issns = _extract_valid_issns(csv_issn)
     publisher_pure_id = ""
     if journal_uuid and (not title or not issns):
         api_data = fetch_journal_from_api(journal_uuid, environment, api_token, api_cache)
