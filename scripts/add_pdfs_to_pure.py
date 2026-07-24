@@ -29,6 +29,8 @@ Options:
     --skip-existing /
     --no-skip-existing      Skip files already in Pure with same name and size (default: skip)
 """
+
+
 import os
 import re
 import sys
@@ -37,6 +39,7 @@ import json
 import time
 import argparse
 import requests
+from collections import defaultdict
 from datetime import datetime, date
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -290,6 +293,130 @@ def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
         changed = True
 
     return changed, updated
+
+
+# ---------------------------------------------------------------------------
+# Duplicate FileElectronicVersion resolution
+# ---------------------------------------------------------------------------
+
+# Fields checked when scoring how "complete" a FileElectronicVersion's own
+# metadata is (not the nested file block, which is identical across true
+# duplicates by definition — same fileName + size).
+FILE_EV_METADATA_FIELDS = (
+    "licenseType", "accessType", "versionType", "visibleOnPortalDate",
+    "embargoPeriod", "title",
+)
+
+
+def find_duplicate_file_groups(pure_record: dict) -> dict:
+    """
+    Group a record's FileElectronicVersions by (fileName, size).
+    Returns {(fileName, size): [ev, ev, ...]} for groups with more than
+    one entry — i.e. only the genuine duplicates, keyed by object identity
+    so callers can safely tell entries apart even when every other field
+    (including fileName/size) is identical.
+    """
+    groups = defaultdict(list)
+    for ev in pure_record.get("electronicVersions", []):
+        if ev.get("typeDiscriminator") != "FileElectronicVersion":
+            continue
+        file_block = ev.get("file") or {}
+        file_name = file_block.get("fileName")
+        if not file_name:
+            continue
+        key = (file_name, file_block.get("size"))
+        groups[key].append(ev)
+
+    return {key: evs for key, evs in groups.items() if len(evs) > 1}
+
+
+def metadata_completeness_score(ev: dict) -> int:
+    """
+    Count how many of FILE_EV_METADATA_FIELDS are meaningfully populated
+    on a FileElectronicVersion. Higher = more complete metadata.
+    """
+    score = 0
+    for field in FILE_EV_METADATA_FIELDS:
+        value = ev.get(field)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, str)) and not value:
+            continue
+        score += 1
+    return score
+
+
+# Creator values treated as system/import accounts rather than real Pure users.
+SYSTEM_CREATORS = {"root", "atira", "sync_user", "admin", "system", ""}
+
+
+def is_uploaded_by_real_user(ev: dict) -> bool:
+    """
+    Heuristic: entries created by a known system/import account (see
+    SYSTEM_CREATORS) are treated as system/import uploads; any other
+    creator is treated as a real Pure user.
+    """
+    creator = (ev.get("creator") or "").strip().lower()
+    return creator not in SYSTEM_CREATORS
+
+
+def choose_duplicate_to_keep(duplicates: list) -> dict:
+    """
+    Given a list of FileElectronicVersion entries that are duplicates (same
+    fileName + size), choose which single entry to keep.
+
+    Priority:
+      1. Most complete metadata (highest metadata_completeness_score).
+      2. Uploaded by a real Pure user rather than the root/import account.
+      3. Fallback: first entry in the record's original electronicVersions order.
+    """
+    best_ev = None
+    best_key = None
+    for idx, ev in enumerate(duplicates):
+        key = (
+            metadata_completeness_score(ev),
+            1 if is_uploaded_by_real_user(ev) else 0,
+            -idx,  # earlier entries win ties (idx 0 sorts highest)
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_ev = ev
+    return best_ev
+
+
+def resolve_duplicate_file_versions(pure_record: dict) -> tuple[bool, list, list, dict]:
+    """
+    Find and resolve duplicate FileElectronicVersions on a record, keeping
+    exactly one entry per (fileName, size) group per choose_duplicate_to_keep().
+
+    Does NOT mutate pure_record — the caller decides whether/when to apply
+    the returned list. Returns (changed, deduped_versions, removed_evs, kept_by_group):
+      - changed: True if any duplicates were found and resolved
+      - deduped_versions: a new electronicVersions list with duplicates removed
+      - removed_evs: the FileElectronicVersion dicts that were dropped
+      - kept_by_group: {(fileName, size): kept_ev} for the groups that were deduped
+    """
+    groups = find_duplicate_file_groups(pure_record)
+    if not groups:
+        return False, pure_record.get("electronicVersions", []), [], {}
+
+    to_remove_ids = set()
+    removed = []
+    kept_by_group = {}
+    for key, evs in groups.items():
+        keeper = choose_duplicate_to_keep(evs)
+        kept_by_group[key] = keeper
+        for ev in evs:
+            if ev is not keeper:
+                to_remove_ids.add(id(ev))
+                removed.append(ev)
+
+    deduped_versions = [
+        ev for ev in pure_record.get("electronicVersions", [])
+        if id(ev) not in to_remove_ids
+    ]
+    return True, deduped_versions, removed, kept_by_group
+
 
 # ---------------------------------------------------------------------------
 # Matching: build lookup indices from Pure JSON
@@ -896,6 +1023,7 @@ def main():
         "no_match":         0,
         "already_has_fev":  0,
         "metadata_updated": 0,
+        "duplicates_removed": 0,
         "pdf_fail":         0,
         "put_fail":         0,
         "success":          0,
@@ -1072,17 +1200,44 @@ def main():
                              and ev.get("file", {}).get("fileName") == matched_ev_name),
                             None
                         )
-                        changed, updated_ev = needs_metadata_update(matching_ev, row) if matching_ev else (False, None)
 
-                        if changed and not args.dry_run:
-                            print(f"    ℹ️  Same filename and size — updating metadata")
+                        # Look for duplicate FileElectronicVersions anywhere on this
+                        # record (same fileName + size). If the file we matched on
+                        # is one of a duplicate group, treat the chosen "keeper" as
+                        # the entry to check/update metadata on, not just whichever
+                        # duplicate happened to be found first above.
+                        dedup_changed, deduped_versions, removed_evs, kept_by_group = \
+                            resolve_duplicate_file_versions(pure_record)
+
+                        target_ev = matching_ev
+                        if matching_ev is not None:
+                            for (dup_name, _dup_size), keeper in kept_by_group.items():
+                                if dup_name == matched_ev_name:
+                                    target_ev = keeper
+                                    break
+
+                        meta_changed, updated_ev = needs_metadata_update(target_ev, row) if target_ev else (False, None)
+
+                        if (meta_changed or (dedup_changed and removed_evs)) and not args.dry_run:
+                            if dedup_changed and removed_evs:
+                                removed_names = ", ".join(
+                                    f"{ev.get('file', {}).get('fileName', '?')} "
+                                    f"(pureId={ev.get('pureId', '?')}, fileId={ev.get('file', {}).get('fileId', '?')})"
+                                    for ev in removed_evs
+                                )
+                                print(f"    🧹 Removing {len(removed_evs)} duplicate file(s): {removed_names}")
+                            if meta_changed:
+                                print(f"    ℹ️  Same filename and size — updating metadata")
+
+                            # Build the new electronicVersions list from the already
+                            # deduped list (losers excluded), swapping in updated_ev
+                            # for the exact surviving object (identity-based, never
+                            # by filename — a record can hold several entries that
+                            # share a fileName without being the same association).
                             updated_record = dict(pure_record)
                             updated_record["electronicVersions"] = [
-                                updated_ev if (
-                                    ev.get("typeDiscriminator") == "FileElectronicVersion"
-                                    and ev.get("file", {}).get("fileName") == matched_ev_name
-                                ) else ev
-                                for ev in pure_record.get("electronicVersions", [])
+                                updated_ev if (meta_changed and ev is target_ev) else ev
+                                for ev in deduped_versions
                             ]
                             success, detail, pure_id = put_pure_record(
                                 pure_record=updated_record,
@@ -1093,7 +1248,23 @@ def main():
                             )
                             entry["pure_id"] = pure_id
                             if success:
-                                print(f"    ✅ Metadata updated ({detail})")
+                                # Reflect the change in the in-memory record so any
+                                # remaining paths for this same row see the corrected
+                                # (deduped / metadata-updated) state, not stale data.
+                                pure_record["electronicVersions"] = updated_record["electronicVersions"]
+
+                                detail_parts = []
+                                if meta_changed:
+                                    print(f"    ✅ Metadata updated ({detail})")
+                                    detail_parts.append(f"Metadata updated for: {matched_ev_name}")
+                                    counters["metadata_updated"] += 1
+                                if dedup_changed and removed_evs:
+                                    print(f"    ✅ Duplicates removed ({detail})")
+                                    detail_parts.append(
+                                        f"Removed {len(removed_evs)} duplicate copy/copies of: {matched_ev_name}"
+                                    )
+                                    counters["duplicates_removed"] += len(removed_evs)
+
                                 p_file_id, p_file_pure_id, p_file_name = get_file_info(
                                     session, base_url, pure_uuid,
                                     expected_file_name=matched_ev_name,
@@ -1103,25 +1274,30 @@ def main():
                                 entry["pure_file_name"]    = p_file_name
                                 if p_file_id:
                                     print(f"    🔎 File in Pure — fileId: {p_file_id}  fileName: {p_file_name}")
-                                counters["metadata_updated"] += 1
                                 entry["status"] = "metadata_updated"
-                                entry["detail"] = f"Metadata updated for: {matched_ev_name}"
+                                entry["detail"] = "; ".join(detail_parts) if detail_parts else "No change"
                                 results.append(entry)
                                 success_rows.append(entry)
                                 matched_ref_writer.writerow(entry)
                                 matched_ref_fh.flush()
                                 metadata_update_handled = True
                             else:
-                                print(f"    ❌ Metadata update PUT failed: {detail}")
+                                print(f"    ❌ Metadata/duplicate update PUT failed: {detail}")
                                 counters["put_fail"] += 1
                                 entry["status"] = "put_failed"
-                                entry["detail"] = f"Metadata update failed: {detail}"
+                                entry["detail"] = f"Metadata/duplicate update failed: {detail}"
                                 results.append(entry)
                                 failed_rows.append(entry)
                                 metadata_update_handled = True
                             continue
-                        elif changed and args.dry_run:
-                            print(f"    🔍 DRY RUN — metadata would be updated")
+                        elif (meta_changed or (dedup_changed and removed_evs)) and args.dry_run:
+                            if meta_changed:
+                                print(f"    🔍 DRY RUN — metadata would be updated")
+                            if dedup_changed and removed_evs:
+                                removed_names = ", ".join(
+                                    ev.get("file", {}).get("fileName", "?") for ev in removed_evs
+                                )
+                                print(f"    🔍 DRY RUN — would remove {len(removed_evs)} duplicate file(s): {removed_names}")
                             counters["already_has_fev"] += 1
                             skipped_paths.append(safe_file_name)
                         else:
@@ -1298,6 +1474,7 @@ def main():
     print(f"  No Pure match                 : {counters['no_match']}")
     print(f"  Already had FileEV            : {counters['already_has_fev']}")
     print(f"  Only file metadata updated    : {counters['metadata_updated']}")
+    print(f"  Duplicate FileEVs removed     : {counters['duplicates_removed']}")
     print(f"  PDF upload failed             : {counters['pdf_fail']}")
     print(f"  PUT failed                    : {counters['put_fail']}")
     print(f"  Successfully uploaded         : {counters['success']}")
