@@ -984,10 +984,12 @@ def build_electronic_versions(
                 sub(file_el, "filename", file_name)
                 sub(file_el, "fileLocation", dspace_url)
                 sub(file_el, "mimetype", mime_type)
+                sub(file_el, "source", "DSpace")
+                sub(file_el, "externalRepositoryState", "STORED")
                 if file_size:
                     sub(file_el, "filesize", file_size)
             else:
-                # ── Case 3: Pure only (no DSpace counterpart) ───────────────
+                # ── Case 2: Pure only (no DSpace counterpart) ───────────────
                 # Use Pure filename, Pure link, and Pure file ID.
                 if not file_url:
                     continue
@@ -1031,7 +1033,7 @@ def build_electronic_versions(
         sub(file_el, "filename", filename)
         sub(file_el, "fileLocation", file_location)
         sub(file_el, "mimetype", guess_mimetype(filename))
-        sub(file_el, "source", store_host)
+        sub(file_el, "source", "DSpace")
         sub(file_el, "externalRepositoryState", "STORED")
  
  
