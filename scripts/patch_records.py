@@ -11,6 +11,8 @@ Patch modes (one or more may be combined):
   --patch-author-keywords  Remove the /dk/atira/pure/authors keyword group
   --patch-publishers     Inject publisher from DSpace dc.publisher into Pure records
                          that lack one. Requires --publisher-mapping and --dspace-csv.
+  --patch-file-versions  Set a default versionType on file electronic versions
+                         that don't have one assigned.
 
 See README.md for full usage examples.
 """
@@ -51,6 +53,11 @@ PUBLISHER_TYPES = {
     "OtherContribution",
     "WorkingPaper",
     "NonTextual",
+}
+
+DEFAULT_VERSION_TYPE = {
+    "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
+    "term": {"en_IE": "Accepted author manuscript"},
 }
 
 
@@ -512,6 +519,84 @@ def patch_author_keywords(
 
 
 # ---------------------------------------------------------------------------
+# Patch: file versions
+# ---------------------------------------------------------------------------
+
+def patch_file_versions(
+    records: list,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    For each FileElectronicVersion entry in electronicVersions that has no
+    versionType assigned, set versionType to DEFAULT_VERSION_TYPE
+    ("Accepted author manuscript"). Nothing else on the record is changed.
+    Produces a standard PATCH-compatible JSON (uuid + full electronicVersions
+    list, with the fix applied) for every record that had at least one file
+    missing a version type.
+    """
+    patches = []
+    skipped = 0
+    skipped_date = 0
+    patched = 0
+    files_patched = 0
+
+    for record in tqdm(records, desc="[file-versions] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        uuid = record.get("uuid", "")
+        electronic_versions = record.get("electronicVersions", [])
+
+        if not electronic_versions:
+            skipped += 1
+            continue
+
+        changed = False
+        updated_versions = []
+        for ev in electronic_versions:
+            if (
+                isinstance(ev, dict)
+                and ev.get("typeDiscriminator") == "FileElectronicVersion"
+                and not ev.get("versionType")
+            ):
+                ev = {**ev, "versionType": DEFAULT_VERSION_TYPE}
+                changed = True
+                files_patched += 1
+                file_name = ev.get("file", {}).get("fileName", "") \
+                    if isinstance(ev.get("file"), dict) else ""
+                tqdm.write(
+                    f"  📎 [{uuid}] — default versionType set on file "
+                    f"'{file_name}'"
+                )
+            updated_versions.append(ev)
+
+        if not changed:
+            skipped += 1
+            continue
+
+        patches.append({
+            "uuid":               uuid,
+            "electronicVersions": updated_versions,
+        })
+        patched += 1
+
+    output_path = os.path.join(output_dir, f"file_version_patch_{TODAY}.json")
+    write_json(output_path, patches)
+
+    return {
+        "total":               len(records),
+        "skipped_date_filter": skipped_date,
+        "skipped_no_change":   skipped,
+        "patched":             patched,
+        "files_patched":       files_patched,
+        "files":               [output_path],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Patch: publishers
 # ---------------------------------------------------------------------------
 
@@ -773,6 +858,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "output_dir",
         help="Directory where patch files will be written.",
+        default = "./patches"
     )
 
     modes = parser.add_argument_group("Patch modes (at least one required)")
@@ -814,6 +900,14 @@ def build_parser() -> argparse.ArgumentParser:
             "have no publisher set. Matches Pure records to DSpace rows by DOI, "
             "handle, or DSpace UUID, then resolves dc.publisher against the "
             "publisher mapping. Requires --publisher-mapping and --dspace-csv."
+        ),
+    )
+    modes.add_argument(
+        "--patch-file-versions",
+        action="store_true",
+        help=(
+            "Set a default versionType ('Accepted author manuscript') on "
+            "FileElectronicVersion entries that have no versionType assigned."
         ),
     )
 
@@ -878,13 +972,15 @@ def main() -> None:
         args.patch_external_orgs,
         args.patch_author_keywords,
         args.patch_publishers,
+        args.patch_file_versions,
     ]
     
     if not any(modes_selected):
         parser.error(
             "No patch mode selected. Choose at least one of: "
             "--patch-nulls, --patch-titles, --patch-workflow, "
-            "--patch-external-orgs, --patch-author-keywords, --patch-publishers"
+            "--patch-external-orgs, --patch-author-keywords, --patch-publishers, "
+            "--patch-file-versions"
         )
 
     if args.patch_publishers and not args.publisher_mapping:
@@ -957,6 +1053,10 @@ def main() -> None:
             args.output_dir, modified_after
         )
         print_summary("Publishers", stats)
+
+    if args.patch_file_versions:
+        stats = patch_file_versions(records, args.output_dir, modified_after)
+        print_summary("File versions", stats)
 
     print(f"\n✅ All done. Output directory: {args.output_dir}\n")
 
