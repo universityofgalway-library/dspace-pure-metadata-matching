@@ -964,6 +964,13 @@ def build_electronic_versions(
         # {"year": 2026, "month": 5, "day": 1}
         if ev:
             embargo_end = (ev.get("embargoPeriod") or {}).get("endDate")
+            if embargo_end and isinstance(embargo_end, str):
+                year, month, day = parse_date(embargo_end, dayfirst=True)
+                embargo_end = {
+                                "year": year,
+                                "month": month,
+                                "day": day,
+                            }
 
         # DSpace CSV fallback: dc.date.embargo is a string, so parse it
         # into the same (year, month, day) representation.
@@ -1192,7 +1199,7 @@ def resolve_journal_info(
     journal_obj    = journal_assoc.get("journal") or {}
     journal_uuid   = (journal_obj.get("uuid") or "").strip()
     journal_pure_id = str(journal_obj.get("pureId") or "").strip()
-    title          = ((journal_assoc.get("title") or {}).get("title") or "").strip()
+    title = _extract_localized_text((journal_assoc.get("title") or "")).strip()
     if not title:
         title = (dspace_record.get("journal_title") or "").strip()
     if not title:
@@ -1269,22 +1276,17 @@ def build_publisher(parent: ET.Element, pure_record: dict) -> None:
 
 def build_isbns(parent: ET.Element, pure_record: dict, dspace_record: dict) -> None:
     pure_isbns = []
-
     for field_name in ("printISBNs", "electronicISBNs"):
         for isbn in pure_record.get(field_name, []) or []:
             isbn = str(isbn).strip()
             if isbn and isbn not in pure_isbns:
                 pure_isbns.append(isbn)
-
     isbns = pure_isbns
-
     if not isbns:
         dspace_isbn = (dspace_record.get("dc.identifier.isbn") or "").strip()
         isbns = [isbn.strip() for isbn in dspace_isbn.split(";") if isbn.strip()]
-
     if not isbns:
         return
-
     isbns_el = sub(parent, "printIsbns")
     for isbn in isbns:
         sub(isbns_el, "isbn", isbn)
@@ -1428,12 +1430,12 @@ def _add_type_specific_fields(
         build_publisher(rec_el, pure_record)
 
     elif xml_tag == "chapterInBook":
-        host_title = (pure_record.get("hostPublicationTitle") or "").strip()
+        host_title = _extract_localized_text(pure_record.get("hostPublicationTitle")).strip()
         if not host_title:
             host_title = (dspace_record.get("dc.relation.ispartof") or "").strip()
         if host_title:
             sub(rec_el, "hostPublicationTitle", host_title)
-        host_subtitle = (pure_record.get("hostPublicationSubTitle") or "").strip()
+        host_subtitle = _extract_localized_text(pure_record.get("hostPublicationSubTitle")).strip()
         if host_subtitle:
             sub(rec_el, "hostPublicationSubTitle", host_subtitle)
         build_publisher(rec_el, pure_record)
@@ -1576,11 +1578,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--csv",  required=True, metavar="CSV_FILE",
+    parser.add_argument("--csv",  metavar="CSV_FILE", required=True,
                         help="Path to the DSpace CSV export.")
-    parser.add_argument("--json", required=True, metavar="JSON_FILE",
+    parser.add_argument("--json",  metavar="JSON_FILE", required=True,
                         help="Path to the Pure JSON export.")
-    parser.add_argument("--environment", required=True, choices=sorted(DSPACE_BASE_URLS),
+    parser.add_argument("--environment", choices=sorted(DSPACE_BASE_URLS), required=True,
                         help=(
                             "Which DSpace environment's base URL to use for "
                             "<existingStores>/<storeName>, <electronicVersionFile>/"
@@ -1719,7 +1721,7 @@ def main() -> None:
         unmatched_dspace_rows.append(row)
 
     for row in unmatched_dspace_rows:
-        title = (row.get("dc.title") or row.get("title") or "").strip() or "(no title)"
+        title = (row.get("dc.title") or row.get("title") or "").strip() or ""
         handle = (row.get("handle") or "").strip() or "(no handle)"
         uuid   = (row.get("uuid")   or "").strip() or "(no uuid)"
         print(
