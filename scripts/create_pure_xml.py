@@ -17,10 +17,9 @@ ID rules:
   - The DSpace UUID is written as <id type="DSpace"> inside <externalIds>.
 
 Data source priority:
-  Pure JSON is authoritative. The DSpace CSV is only used to fill in fields
-  Pure doesn't have (e.g. journal/publisher details, embargo info, and any
-  bitstream that exists in DSpace but isn't yet recorded as an electronic
-  version in Pure).
+Pure JSON is authoritative for publication metadata. The DSpace CSV is used
+only as a fallback when a corresponding Pure field is absent, and for
+repository-specific file matching / DSpace-only bitstreams and existingStores.
 
 existingStores:
   Every matched record gets an <existingStores>/<existingStore> block built
@@ -238,6 +237,7 @@ LANG_MAP = {
     "alb": "sq_AL",
 }
 
+
 PURE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article":                  ("contributionToJournal", "article"),
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview":         ("contributionToJournal", "systematicreview"),
@@ -314,6 +314,7 @@ PURE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontomemorandum/contributiontoqahearing":           ("contributionToMemorandum", "contributiontoqahearing"),
 }
 
+
 DSPACE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "journal article":        ("contributionToJournal", "article"),
     "review article":         ("contributionToJournal", "systematicreview"),
@@ -334,6 +335,7 @@ DSPACE_TYPE_MAP: dict[str, tuple[str, str]] = {
     "other":                  ("other", "other"),
 }
 
+
 LICENSE_MAP: dict[str, str] = {
     "cc_by":       "cc_by",
     "cc_by_nc":    "cc_by_nc",
@@ -344,12 +346,14 @@ LICENSE_MAP: dict[str, str] = {
     "cc0":         "cc0",
 }
 
+
 ACCESS_MAP: dict[str, str] = {
     "open":      "open",
     "closed":    "closed",
     "embargoed": "embargoed",
     "unknown":   "unknown",
 }
+
 
 VERSION_MAP: dict[str, str] = {
     "publishersversion": "publishersversion",
@@ -358,6 +362,7 @@ VERSION_MAP: dict[str, str] = {
     "proofversion":      "proofversion",
 }
 
+
 WORKFLOW_MAP: dict[str, str] = {
     "entryInProgress": "entryInProgress",
     "forApproval":     "forApproval",
@@ -365,12 +370,14 @@ WORKFLOW_MAP: dict[str, str] = {
     "validated":       "validated",
 }
 
+
 VISIBILITY_MAP: dict[str, str] = {
     "FREE":       "Public",
     "BACKEND":    "Restricted",
     "CAMPUS":     "Restricted",
     "RESTRICTED": "Restricted",
 }
+
 
 ROLE_MAP: dict[str, str] = {
     "author":      "author",
@@ -701,18 +708,23 @@ def _uri_suffix(uri: str) -> str:
  
 def map_license(uri: str) -> str:
     return LICENSE_MAP.get(_uri_suffix(uri), "")
+
  
 def map_access(uri: str) -> str:
     return ACCESS_MAP.get(_uri_suffix(uri), "open")
+
  
 def map_version(uri: str) -> str:
     return VERSION_MAP.get(_uri_suffix(uri), "authorsversion")
+
  
 def map_workflow(step: str) -> str:
     return WORKFLOW_MAP.get(step, "forApproval")
+
  
 def map_visibility(key: str) -> str:
     return VISIBILITY_MAP.get(key, "Public")
+
  
 def map_role(uri: str) -> str:
     return ROLE_MAP.get(_uri_suffix(uri), "author")
@@ -732,6 +744,7 @@ RIGHTS_TO_LICENSE: dict[str, str] = {
     "cc by-sa":    "cc_by_sa",
     "cc0":         "cc0",
 }
+
  
 def rights_to_licence(rights: str) -> str:
     return RIGHTS_TO_LICENSE.get(rights.strip().lower(), "")
@@ -792,24 +805,35 @@ def build_publication_statuses(parent: ET.Element, pure_record: dict) -> None:
                 sub(date_el, "day", str(pub_date["day"]), ns=CMN_NS)
  
  
-def build_title(parent: ET.Element, pure_record: dict, lang_uri: str) -> None:
+def build_title(parent: ET.Element, pure_record: dict, dspace_record: dict, lang_uri: str, ) -> None:
     title_val = ""
     title_obj = pure_record.get("title", {})
     if isinstance(title_obj, dict):
-        title_val = title_obj.get("value", "").strip()
+        title_val = (title_obj.get("value") or "").strip()
+
+    # DSpace is fallback only for an empty Pure title.
+    if not title_val:
+        title_val = (
+            dspace_record.get("dc.title")
+            or dspace_record.get("title")
+            or ""
+        ).strip()
     if not title_val:
         return
     title_el = sub(parent, "title")
     text_el(title_el, "text", title_val, attrib=lang_attr(lang_uri))
- 
- 
-def build_subtitle(parent: ET.Element, dspace_record: dict, lang_uri: str) -> None:
-    subtitle = (dspace_record.get("dc.title.subtitle") or "").strip()
-    if not subtitle:
+
+
+def build_subtitle(parent: ET.Element, pure_record: dict, lang_uri: str,) -> None:
+    st_val = ""
+    st_obj = pure_record.get("subtitle", {})
+    if isinstance(st_obj, dict):
+        st_val = (st_obj.get("value") or "").strip()
+    if not st_val:
         return
     st_el = sub(parent, "subTitle")
-    text_el(st_el, "text", subtitle)
- 
+    text_el(st_el, "text", st_val, attrib=lang_attr(lang_uri))
+
  
 def build_abstract(parent: ET.Element, pure_record: dict, lang_uri: str) -> None:
     abstract_obj = pure_record.get("abstract", {})
@@ -938,7 +962,7 @@ def build_electronic_versions(
         sub(node, "version", version)
         if licence:
             sub(node, "licence", licence)
-            
+
         # Embargo end date: Pure JSON (ev["embargoPeriod"]["endDate"]) is
         # authoritative; the DSpace CSV's dc.date.embargo (the embargo lift
         # date) is only used as a fallback when Pure has no embargoPeriod
@@ -1119,15 +1143,34 @@ def _build_external_ids(
     pure_record: dict,
     dspace_uuid: str,
     dspace_record: dict,
+    xml_tag: str,
 ) -> None:
     ext_el = sub(parent, "externalIds")
-    sub(ext_el, "id", dspace_uuid, attrib={"type": "DSpace"})
-    isbn = (dspace_record.get("dc.identifier.isbn") or "").strip()
-    if isbn:
-        sub(ext_el, "id", isbn, attrib={"type": "isbn"})
-    issn = (dspace_record.get("dc.identifier.issn") or "").strip()
-    if issn:
-        sub(ext_el, "id", issn, attrib={"type": "issn"})
+
+    if dspace_uuid:
+        sub(ext_el, "id", dspace_uuid, attrib={"type": "DSpace"})
+
+    if xml_tag != "book":
+        return
+
+    pure_isbns = []
+    for field_name in ("printISBNs", "electronicISBNs"):
+        for isbn in pure_record.get(field_name, []) or []:
+            isbn = str(isbn).strip()
+            if isbn and isbn not in pure_isbns:
+                pure_isbns.append(isbn)
+
+    if pure_isbns:
+        for isbn in pure_isbns:
+            sub(ext_el, "id", isbn, attrib={"type": "isbn"})
+        return
+
+    # DSpace ISBN is fallback only when Pure has no ISBNs.
+    dspace_isbn = (dspace_record.get("dc.identifier.isbn") or "").strip()
+    for isbn in dspace_isbn.split(";"):
+        isbn = isbn.strip()
+        if isbn:
+            sub(ext_el, "id", isbn, attrib={"type": "isbn"})
  
  
 def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> None:
@@ -1234,31 +1277,56 @@ def build_journal(
     return True
  
  
-def build_publisher(parent: ET.Element, dspace_record: dict) -> None:
-    publisher = (dspace_record.get("publisher_name") or dspace_record.get("dc.publisher") or "").strip()
-    if not publisher:
+def build_publisher(parent: ET.Element, pure_record: dict) -> None:
+    publisher = pure_record.get("publisher") or {}
+    publisher_uuid = str(publisher.get("uuid") or "").strip()
+    if not publisher_uuid:
         return
-    pub_el = sub(parent, "publisher")
-    sub(pub_el, "name", publisher)
- 
- 
-def build_isbns(parent: ET.Element, dspace_record: dict) -> None:
-    isbn = (dspace_record.get("dc.identifier.isbn") or "").strip()
-    if not isbn:
+    sub(
+        parent,
+        "publisher",
+        attrib={"id": publisher_uuid},
+    )
+
+
+def build_isbns(parent: ET.Element, pure_record: dict, dspace_record: dict) -> None:
+    pure_isbns = []
+
+    for field_name in ("printISBNs", "electronicISBNs"):
+        for isbn in pure_record.get(field_name, []) or []:
+            isbn = str(isbn).strip()
+            if isbn and isbn not in pure_isbns:
+                pure_isbns.append(isbn)
+
+    isbns = pure_isbns
+
+    if not isbns:
+        dspace_isbn = (dspace_record.get("dc.identifier.isbn") or "").strip()
+        isbns = [isbn.strip() for isbn in dspace_isbn.split(";") if isbn.strip()]
+
+    if not isbns:
         return
+
     isbns_el = sub(parent, "printIsbns")
-    for raw in isbn.split(";"):
-        raw = raw.strip()
-        if raw:
-            sub(isbns_el, "isbn", raw)
+    for isbn in isbns:
+        sub(isbns_el, "isbn", isbn)
  
  
-def build_funding_text(parent: ET.Element, dspace_record: dict, lang_uri: str) -> None:
-    sponsorship = (dspace_record.get("dc.description.sponsorship") or "").strip()
-    if not sponsorship:
+def build_funding_text(
+    parent: ET.Element,
+    pure_record: dict,
+    dspace_record: dict,
+    lang_uri: str,
+) -> None:
+    funding = _extract_localized_text(pure_record.get("fundingText"))
+
+    # DSpace is fallback only when Pure fundingText is missing/empty.
+    if not funding:
+        funding = (dspace_record.get("dc.description.sponsorship") or "").strip()
+    if not funding:
         return
     ft_el = sub(parent, "fundingText")
-    text_el(ft_el, "text", sponsorship, attrib=lang_attr(lang_uri))
+    text_el(ft_el, "text", funding, attrib=lang_attr(lang_uri))
  
  
 # ---------------------------------------------------------------------------
@@ -1321,8 +1389,8 @@ def build_record_element(
                     file=sys.stderr,
                 )
             sub(rec_el, "language", mapped_lang)
-    build_title(rec_el, pure_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
-    build_subtitle(rec_el, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
+    build_title(rec_el, pure_record, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
+    build_subtitle(rec_el, pure_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
     build_abstract(rec_el, pure_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
     build_persons(rec_el, pure_record)
     orgs = pure_record.get("organizations", [])
@@ -1346,8 +1414,8 @@ def build_record_element(
     vis_key = pure_record.get("visibility", {}).get("key", "FREE")
     sub(rec_el, "visibility", map_visibility(vis_key))
     dspace_uuid = (dspace_record.get("uuid") or "").strip()
-    _build_external_ids(rec_el, pure_record, dspace_uuid, dspace_record)
-    build_funding_text(rec_el, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
+    _build_external_ids(rec_el, pure_record, dspace_uuid, dspace_record, xml_tag)
+    build_funding_text(rec_el, pure_record, dspace_record, lang_uri or "/dk/atira/pure/core/languages/en_IE")
     _add_type_specific_fields(
         rec_el, xml_tag, pure_record, dspace_record, lang_uri,
         environment, api_token, api_cache,
@@ -1376,27 +1444,32 @@ def _add_type_specific_fields(
             rec_el.tag = f"{{{PUB_NS}}}other"
             rec_el.set("subType", "other")
             # <other> needs no type-specific child elements — nothing more to do.
+
     elif xml_tag in ("book",):
-        build_isbns(rec_el, dspace_record)
-        build_publisher(rec_el, dspace_record)
+        build_isbns(rec_el, pure_record, dspace_record)
+        build_publisher(rec_el, pure_record)
+
     elif xml_tag == "chapterInBook":
-        build_isbns(rec_el, dspace_record)
-        alt_title = (
-            (dspace_record.get("dc.title.alternative") or "").strip()
-            or (dspace_record.get("dc.relation.ispartof") or "").strip()
-            or "\u2014"
-        )
-        sub(rec_el, "hostPublicationTitle", alt_title)
-        build_publisher(rec_el, dspace_record)
+        host_title = (pure_record.get("hostPublicationTitle") or "").strip()
+        if not host_title:
+            host_title = (dspace_record.get("dc.relation.ispartof") or "").strip()
+        if host_title:
+            sub(rec_el, "hostPublicationTitle", host_title)
+        host_subtitle = (pure_record.get("hostPublicationSubTitle") or "").strip()
+        if host_subtitle:
+            sub(rec_el, "hostPublicationSubTitle", host_subtitle)
+        build_publisher(rec_el, pure_record)
+
     elif xml_tag == "workingPaper":
-        build_publisher(rec_el, dspace_record)
+        build_publisher(rec_el, pure_record)
+
     elif xml_tag == "thesis":
         quality = (dspace_record.get("dc.type") or "").strip().lower()
         if "phd" in quality or "doctoral" in quality:
             sub(rec_el, "qualification", "phd")
         elif "master" in quality:
             sub(rec_el, "qualification", "master")
-        build_publisher(rec_el, dspace_record)
+        build_publisher(rec_el, pure_record)
  
  
 # ---------------------------------------------------------------------------
