@@ -8,6 +8,7 @@ Matches records between a **DSpace CSV export** and a **Pure JSON export**, then
 
 - Python 3.10+
 - `python-dotenv` (for reading the optional `.env` API key file)
+- `python-dateutil` (for parsing DSpace embargo date strings)
 - Standard library otherwise (`csv`, `json`, `xml.etree.ElementTree`, `xml.dom.minidom`, `argparse`, `re`, `urllib`, `mimetypes`)
 
 ---
@@ -75,21 +76,18 @@ Standard DSpace metadata export. The script uses the following columns:
 | `handle` | Fallback match key; also written as `<existingStores><existingStore><storeContentId>` and used to build the `<file id="...">` attribute for DSpace-only files |
 | `pdf_links` | Full DSpace bitstream URL for the item's file. Used as `<fileLocation>` (domain rewritten per `--environment`) when that file isn't already represented in the Pure JSON |
 | `pdf_handle_paths` | Old-style handle bitstream path (e.g. `/10379/17513/1/name.pdf`), parsed to recover the bitstream sequence number and filename for the DSpace-only `<file>` block |
-| `dc.title` | Title fallback used in unmatched-row warnings |
-| `dc.title.alternative` / `dc.relation.ispartof` | Host publication title for book chapters |
-| `dc.title.subtitle` | Subtitle |
-| `dc.description.abstract` | Abstract (if Pure has none) |
+| `dc.title` | Fallback for the publication title when Pure `title.value` is empty; also used in unmatched-row warnings |
+| `dc.relation.ispartof` | Fallback for `<hostPublicationTitle>` for book-chapter records when Pure `hostPublicationTitle` is absent or empty |
 | `dc.description.peer-reviewed` | Peer review flag fallback |
-| `dc.description.sponsorship` | Funding text |
+| `dc.description.sponsorship` | Fallback for funding text when Pure `fundingText` is missing or empty |
 | `dc.identifier.doi` | DOI fallback if Pure has none |
-| `dc.identifier.issn` | ISSN written into `<journal>` |
-| `dc.identifier.isbn` | ISBN written into `<printIsbns>` |
+| `dc.identifier.issn` | ISSN fallback for journal resolution |
+| `dc.identifier.isbn` | ISBN fallback for `book` records only, when Pure `printISBNs` and `electronicISBNs` are both absent/empty |
 | `dc.language.iso` | Language fallback |
-| `dc.publisher` / `publisher_name` | Publisher name |
 | `dc.rights` | Licence fallback (e.g. `CC BY-NC-ND`) |
-| `dc.type` | Publication type fallback, and thesis qualification detection (`phd`/`doctoral`/`master`) |
-| `dc.date.embargo` / `dc.description.embargo` | Embargo start/end dates |
-| `journal_title` | Journal title |
+| `dc.type` | Publication type fallback |
+| `dc.date.embargo` | Embargo-date fallback when Pure has no `embargoPeriod.endDate`; the DSpace string is parsed into a date structure |
+| `journal_title` | Journal title fallback |
 | `dc.identifier.journal` | Journal title fallback |
 
 All other columns are loaded but not directly mapped to XML.
@@ -98,8 +96,9 @@ All other columns are loaded but not directly mapped to XML.
 
 Array of research output objects as returned by the Pure REST API. The script reads:
 
-- `pureId`, `uuid`, `typeDiscriminator`, `type.uri`
-- `title.value`, `abstract`
+ `pureId`, `uuid`, `typeDiscriminator`, `type.uri`
+- `title.value`
+- `abstract`
 - `language.uri`
 - `peerReview`, `publicationStatuses`
 - `category.uri` (publication category; defaults to `research`)
@@ -107,6 +106,10 @@ Array of research output objects as returned by the Pure REST API. The script re
 - `contributors[]` — name, role, correspondingAuthor; `person.uuid` (internal) or `externalPerson.uuid` (external) used as the `<person id="...">` attribute
 - `organizations[]`, `managingOrganization`
 - `journalAssociation.journal.uuid`, `journalAssociation.title.title`
+- `publisher.uuid` — used for `<publisher id="...">` on non-journal/non-specialist-publication types; there is no DSpace publisher fallback
+- `printISBNs`, `electronicISBNs` — used for `book` records only
+- `hostPublicationTitle`, `hostPublicationSubTitle` — used for book-chapter records; `dc.relation.ispartof` is only a fallback for `hostPublicationTitle`
+- `fundingText` — used for funding text; `dc.description.sponsorship` is only a fallback
 - `electronicVersions[]` (DOI, file, and link versions)
 - `identifiers[]` (to extract the DSpace UUID for matching)
 - `links[]` — Handle URLs (for matching); repository DOIs (`10.13025/` prefix, promoted to `<electronicVersionDOI>`); all other non-DOI links written to `<urls>`
@@ -128,6 +131,12 @@ Pure records with no match in the CSV are simply skipped — this is not reporte
 ### Duplicate resolution
 
 If the same DSpace UUID maps to more than one Pure record, the most recently modified Pure record (by `modifiedDate`) is kept. A warning is printed to stderr for every collision.
+
+### Publication metadata source priority
+
+Pure JSON is the authoritative source for publication metadata. DSpace CSV values are used only as explicit fallbacks where documented below.
+
+The file-matching logic is the exception: DSpace filenames and bitstream URLs are used to match Pure `FileElectronicVersion` entries, and DSpace-only bitstreams can be added when no matching Pure file exists.
 
 ---
 
@@ -194,6 +203,12 @@ For the complete, authoritative list of every supported subtype, see the `PURE_T
 | `data management plan` | `other` | `other` |
 | `other` | `other` | `other` |
 
+### Title and subtitle
+
+- `<title>` is taken from Pure `title.value`.
+- If Pure `title.value` is empty, `dc.title` from DSpace is used as a fallback.
+- `<subTitle>` is taken from the Pure subtitle field only. There is no DSpace subtitle fallback.
+
 ### Journal resolution
 
 `<journal>` is mandatory for `contributionToJournal` and `contributionToSpecialist` records, so it's always resolved with the following priority:
@@ -206,18 +221,9 @@ If nothing is found anywhere, the record is **skipped** (not exported) and a war
 
 ### Electronic versions
 
-Electronic versions are resolved across three sources in priority order.
+Electronic versions are taken from Pure `electronicVersions[]`. DSpace is used only for the documented DOI and embargo fallbacks, plus the file-matching/Dspace-only-file logic below.
 
-#### Repository DOIs in `links[]`
-
-Before processing `electronicVersions`, the script scans the Pure JSON `links[]` array for any URL containing the repository DOI prefix `10.13025/`. These are promoted to `<electronicVersionDOI>` elements with fixed metadata — they are not written to `<urls>`:
-
-| Field | Value |
-|---|---|
-| `<version>` | `authorsversion` |
-| `<licence>` | `cc_by` |
-| `<publicAccess>` | `open` |
-| `<doi>` | bare DOI extracted from the link URL (e.g. `10.13025/18019`) |
+If Pure carries no electronic versions but the DSpace record has a `dc.identifier.doi`, a `<electronicVersionDOI>` is generated from it as a fallback.
 
 #### Pure `electronicVersions[]`
 
@@ -235,9 +241,9 @@ For each `FileElectronicVersion` in the Pure JSON, the script looks up whether a
 
 | Case | `<filename>` | `<fileLocation>` | `<file id="...">` |
 |---|---|---|---|
-| **DSpace + Pure match** — filename found in both | DSpace (`pdf_handle_paths`) | DSpace URL (`pdf_links`, domain rewritten per `--environment`) | Pure `fileId` |
+| **DSpace + Pure match** — filename found in both | DSpace (`pdf_handle_paths`) | DSpace URL (`pdf_links`, domain rewritten per `--environment`) | `<handle>:<filename>` |
 | **Pure only** — Pure file has no DSpace counterpart | Pure `fileName` | Pure file URL | Pure `fileId` |
-| **DSpace only** — DSpace file has no Pure counterpart | DSpace (`pdf_handle_paths`) | DSpace URL (domain rewritten) | *omitted* — Pure assigns one after upload |
+| **DSpace only** — DSpace file has no Pure counterpart | DSpace (`pdf_handle_paths`) | DSpace URL (domain rewritten) | `<handle>:<filename>` |
 
 DSpace-only files (case 3) are appended after all Pure `FileElectronicVersion` entries are processed. Each semicolon-separated entry in `pdf_links` / `pdf_handle_paths` produces a separate `<electronicVersionFile>` element. Additional DSpace-only fields:
 
@@ -245,12 +251,18 @@ DSpace-only files (case 3) are appended after all Pure `FileElectronicVersion` e
 |---|---|
 | `<mimetype>` | Guessed from the filename extension (defaults to `application/pdf`) |
 | `<filesize>` | Omitted — the CSV doesn't carry a size for DSpace-only bitstreams |
-| `<source>` |Always `DSpace` |
+| `<source>` | Always `DSpace` |
 | `<externalRepositoryState>` | Always `STORED` |
-| `<version>` | `--default-version` (default `publishersversion`) |
+| `<version>` | `authorsversion` |
 | `<licence>` / `<publicAccess>` | `dc.rights` → licence; `dc.date.embargo` → embargoed, otherwise open |
 
 Filename comparison is case-insensitive and URL-decodes both sides, so e.g. `Paper.PDF` and `paper.pdf` are treated as the same file.
+
+#### Embargo dates
+
+For a Pure electronic version, `embargoPeriod.endDate` is authoritative and is emitted as a date structure containing `year`, `month`, and `day`.
+
+If Pure has no embargo end date for that electronic version, the DSpace `dc.date.embargo` string is parsed and converted to the same date structure before being written to `<embargoEndDate>`.
 
 ### Publication category
 
@@ -270,13 +282,13 @@ Every matched record gets an `<existingStores><existingStore>` block, telling Pu
 </existingStores>
 ```
 
-`storeName` is always `DSpace`, `storeContentId` is the DSpace Handle (CSV `handle` column — not the UUID), and `updateRequired` is always `true`. This block is added whenever the matched DSpace CSV row has a `handle` value, independent of whether any file was found for the record.
+`storeName` is the selected `--environment`'s host, `storeContentId` is the DSpace Handle (CSV `handle` column — not the UUID), and `updateRequired` is always `true`. This block is added whenever the matched DSpace CSV row has a `handle` value, independent of whether any file was found for the record.
 
 ### URLs
 
 `<urls>` is built **only** from the Pure JSON `links[]` array — the DSpace CSV's `dc.identifier.uri` column and the Pure JSON `portalUrl` field are no longer used, since neither is part of the record's own `links[]` and including them produced duplicate or unwanted entries. For each entry in `links[]`:
 
-- Repository DOIs (`10.13025/` prefix) are skipped — they're promoted to `<electronicVersionDOI>` instead (see [Repository DOIs in `links[]`](#repository-dois-in-links)).
+- Repository DOIs (`10.13025/` prefix) are skipped).
 - Everything else, **including Handle links**, is written to `<urls>`. The `<description>` text comes from the link's own `description.en_IE` field, falling back to `alias` if no description is present.
 
 ### Licence and access
@@ -314,12 +326,12 @@ Depending on the resolved XML tag, additional elements are written:
 
 | XML tag | Extra fields written |
 |---|---|
-| `contributionToJournal` | `<journal>` (see [Journal resolution](#journal-resolution)) |
+| `contributionToJournal` | `<journal>` (record is skipped if it can't be resolved — see [Journal resolution](#journal-resolution)) |
 | `contributionToSpecialist` | `<journal>` (same skip behaviour as above) |
 | `book` | `<printIsbns>`, `<publisher>` |
-| `chapterInBook` | `<printIsbns>`, `<hostPublicationTitle>` (from `dc.title.alternative` / `dc.relation.ispartof`, falling back to an em dash if neither is present), `<publisher>` |
+| `chapterInBook` | `<hostPublicationTitle>` (falling back to `dc.relation.ispartof`, and then an em dash if neither is present), `<publisher>` |
 | `workingPaper` | `<publisher>` |
-| `thesis` | `<qualification>` (`phd` or `mphil`, guessed from `dc.type`; defaults to `phd`), `<publisher>` |
+| `thesis` | `<qualification>` (`phd` or `master`, guessed from `dc.type`), `<publisher>` |
 
 ---
 

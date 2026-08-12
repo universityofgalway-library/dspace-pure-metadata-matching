@@ -920,20 +920,11 @@ def build_persons(parent: ET.Element, pure_record: dict) -> None:
         build_author_organisations(author_el, contrib)
  
 
-def is_repository_doi(doi_or_url: str) -> bool:
+def is_doi(doi_or_url: str) -> bool:
     """Return True if the value is a repository DOI (10.13025/ prefix)."""
     s = (doi_or_url or "").strip()
     # Accept bare DOIs ("10.13025/xxxxx") and URL forms ("https://doi.org/10.13025/…")
-    return "10.13025/" in s
-
-
-def extract_doi_from_link(url: str) -> str:
-    """Extract the bare DOI from a doi.org URL or return the value unchanged."""
-    url = (url or "").strip()
-    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/"):
-        if url.lower().startswith(prefix):
-            return url[len(prefix):]
-    return url
+    return "10.13025/" in s or "doi.org" in s
 
 
 def build_electronic_versions(
@@ -997,19 +988,6 @@ def build_electronic_versions(
         elif access:
             sub(node, "publicAccess", access)
 
-    # ── Repository DOIs stored as links[] in the Pure JSON ──────────────────
-    # Pure sometimes records a repository DOI (prefix 10.13025/) as a plain
-    # URL link rather than a DoiElectronicVersion. Emit them here as
-    # DoiElectronicVersion: authorsversion, open access, CC BY 4.0.
-    for link in pure_record.get("links", []):
-        link_url = (link.get("url") or "").strip()
-        if is_repository_doi(link_url):
-            doi_val = extract_doi_from_link(link_url)
-            doi_el = sub(ensure_ev_el(), "electronicVersionDOI")
-            sub(doi_el, "version", "authorsversion")
-            sub(doi_el, "licence", "cc_by")
-            sub(doi_el, "publicAccess", "open")
-            sub(doi_el, "doi", doi_val)
 
     # ── Build filename → (sequence, dspace_url) lookup from the CSV ─────────
     handle   = (dspace_record.get("handle") or "").strip()
@@ -1190,7 +1168,7 @@ def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> No
         link_url = (link.get("url") or "").strip()
         # Skip repository DOIs (those are promoted to electronicVersionDOI
         # with authorsversion/cc_by/open in build_electronic_versions).
-        if not link_url or is_repository_doi(link_url):
+        if not link_url or is_doi(link_url):
             continue
         desc_text = (
             (link.get("description") or {}).get("en_IE", "").strip()
