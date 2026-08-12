@@ -245,7 +245,7 @@ DSpace-only files (case 3) are appended after all Pure `FileElectronicVersion` e
 |---|---|
 | `<mimetype>` | Guessed from the filename extension (defaults to `application/pdf`) |
 | `<filesize>` | Omitted — the CSV doesn't carry a size for DSpace-only bitstreams |
-| `<source>` | The selected `--environment`'s host |
+| `<source>` |Always `DSpace` |
 | `<externalRepositoryState>` | Always `STORED` |
 | `<version>` | `--default-version` (default `publishersversion`) |
 | `<licence>` / `<publicAccess>` | `dc.rights` → licence; `dc.date.embargo` → embargoed, otherwise open |
@@ -263,14 +263,14 @@ Every matched record gets an `<existingStores><existingStore>` block, telling Pu
 ```xml
 <existingStores>
     <existingStore>
-        <storeName>researchrepository.universityofgalway.ie</storeName>
+        <storeName>DSpace</storeName>
         <updateRequired>true</updateRequired>
         <storeContentId>10379/17513</storeContentId>
     </existingStore>
 </existingStores>
 ```
 
-`storeName` is the selected `--environment`'s host, `storeContentId` is the DSpace Handle (CSV `handle` column — not the UUID), and `updateRequired` is always `true`. This block is added whenever the matched DSpace CSV row has a `handle` value, independent of whether any file was found for the record.
+`storeName` is always `DSpace`, `storeContentId` is the DSpace Handle (CSV `handle` column — not the UUID), and `updateRequired` is always `true`. This block is added whenever the matched DSpace CSV row has a `handle` value, independent of whether any file was found for the record.
 
 ### URLs
 
