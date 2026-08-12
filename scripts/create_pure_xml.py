@@ -964,34 +964,14 @@ def build_electronic_versions(
         # {"year": 2026, "month": 5, "day": 1}
         if ev:
             embargo_end = (ev.get("embargoPeriod") or {}).get("endDate")
-            if embargo_end and isinstance(embargo_end, str):
-                year, month, day = parse_date(embargo_end, dayfirst=True)
-                embargo_end = {
-                                "year": year,
-                                "month": month,
-                                "day": day,
-                            }
-
         # DSpace CSV fallback: dc.date.embargo is a string, so parse it
         # into the same (year, month, day) representation.
         if not embargo_end and dspace_embargo_end:
-            year, month, day = parse_date(dspace_embargo_end, dayfirst=True)
-            embargo_end = {
-                "year": year,
-                "month": month,
-                "day": day,
-            }
+            embargo_end = dspace_embargo_end
 
         if embargo_end:
             sub(node, "publicAccess", "embargoed")
-
-            embargo_el = sub(node, "embargoEndDate")
-            if embargo_end.get("year"):
-                sub(embargo_el, "year", str(embargo_end["year"]), ns=CMN_NS)
-            if embargo_end.get("month"):
-                sub(embargo_el, "month", str(embargo_end["month"]), ns=CMN_NS)
-            if embargo_end.get("day"):
-                sub(embargo_el, "day", str(embargo_end["day"]), ns=CMN_NS)
+            sub(node, "embargoEndDate", embargo_end)
         elif access:
             sub(node, "publicAccess", access)
 
