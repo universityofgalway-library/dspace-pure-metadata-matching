@@ -13,6 +13,8 @@ Patch modes (one or more may be combined):
                          that lack one. Requires --publisher-mapping and --dspace-csv.
   --patch-file-versions  Set a default versionType on file electronic versions
                          that don't have one assigned.
+  --patch-urls            Clean links[]: keep one Handle link (desc "Repository
+                           Handle"), drop DOIs/portal links, dedupe the rest.
 
 See README.md for full usage examples.
 """
@@ -820,6 +822,142 @@ def patch_publishers(
 
 
 # ---------------------------------------------------------------------------
+# Patch: urls
+# ---------------------------------------------------------------------------
+
+def _is_doi_url(url: str) -> bool:
+    """True if the value is a DOI (doi.org URL or bare 10.xxxx/... DOI)."""
+    url = (url or "").strip()
+    if not url:
+        return False
+    if re.search(r'doi\.org/', url, re.IGNORECASE):
+        return True
+    return bool(re.match(r'^10\.\d{4,9}/\S+$', url, re.IGNORECASE))
+
+
+def _is_handle_url(url: str) -> bool:
+    """True if the value is a hdl.handle.net Handle URL."""
+    return bool(re.search(r'hdl\.handle\.net', (url or ""), re.IGNORECASE))
+
+
+def _is_portal_url(link: dict, record: dict) -> bool:
+    """True if the link is the Pure portal link for this record."""
+    url = (link.get("url") or "").strip()
+    portal_url = (record.get("portalUrl") or "").strip()
+    if portal_url and url == portal_url:
+        return True
+    alias = (link.get("alias") or "").strip().lower()
+    desc  = ((link.get("description") or {}).get("en_IE") or "").strip().lower()
+    return "portal" in alias or "portal" in desc
+
+
+def _clean_links(links: list, record: dict):
+    """
+    Clean a record's `links` list:
+      - drop DOI links and Pure portal links
+      - keep exactly one Handle link, with its description normalised to
+        "Repository Handle"
+      - de-duplicate the remaining (non-Handle) links by URL, preferring
+        whichever copy has a description when duplicates are found
+    Returns (cleaned_links, changed).
+    """
+    if not links:
+        return links, False
+
+    handle_link = None
+    other_by_url = {}
+    order = []
+
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        url = (link.get("url") or "").strip()
+        if not url:
+            continue
+        if _is_doi_url(url):
+            continue
+        if _is_portal_url(link, record):
+            continue
+
+        if _is_handle_url(url):
+            if handle_link is None:
+                handle_link = link
+            continue
+
+        key = url.lower()
+        existing = other_by_url.get(key)
+        if existing is None:
+            other_by_url[key] = link
+            order.append(key)
+        else:
+            existing_has_desc = bool((existing.get("description") or {}).get("en_IE", "").strip())
+            new_has_desc = bool((link.get("description") or {}).get("en_IE", "").strip())
+            if new_has_desc and not existing_has_desc:
+                other_by_url[key] = link
+
+    cleaned = []
+    if handle_link is not None:
+        normalized_handle = dict(handle_link)
+        normalized_handle["description"] = {"en_IE": "Repository Handle"}
+        cleaned.append(normalized_handle)
+    cleaned.extend(other_by_url[key] for key in order)
+
+    return cleaned, cleaned != links
+
+
+def patch_urls(
+    records: list,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    Clean up each record's `links` list: keep exactly one Handle link
+    (description normalised to "Repository Handle"), drop all DOI links
+    and Pure portal links, and de-duplicate what's left by URL (preferring
+    the copy that has a description). Produces a PATCH-compatible JSON
+    (uuid + cleaned links list) for every record whose links actually changed.
+    """
+    patches = []
+    skipped = 0
+    skipped_date = 0
+    skipped_no_links = 0
+    patched = 0
+
+    for record in tqdm(records, desc="[urls] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        uuid = record.get("uuid", "")
+        links = record.get("links", [])
+
+        if not links:
+            skipped_no_links += 1
+            continue
+
+        cleaned_links, changed = _clean_links(links, record)
+        if not changed:
+            skipped += 1
+            continue
+
+        patches.append({"uuid": uuid, "links": cleaned_links})
+        patched += 1
+        tqdm.write(f"  🔗 [{uuid}] links: {len(links)} → {len(cleaned_links)}")
+
+    output_path = os.path.join(output_dir, f"url_patch_{TODAY}.json")
+    write_json(output_path, patches)
+
+    return {
+        "total":               len(records),
+        "skipped_date_filter": skipped_date,
+        "skipped_no_links":    skipped_no_links,
+        "skipped_no_change":   skipped,
+        "patched":             patched,
+        "files":               [output_path],
+    }
+
+# ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1048,15 @@ def build_parser() -> argparse.ArgumentParser:
             "FileElectronicVersion entries that have no versionType assigned."
         ),
     )
+    modes.add_argument(
+        "--patch-urls",
+        action="store_true",
+        help=(
+            "Clean links[]: keep one Handle link (description normalised "
+            "to 'Repository Handle'), drop DOI links and Pure portal "
+            "links, and de-duplicate remaining links by URL."
+        ),
+    )
 
     opts = parser.add_argument_group("Options")
     opts.add_argument(
@@ -973,6 +1120,7 @@ def main() -> None:
         args.patch_author_keywords,
         args.patch_publishers,
         args.patch_file_versions,
+        args.patch_urls,
     ]
     
     if not any(modes_selected):
@@ -980,7 +1128,7 @@ def main() -> None:
             "No patch mode selected. Choose at least one of: "
             "--patch-nulls, --patch-titles, --patch-workflow, "
             "--patch-external-orgs, --patch-author-keywords, --patch-publishers, "
-            "--patch-file-versions"
+            "--patch-file-versions, --patch-urls"
         )
 
     if args.patch_publishers and not args.publisher_mapping:
@@ -1057,6 +1205,10 @@ def main() -> None:
     if args.patch_file_versions:
         stats = patch_file_versions(records, args.output_dir, modified_after)
         print_summary("File versions", stats)
+
+    if args.patch_urls:
+        stats = patch_urls(records, args.output_dir, modified_after)
+        print_summary("URLs", stats)
 
     print(f"\n✅ All done. Output directory: {args.output_dir}\n")
 

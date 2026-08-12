@@ -55,6 +55,8 @@ python patch_records.py <input> <output_dir> [OPTIONS]
 | `--patch-external-orgs` | Clear `externalOrganizations` at the record level and within every contributor. |
 | `--patch-author-keywords` | Remove the `/dk/atira/pure/authors` keyword group from `keywordGroups`. |
 | `--patch-publishers` | Inject publisher UUIDs into eligible Pure records that have no publisher set, sourced from DSpace `dc.publisher`. Requires `--publisher-mapping` and `--dspace-csv`. |
+| `--patch-file-versions` | Set a default `versionType` ("Accepted author manuscript") on `FileElectronicVersion` entries in `electronicVersions` that have no `versionType` assigned. |
+| `--patch-urls` | Clean `links[]`: keep exactly one Handle link (description normalised to "Repository Handle"), drop DOI links and Pure portal links, and de-duplicate remaining links by URL (preferring the copy that has a description). |
 
 ### Options
 
@@ -189,6 +191,38 @@ Patch shape:
 }
 ```
 
+### `--patch-file-versions`
+
+For each `FileElectronicVersion` entry in a record's `electronicVersions` that has no `versionType` assigned, sets `versionType` to:
+
+```json
+{
+  "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
+  "term": { "en_IE": "Accepted author manuscript" }
+}
+```
+
+Records with no `electronicVersions`, or where every file version already has a `versionType`, are skipped. The `--modified-after` date filter applies.
+
+Output file: `file_version_patch_YYYY-MM-DD.json`
+Patch shape: `{ "uuid": "…", "electronicVersions": [ /* full list, with the fix applied */ ] }`
+
+---
+
+### `--patch-urls`
+
+Cleans up each record's `links` array:
+
+1. Drops any DOI link (`doi.org` URL or bare `10.xxxx/…` DOI).
+2. Drops the Pure portal link (matched against the record's `portalUrl`, or an `alias`/`description` containing "portal").
+3. Keeps exactly **one** Handle link (`hdl.handle.net` URL), with its `description` normalised to `{"en_IE": "Repository Handle"}`.
+4. De-duplicates any remaining links by URL, preferring whichever copy has a `description` set when duplicates are found.
+
+Records whose `links` list is empty, or whose cleaned result is identical to the original, are skipped. The `--modified-after` date filter applies.
+
+Output file: `url_patch_YYYY-MM-DD.json`
+Patch shape: `{ "uuid": "…", "links": [ /* cleaned links */ ] }`
+
 ---
 
 ## Output files summary
@@ -201,6 +235,8 @@ Patch shape:
 | `--patch-external-orgs` | `external_org_patch_YYYY-MM-DD.json` |
 | `--patch-author-keywords` | `author_keyword_patch_YYYY-MM-DD.json` |
 | `--patch-publishers` | `publisher_patch_YYYY-MM-DD.json` |
+| `--patch-file-versions` | `file_version_patch_YYYY-MM-DD.json` |
+| `--patch-urls` | `url_patch_YYYY-MM-DD.json` |
 
 All files are written to `<output_dir>/`. The date in each filename is the date the script is run.
 
