@@ -82,7 +82,6 @@ Standard DSpace metadata export. The script uses the following columns:
 | `dc.description.peer-reviewed` | Peer review flag fallback |
 | `dc.description.sponsorship` | Funding text |
 | `dc.identifier.doi` | DOI fallback if Pure has none |
-| `dc.identifier.uri` | Handle URL(s) written to `<urls>` |
 | `dc.identifier.issn` | ISSN written into `<journal>` |
 | `dc.identifier.isbn` | ISBN written into `<printIsbns>` |
 | `dc.language.iso` | Language fallback |
@@ -112,7 +111,6 @@ Array of research output objects as returned by the Pure REST API. The script re
 - `identifiers[]` (to extract the DSpace UUID for matching)
 - `links[]` — Handle URLs (for matching); repository DOIs (`10.13025/` prefix, promoted to `<electronicVersionDOI>`); all other non-DOI links written to `<urls>`
 - `modifiedBy`, `modifiedDate` (for filtering and duplicate resolution)
-- `portalUrl` (written to `<urls>`)
 
 ---
 
@@ -276,7 +274,10 @@ Every matched record gets an `<existingStores><existingStore>` block, telling Pu
 
 ### URLs
 
-`dc.identifier.uri` (from the DSpace CSV) and `portalUrl` (from the Pure JSON) are written to `<urls>`. Non-Handle, non-repository-DOI entries from Pure's `links[]` array are also included. Handle links are skipped (used for matching only) and repository DOIs (`10.13025/`) are skipped because they are promoted to `<electronicVersionDOI>` instead.
+`<urls>` is built **only** from the Pure JSON `links[]` array — the DSpace CSV's `dc.identifier.uri` column and the Pure JSON `portalUrl` field are no longer used, since neither is part of the record's own `links[]` and including them produced duplicate or unwanted entries. For each entry in `links[]`:
+
+- Repository DOIs (`10.13025/` prefix) are skipped — they're promoted to `<electronicVersionDOI>` instead (see [Repository DOIs in `links[]`](#repository-dois-in-links)).
+- Everything else, **including Handle links**, is written to `<urls>`. The `<description>` text comes from the link's own `description.en_IE` field, falling back to `alias` if no description is present.
 
 ### Licence and access
 

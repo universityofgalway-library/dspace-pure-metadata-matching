@@ -1065,8 +1065,10 @@ def _build_external_ids(
  
  
 def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> None:
-    handle_raw = (dspace_record.get("dc.identifier.uri") or "").strip()
-    portal_url = pure_record.get("portalUrl", "").strip()
+    """Emit <urls> using ONLY pure_record['links'] -- do not fabricate entries
+    from the DSpace CSV handle or the Pure portalUrl, since those are not
+    part of the record's links[] and were causing duplicate/unwanted URLs.
+    """
     urls_el = None
 
     def ensure_urls() -> ET.Element:
@@ -1075,37 +1077,22 @@ def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> No
             urls_el = sub(parent, "urls")
         return urls_el
 
-    if handle_raw:
-        for raw in handle_raw.split(";"):
-            raw = raw.strip()
-            if raw:
-                url_el = sub(ensure_urls(), "url")
-                sub(url_el, "url", raw)
-                desc_el = sub(url_el, "description")
-                text_el(desc_el, "text", "Repository Handle")
-                sub(url_el, "type", "unspecified")
-    if portal_url:
-        url_el = sub(ensure_urls(), "url")
-        sub(url_el, "url", portal_url)
-        desc_el = sub(url_el, "description")
-        text_el(desc_el, "text", "Pure portal link")
-        sub(url_el, "type", "unspecified")
-
-    # Add any Pure links[] that are NOT repository DOIs (those are promoted to
-    # DoiElectronicVersion in build_electronic_versions).
     for link in pure_record.get("links", []):
-        alias    = (link.get("alias") or "").strip()
         link_url = (link.get("url") or "").strip()
-        # Skip Handle links (used for matching only) and repository DOIs
-        # (promoted to electronicVersionDOI with authorsversion/cc_by/open).
-        if not link_url or alias == "Handle" or is_repository_doi(link_url):
+        # Skip repository DOIs (those are promoted to electronicVersionDOI
+        # with authorsversion/cc_by/open in build_electronic_versions).
+        if not link_url or is_repository_doi(link_url):
             continue
+        desc_text = (
+            (link.get("description") or {}).get("en_IE", "").strip()
+            or (link.get("alias") or "").strip()
+        )
         url_el = sub(ensure_urls(), "url")
         sub(url_el, "url", link_url)
-        if alias:
+        if desc_text:
             desc_el = sub(url_el, "description")
-            text_el(desc_el, "text", alias)
-        sub(url_el, "type", "unspecified")
+            text_el(desc_el, "text", desc_text)
+        sub(url_el)
  
  
 def resolve_journal_info(
