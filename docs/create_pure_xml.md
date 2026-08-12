@@ -314,7 +314,7 @@ Depending on the resolved XML tag, additional elements are written:
 
 | XML tag | Extra fields written |
 |---|---|
-| `contributionToJournal` | `<journal>` (record is skipped if it can't be resolved — see [Journal resolution](#journal-resolution)) |
+| `contributionToJournal` | `<journal>` (see [Journal resolution](#journal-resolution)) |
 | `contributionToSpecialist` | `<journal>` (same skip behaviour as above) |
 | `book` | `<printIsbns>`, `<publisher>` |
 | `chapterInBook` | `<printIsbns>`, `<hostPublicationTitle>` (from `dc.title.alternative` / `dc.relation.ispartof`, falling back to an em dash if neither is present), `<publisher>` |
