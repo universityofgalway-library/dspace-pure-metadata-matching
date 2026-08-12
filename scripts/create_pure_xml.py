@@ -24,18 +24,20 @@ Data source priority:
 
 existingStores:
   Every matched record gets an <existingStores>/<existingStore> block built
-  from the DSpace CSV "handle" column (storeContentId) and the chosen
-  --environment's hostname (storeName), with <updateRequired>true</updateRequired>,
-  matching the structure of DSpace_XMl_example.xml.
+  from the DSpace CSV "handle" column (storeContentId) with <storeName> set to
+  "DSpace" and with <updateRequired>true</updateRequired>, matching the 
+  structure of DSpace_XMl_example.xml.
 
 DSpace-only files:
   If the DSpace CSV row references a bitstream (via "pdf_links" /
   "pdf_handle_paths") whose filename doesn't match any FileElectronicVersion
   already present in the Pure JSON record, a new <electronicVersionFile> is
-  added for it. Its <v1:file id="..."> follows the example's
-  "{handle}:{sequence}:{filename}" pattern, and <fileLocation> is the
-  "pdf_links" URL rewritten onto the selected --environment's domain.
-  No <filesize> is written for these files since the CSV doesn't carry one.
+  added for it. Its <v1:file id="..."> follows the "{handle}:{filename}"
+  pattern, and <fileLocation> is the "pdf_links" URL rewritten onto the
+  selected --environment's domain. No <filesize> is written for these files
+  since the CSV doesn't carry one. The same "{handle}:{filename}" id pattern
+  is also used when a Pure FileElectronicVersion matches a DSpace file by
+  name (replacing Pure's own fileId); Pure-only files keep using Pure's fileId.
 
 Journal (<journal>):
   Mandatory (minOccurs=1) for contributionToJournal and
@@ -54,9 +56,9 @@ Journal (<journal>):
        PURE_ROOT_API_KEY_TEST (--environment test) or PURE_ROOT_API_KEY
        (--environment prod), falling back to real process environment
        variables of the same name.
-  If nothing is found anywhere, an empty <journal/> is emitted (still
-  schema-valid, since all its children are optional) and a warning is
-  printed so the gap can be filled in manually.
+  If nothing is found anywhere, the record is reclassified as <other>
+  (subType "other") instead of emitting an invalid empty <journal/>,
+  and a warning is printed so the gap can be reviewed.
 
 Usage:
     python create_pure_xml.py --csv input.csv --json input.json --environment test
@@ -76,6 +78,8 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+from dateutil import parser as dateutil_parser
+from dateutil.parser import ParserError
 from urllib.parse import unquote, urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
@@ -377,6 +381,40 @@ ROLE_MAP: dict[str, str] = {
     "supervisor":  "supervisor",
 }
 
+
+# ---------------------------------------------------------------------------
+# Date utilities
+# ---------------------------------------------------------------------------
+
+def parse_date(date_string, dayfirst=True):
+    """
+    Parse a date string into a (year, month, day) tuple.
+
+    Supports ISO 8601, yyyy-mm-dd, dd-mm-yyyy, yyyy/mm/dd, dd/mm/yyyy,
+    year-only, and most other common formats via dateutil.
+    """
+    if not date_string:
+        return (1970, 1, 1)
+
+    date_string = date_string.strip()
+
+    # Year-only: "2008", "1995"
+    if date_string.isdigit() and len(date_string) == 4:
+        return (int(date_string), 1, 1)
+
+    try:
+        parsed = dateutil_parser.parse(date_string, dayfirst=dayfirst)
+        return (parsed.year, parsed.month, parsed.day)
+    except (ParserError, ValueError, OverflowError):
+        pass
+
+    # Last resort: extract the first 4-digit year found
+    year_match = re.search(r'\b(1[89]\d{2}|20\d{2})\b', date_string)
+    if year_match:
+        return (int(year_match.group(1)), 1, 1)
+
+    return (1970, 1, 1)
+
  
 # ---------------------------------------------------------------------------
 # ID utilities
@@ -517,8 +555,8 @@ def parse_journal_api_response(data: dict) -> dict:
     issn_pool = active_issns or all_issns
     issns = [i["issn"].strip() for i in issn_pool if (i.get("issn") or "").strip()]
  
-    publisher_pure_id = str((data.get("publisher") or {}).get("pureId") or "").strip()
-    return {"title": title, "issns": issns, "publisher_pure_id": publisher_pure_id}
+    publisher_uuid = str((data.get("publisher") or {}).get("uuid") or "").strip()
+    return {"title": title, "issns": issns, "publisher_uuid": publisher_uuid}
  
  
 def fetch_journal_from_api(
@@ -884,9 +922,9 @@ def build_electronic_versions(
 ) -> None:
     evs = pure_record.get("electronicVersions", [])
     dc_rights_licence = rights_to_licence(dspace_record.get("dc.rights") or "")
-    has_embargo   = bool((dspace_record.get("dc.date.embargo") or "").strip())
-    embargo_start = (dspace_record.get("dc.date.embargo") or "").strip()
-    embargo_desc  = (dspace_record.get("dc.description.embargo") or "").strip()
+    # DSpace fallback embargo end date -- only used when Pure JSON has no
+    # embargoPeriod.endDate for the electronic version in question.
+    dspace_embargo_end = (dspace_record.get("dc.date.embargo") or "").strip()
 
     ev_el: ET.Element | None = None
 
@@ -896,19 +934,44 @@ def build_electronic_versions(
             ev_el = sub(parent, "electronicVersions")
         return ev_el
 
-    def _fill_common(node: ET.Element, version: str, licence: str, access: str) -> None:
+    def _fill_common(node: ET.Element, version: str, licence: str, access: str, ev: dict | None = None, ) -> None:
         sub(node, "version", version)
         if licence:
             sub(node, "licence", licence)
-        if has_embargo:
+            
+        # Embargo end date: Pure JSON (ev["embargoPeriod"]["endDate"]) is
+        # authoritative; the DSpace CSV's dc.date.embargo (the embargo lift
+        # date) is only used as a fallback when Pure has no embargoPeriod
+        # for this electronic version.
+        embargo_end = None
+
+        # Pure JSON: endDate is a date dict, e.g.
+        # {"year": 2026, "month": 5, "day": 1}
+        if ev:
+            embargo_end = (ev.get("embargoPeriod") or {}).get("endDate")
+
+        # DSpace CSV fallback: dc.date.embargo is a string, so parse it
+        # into the same (year, month, day) representation.
+        if not embargo_end and dspace_embargo_end:
+            year, month, day = parse_date(dspace_embargo_end, dayfirst=True)
+            embargo_end = {
+                "year": year,
+                "month": month,
+                "day": day,
+            }
+
+        if embargo_end:
             sub(node, "publicAccess", "embargoed")
-            if embargo_start:
-                sub(node, "embargoStartDate", embargo_start)
-            if embargo_desc:
-                sub(node, "embargoEndDate", embargo_desc)
-        else:
-            if access:
-                sub(node, "publicAccess", access)
+
+            embargo_el = sub(node, "embargoEndDate")
+            if embargo_end.get("year"):
+                sub(embargo_el, "year", str(embargo_end["year"]), ns=CMN_NS)
+            if embargo_end.get("month"):
+                sub(embargo_el, "month", str(embargo_end["month"]), ns=CMN_NS)
+            if embargo_end.get("day"):
+                sub(embargo_el, "day", str(embargo_end["day"]), ns=CMN_NS)
+        elif access:
+            sub(node, "publicAccess", access)
 
     # ── Repository DOIs stored as links[] in the Pure JSON ──────────────────
     # Pure sometimes records a repository DOI (prefix 10.13025/) as a plain
@@ -955,7 +1018,7 @@ def build_electronic_versions(
             if not doi_val:
                 continue
             doi_el = sub(ensure_ev_el(), "electronicVersionDOI")
-            _fill_common(doi_el, version, licence, access)
+            _fill_common(doi_el, version, licence, access, ev)
             sub(doi_el, "doi", doi_val)
 
         elif disc == "FileElectronicVersion":
@@ -974,13 +1037,15 @@ def build_electronic_versions(
 
             if norm and norm in dspace_by_filename:
                 # ── Case 1: DSpace + Pure match ─────────────────────────────
-                # Use DSpace filename and URL; keep Pure file ID.
+                # Use DSpace filename and URL; build File id from DSpace handle + filename.
                 seq, dspace_url = dspace_by_filename[norm]
                 matched_dspace_norms.add(norm)
                 fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
-                _fill_common(fev_el, version, licence, access)
-                # Pure ID preserved as the file element's id attribute.
-                file_el = sub(fev_el, "file", attrib={"id": file_id} if file_id else None)
+                _fill_common(fev_el, version, licence, access, ev)
+                # File id is built from the DSpace handle + filename
+                # ("{handle}:{filename}"), not from Pure's own fileId.
+                dspace_file_id = f"{handle}:{file_name}" if handle and file_name else file_id
+                file_el = sub(fev_el, "file", attrib={"id": dspace_file_id} if dspace_file_id else None)
                 sub(file_el, "filename", file_name)
                 sub(file_el, "fileLocation", dspace_url)
                 sub(file_el, "mimetype", mime_type)
@@ -994,7 +1059,7 @@ def build_electronic_versions(
                 if not file_url:
                     continue
                 fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
-                _fill_common(fev_el, version, licence, access)
+                _fill_common(fev_el, version, licence, access, ev)
                 file_el = sub(fev_el, "file", attrib={"id": file_id} if file_id else None)
                 sub(file_el, "filename", file_name or file_url.split("/")[-1])
                 sub(file_el, "fileLocation", file_url)
@@ -1007,7 +1072,7 @@ def build_electronic_versions(
             if not link_url:
                 continue
             lev_el = sub(ensure_ev_el(), "electronicVersionLink")
-            _fill_common(lev_el, version, licence, access)
+            _fill_common(lev_el, version, licence, access, ev)
             sub(lev_el, "link", link_url)
 
     if ev_el is None or len(ev_el) == 0:
@@ -1021,15 +1086,16 @@ def build_electronic_versions(
                         sub(doi_el, "licence", dc_rights_licence)
                     sub(doi_el, "doi", doi_raw)
 
-    # ── Case 2: DSpace only (no matching Pure FileElectronicVersion) ─────────
-    # Use DSpace filename and URL; no id (Pure will assign one after upload).
+    # ── Case 3: DSpace only (no matching Pure FileElectronicVersion) ─────────
+    # Use DSpace filename and URL; build File id from DSpace handle + filename.
     for seq, filename, file_location in dspace_files:
         if normalize_filename_for_match(filename) in matched_dspace_norms:
             continue
         fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
         _fill_common(fev_el, version=default_version, licence=dc_rights_licence, access="open")
-        # No id attribute — Pure assigns one after the file is uploaded.
-        file_el = sub(fev_el, "file")
+        # File id is built from the DSpace handle + filename ("{handle}:{filename}").
+        dspace_only_file_id = f"{handle}:{filename}" if handle else None
+        file_el = sub(fev_el, "file", attrib={"id": dspace_only_file_id} if dspace_only_file_id else None)
         sub(file_el, "filename", filename)
         sub(file_el, "fileLocation", file_location)
         sub(file_el, "mimetype", guess_mimetype(filename))
@@ -1037,7 +1103,7 @@ def build_electronic_versions(
         sub(file_el, "externalRepositoryState", "STORED")
  
  
-def build_existing_stores(parent: ET.Element, dspace_record: dict, store_host: str) -> None:
+def build_existing_stores(parent: ET.Element, dspace_record: dict) -> None:
     handle = (dspace_record.get("handle") or "").strip()
     if not handle:
         return
@@ -1092,7 +1158,6 @@ def build_urls(parent: ET.Element, dspace_record: dict, pure_record: dict) -> No
         if desc_text:
             desc_el = sub(url_el, "description")
             text_el(desc_el, "text", desc_text)
-        sub(url_el)
  
  
 def resolve_journal_info(
@@ -1112,10 +1177,16 @@ def resolve_journal_info(
     if not title:
         title = (dspace_record.get("dc.identifier.journal") or "").strip()
     issns: list[str] = []
-    csv_issn = (dspace_record.get("dc.identifier.issn") or "").strip()
-    if csv_issn:
-        issns = _extract_valid_issns(csv_issn)
-    publisher_pure_id = ""
+    # Pure JSON first, per documented priority — confirm actual field name(s)
+    # against a real export; guessing "issn" / "printIssn" here.
+    pure_issn_raw = (journal_obj.get("issn") or journal_obj.get("printIssn") or "").strip()
+    if pure_issn_raw:
+        issns = _extract_valid_issns(pure_issn_raw)
+    if not issns:
+        csv_issn = (dspace_record.get("dc.identifier.issn") or "").strip()
+        if csv_issn:
+            issns = _extract_valid_issns(csv_issn)
+    publisher_uuid = ""
     if journal_uuid and (not title or not issns):
         api_data = fetch_journal_from_api(journal_uuid, environment, api_token, api_cache)
         if api_data:
@@ -1123,14 +1194,14 @@ def resolve_journal_info(
                 title = api_data["title"]
             if not issns and api_data.get("issns"):
                 issns = api_data["issns"]
-            if api_data.get("publisher_pure_id"):
-                publisher_pure_id = api_data["publisher_pure_id"]
+            if api_data.get("publisher_uuid"):
+                publisher_uuid = api_data["publisher_uuid"]
     return {
         "uuid": journal_uuid,
         "pure_id": journal_pure_id,
         "title": title,
         "issns": issns,
-        "publisher_pure_id": publisher_pure_id,
+        "publisher_uuid": publisher_uuid,
     }
  
  
@@ -1145,21 +1216,21 @@ def build_journal(
     """
     Write <journal> and return True.
     Returns False (without writing anything) when no identifying information
-    could be found anywhere -- the caller should then skip the record, because
-    an empty <journal/> fails schema validation.
+    could be found anywhere -- the caller should then downgrade the record to
+    <other> instead, because an empty <journal/> fails schema validation.
     """
     info = resolve_journal_info(pure_record, dspace_record, environment, api_token, api_cache)
     if not info["uuid"] and not info["pure_id"] and not info["title"] and not info["issns"]:
         return False
-    j_el = sub(parent, "journal", attrib={"id": info["pure_id"]} if info["pure_id"] else None)
+    j_el = sub(parent, "journal", attrib={"id": info["uuid"]} if info["uuid"] else None)
     if info["title"]:
         sub(j_el, "title", info["title"])
     if info["issns"]:
         issns_el = sub(j_el, "printIssns")
         for issn in info["issns"]:
             sub(issns_el, "issn", issn)
-    if info["publisher_pure_id"]:
-        sub(j_el, "publisher", attrib={"id": info["publisher_pure_id"]})
+    if info["publisher_uuid"]:
+        sub(j_el, "publisher", attrib={"id": info["publisher_uuid"]})
     return True
  
  
@@ -1271,7 +1342,7 @@ def build_record_element(
         sub(rec_el, "owner", attrib={"id": owner_uuid})
     build_urls(rec_el, dspace_record, pure_record)
     build_electronic_versions(rec_el, pure_record, dspace_record, lang_uri, store_host, default_version)
-    build_existing_stores(rec_el, dspace_record, store_host)
+    build_existing_stores(rec_el, dspace_record)
     vis_key = pure_record.get("visibility", {}).get("key", "FREE")
     sub(rec_el, "visibility", map_visibility(vis_key))
     dspace_uuid = (dspace_record.get("uuid") or "").strip()
@@ -1293,7 +1364,7 @@ def _add_type_specific_fields(
     api_token: str | None,
     api_cache: dict,
 ) -> None:
-    if xml_tag in ("contributionToJournal", "contributionToSpecialist", "contributionToSpecialist"):
+    if xml_tag in ("contributionToJournal", "contributionToSpecialist"):
         if not build_journal(rec_el, pure_record, dspace_record, environment, api_token, api_cache):
             # No journal information available — downgrade to <other> rather than
             # skipping the record entirely, and warn so the gap can be reviewed.
@@ -1324,9 +1395,7 @@ def _add_type_specific_fields(
         if "phd" in quality or "doctoral" in quality:
             sub(rec_el, "qualification", "phd")
         elif "master" in quality:
-            sub(rec_el, "qualification", "mphil")
-        else:
-            sub(rec_el, "qualification", "phd")
+            sub(rec_el, "qualification", "master")
         build_publisher(rec_el, dspace_record)
  
  
