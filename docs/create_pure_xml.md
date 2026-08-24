@@ -73,8 +73,8 @@ Standard DSpace metadata export. The script uses the following columns:
 | Column | Used for |
 |---|---|
 | `uuid` | Primary match key (DSpace UUID) |
-| `handle` | Fallback match key; also written as `<existingStores><existingStore><storeContentId>` and used to build the `<file id="...">` attribute for DSpace-only files |
-| `pdf_links` | Full DSpace bitstream URL for the item's file. Used as `<fileLocation>` (domain rewritten per `--environment`) when that file isn't already represented in the Pure JSON |
+| `handle` | Primary DSpace Handle for the record. Written as the publication element's `id` attribute; also written as `<existingStores><existingStore><storeContentId>` and used to build the `<file id="...">` attribute for DSpace-associated files |
+| `pdf_links` | Full DSpace bitstream URL for the item's file. Used as `<fileLocation>` (domain rewritten per `--environment`) when that file isn't already represented in the Pure JSON and for crating `<file id>` for DSpace files|
 | `pdf_handle_paths` | Old-style handle bitstream path (e.g. `/10379/17513/1/name.pdf`), parsed to recover the bitstream sequence number and filename for the DSpace-only `<file>` block |
 | `dc.title` | Fallback for the publication title when Pure `title.value` is empty; also used in unmatched-row warnings |
 | `dc.relation.ispartof` | Fallback for `<hostPublicationTitle>` for book-chapter records when Pure `hostPublicationTitle` is absent or empty |
@@ -148,7 +148,7 @@ The output conforms to the Pure Research Output Import schema (`v1.publication-i
 
 | Value | XML location |
 |---|---|
-| Pure `pureId` | `id` attribute on the publication element, e.g. `<contributionToJournal id="19125272" subType="article">` |
+| DSpace Handle | `id` attribute on the publication element, e.g. `<other id="10379/17900" subType="other">`. The record is skipped (with a warning) if the matched DSpace CSV row has no `handle` value |
 | DSpace UUID | `<externalIds><id type="DSpace">…</id></externalIds>` |
 | DSpace Handle | `<existingStores><existingStore><storeContentId>…</storeContentId></existingStore></existingStores>` |
 | Pure `person.uuid` / `externalPerson.uuid` | `id` attribute on each `<person>` element inside `<persons>` |
@@ -241,9 +241,11 @@ For each `FileElectronicVersion` in the Pure JSON, the script looks up whether a
 
 | Case | `<filename>` | `<fileLocation>` | `<file id="...">` |
 |---|---|---|---|
-| **DSpace + Pure match** — filename found in both | DSpace (`pdf_handle_paths`) | DSpace URL (`pdf_links`, domain rewritten per `--environment`) | `<handle>:<filename>` |
+| **DSpace + Pure match** — filename found in both | DSpace (`pdf_handle_paths`) | DSpace URL (`pdf_links`, domain rewritten per `--environment`) | `<handle>:<sequence>/<bitstream-uuid>:<filename>` |
 | **Pure only** — Pure file has no DSpace counterpart | Pure `fileName` | Pure file URL | Pure `fileId` |
-| **DSpace only** — DSpace file has no Pure counterpart | DSpace (`pdf_handle_paths`) | DSpace URL (domain rewritten) | `<handle>:<filename>` |
+| **DSpace only** — DSpace file has no Pure counterpart | DSpace (`pdf_handle_paths`) | DSpace URL (domain rewritten) | `<handle>:<sequence>/<bitstream-uuid>:<filename>` |
+
+`<sequence>` is the bitstream sequence number recovered from `pdf_handle_paths` (e.g. `1` from `/10379/17513/1/name.pdf`). `<bitstream-uuid>` is extracted from the bitstream's DSpace content URL (`pdf_links`, e.g. the UUID in `.../server/api/core/bitstreams/{uuid}/content`). If either the handle or the bitstream UUID can't be determined, the file falls back to Pure's own `fileId` (DSpace+Pure match case) or is omitted entirely (DSpace-only case).
 
 DSpace-only files (case 3) are appended after all Pure `FileElectronicVersion` entries are processed. Each semicolon-separated entry in `pdf_links` / `pdf_handle_paths` produces a separate `<electronicVersionFile>` element. Additional DSpace-only fields:
 

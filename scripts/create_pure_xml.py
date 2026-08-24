@@ -130,6 +130,10 @@ _XML_ILLEGAL_CHARS_RE = re.compile(
 
 ISSN_RE = re.compile(r"\b(\d{4}-\d{3}[\dXx])\b")
 
+BITSTREAM_UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
 HANDLE_BASE_URL = "http://hdl.handle.net/"
 
 REPOSITORY_DOI_PREFIX = "10.13025/"
@@ -534,6 +538,15 @@ def parse_dspace_files(
             sequence = sequence or "1"
         result.append((sequence, filename, file_location))
     return result
+
+
+def extract_bitstream_uuid(url: str) -> str | None:
+    """Pull the DSpace bitstream UUID out of a bitstream content URL, e.g.
+    '.../server/api/core/bitstreams/{uuid}/content' -> {uuid}."""
+    if not url:
+        return None
+    m = BITSTREAM_UUID_RE.search(url)
+    return m.group(1) if m else None
 
 
 def _extract_valid_issns(raw: str) -> list[str]:
@@ -1031,9 +1044,11 @@ def build_electronic_versions(
                 matched_dspace_norms.add(norm)
                 fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
                 _fill_common(fev_el, version, licence, access, ev)
-                # File id is built from the DSpace handle + filename
-                # ("{handle}:{filename}"), not from Pure's own fileId.
-                dspace_file_id = f"{handle}:{file_name}" if handle and file_name else file_id
+                bitstream_uuid = extract_bitstream_uuid(dspace_url)
+                dspace_file_id = (
+                    f"{handle}:{seq}/{bitstream_uuid}:{file_name}"
+                    if handle and bitstream_uuid and file_name else file_id
+                )
                 file_el = sub(fev_el, "file", attrib={"id": dspace_file_id} if dspace_file_id else None)
                 sub(file_el, "filename", file_name)
                 sub(file_el, "fileLocation", dspace_url)
@@ -1082,8 +1097,11 @@ def build_electronic_versions(
             continue
         fev_el  = sub(ensure_ev_el(), "electronicVersionFile")
         _fill_common(fev_el, version=default_version, licence=dc_rights_licence, access="open")
-        # File id is built from the DSpace handle + filename ("{handle}:{filename}").
-        dspace_only_file_id = f"{handle}:{filename}" if handle else None
+        bitstream_uuid = extract_bitstream_uuid(file_location)
+        dspace_only_file_id = (
+            f"{handle}:{seq}/{bitstream_uuid}:{filename}"
+            if handle and bitstream_uuid else None
+        )
         file_el = sub(fev_el, "file", attrib={"id": dspace_only_file_id} if dspace_only_file_id else None)
         sub(file_el, "filename", filename)
         sub(file_el, "fileLocation", file_location)
@@ -1304,12 +1322,17 @@ def build_record_element(
     api_cache: dict,
 ) -> None:
     pure_id  = str(pure_record.get("pureId", ""))
+    handle   = (dspace_record.get("handle") or "").strip()
+    if not handle:
+        raise ValueError(
+            f"missing DSpace handle for pureId={pure_id} -- cannot set record id"
+        )
     lang_uri = pure_record.get("language", {}).get("uri", "")
     xml_tag, sub_type = resolve_publication_type(pure_record, dspace_record)
     rec_el = ET.SubElement(
         root,
         f"{{{PUB_NS}}}{xml_tag}",
-        attrib={"id": pure_id, "subType": sub_type},
+        attrib={"id": handle, "subType": sub_type},
     )
     peer = pure_record.get("peerReview")
     if peer is None:
