@@ -26,6 +26,9 @@ Usage:
     python get_file_ids.py --csv input.csv --json input.json --modified-by "john@example.com"
     python get_file_ids.py --csv input.csv --json input.json --modified-after "2025-01-01"
     python get_file_ids.py --csv input.csv --json input.json --modified-by "john@example.com" --modified-after "2025-01-01"
+    python get_file_ids.py --csv input.csv --json input.json --handles "10379/7309"
+    python get_file_ids.py --csv input.csv --json input.json --handles "10379/7309,10379/1501,10379/5890"
+    python get_file_ids.py --csv input.csv --json input.json --xml-filter "sample_xml.xml"
 """
 
 import argparse
@@ -33,6 +36,7 @@ import csv
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import unquote
@@ -54,6 +58,52 @@ def build_handle_url(raw_handle: str) -> str:
     if raw_handle.startswith("http"):
         return raw_handle
     return HANDLE_BASE_URL + raw_handle
+
+
+def parse_handles_arg(handles_arg: str | None) -> set[str]:
+    """
+    Parse a comma-separated --handles string (e.g. '10379/7309' or
+    '10379/7309,10379/1501,10379/5890') into a set of normalized Handle URLs.
+    """
+    if not handles_arg:
+        return set()
+    return {
+        build_handle_url(h)
+        for h in handles_arg.split(",")
+        if h.strip()
+    }
+
+
+def extract_handles_from_xml_filter(xml_path: str) -> set[str]:
+    """
+    Extract Handles from a Pure XML import file (--xml-filter) to use as a
+    record filter.
+
+    Handles come from the "id" attribute of each top-level record element —
+    i.e. the direct children of the document root, such as
+    <book id="10379/7309">, <contributionToJournal id="10379/17295">,
+    <workingPaper id="10379/1034">, etc. Nested elements like
+    <person id="...">, <organisation id="...">, or <file id="..."> use
+    unrelated ID schemes (UUIDs, or the "{handle}:{seq}/{uuid}:{filename}"
+    DSpace file ID format) and are deliberately not considered — only the
+    record-level "id" attribute holds a bare Handle.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as exc:
+        print(f"Error: could not parse --xml-filter file '{xml_path}': {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Error: could not read --xml-filter file '{xml_path}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    root = tree.getroot()
+    handles: set[str] = set()
+    for record in root:
+        raw_handle = record.attrib.get("id", "").strip()
+        if raw_handle:
+            handles.add(build_handle_url(raw_handle))
+    return handles
 
 
 def load_csv_records(csv_path: str) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -331,7 +381,8 @@ def match_records(
     csv_by_uuid:   dict[str, dict],
     json_records: list[dict],
     pdf_filter: str = "all",
-) -> tuple[list[dict], int]:
+    handle_filter: set[str] | None = None,
+) -> tuple[list[dict], int, int]:
     """
     Match JSON records against CSV records by DSpace UUID first, falling back
     to Handle URL if no UUID match is found.
@@ -352,10 +403,15 @@ def match_records(
       'pure_only_pdf'      — Pure has files, DSpace has none
       'no_pdf'             — only records where neither DSpace nor Pure have any files
 
-    Returns (output_rows, skipped_count).
+    handle_filter, if not None, restricts output to records whose matched
+    Handle URL is in the set (built from --handles and/or --xml-filter).
+    Pass None to disable handle filtering entirely.
+
+    Returns (output_rows, skipped_count, filtered_out_count).
     """
     output_rows = []
     skipped = 0
+    filtered_out = 0
 
     for json_rec in json_records:
         # --- Priority 1: match by DSpace UUID ---
@@ -377,6 +433,11 @@ def match_records(
                     break
 
         if csv_rec is None:
+            continue
+
+        # --- Apply Handle filter (--handles / --xml-filter) ---
+        if handle_filter is not None and handle_url not in handle_filter:
+            filtered_out += 1
             continue
 
         # --- Core identifiers ---
@@ -449,7 +510,7 @@ def match_records(
         else:
             skipped += 1
 
-    return output_rows, skipped
+    return output_rows, skipped, filtered_out
 
 
 def _score_row(row: dict) -> tuple:
@@ -680,6 +741,31 @@ def parse_args() -> argparse.Namespace:
             "(e.g. '2025-01-01'). Filter is off by default."
         ),
     )
+    parser.add_argument(
+        "--handles",
+        default=None,
+        metavar="HANDLE_LIST",
+        help=(
+            "Only include records whose Handle is in this comma-separated list, "
+            "e.g. '10379/7309' or '10379/7309,10379/1501,10379/5890'. "
+            "Filter is off by default. Can be combined with --xml-filter "
+            "(the two sets of Handles are unioned)."
+        ),
+    )
+    parser.add_argument(
+        "--xml-filter",
+        default=None,
+        metavar="XML_FILE",
+        dest="xml_filter",
+        help=(
+            "Only include records whose Handle matches a record id in this "
+            "Pure XML import file, e.g. a temp_pure_import XML. Handles are "
+            "extracted from the 'id' attribute of each top-level record "
+            "element (<book id=\"10379/7309\">, <contributionToJournal "
+            "id=\"...\">, etc.). Filter is off by default. Can be combined "
+            "with --handles (the two sets of Handles are unioned)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -730,11 +816,32 @@ def main() -> None:
         )
         print(f"  → {len(json_records)} records after filtering.")
 
+    # --- Handle filter (--handles / --xml-filter) ---
+    handle_filter: set[str] | None = None
+    if args.handles or args.xml_filter:
+        handle_filter = set()
+        if args.handles:
+            from_handles = parse_handles_arg(args.handles)
+            print(f"  → {len(from_handles)} handle(s) from --handles.")
+            handle_filter |= from_handles
+        if args.xml_filter:
+            print(f"Loading XML filter from: {args.xml_filter}")
+            from_xml = extract_handles_from_xml_filter(args.xml_filter)
+            print(f"  → {len(from_xml)} handle(s) extracted from XML filter.")
+            handle_filter |= from_xml
+        print(f"  → {len(handle_filter)} handle(s) in combined filter.")
+
     print("Matching records by Handle…")
-    output_rows, skipped = match_records(csv_by_handle, csv_by_uuid, json_records, pdf_filter=args.pdf_filter)
+    output_rows, skipped, filtered_out = match_records(
+        csv_by_handle, csv_by_uuid, json_records,
+        pdf_filter=args.pdf_filter,
+        handle_filter=handle_filter,
+    )
     print(f"  → {len(output_rows)} complete matches found.")
     if skipped:
         print(f"  → {skipped} matched records skipped due to missing core fields.")
+    if filtered_out:
+        print(f"  → {filtered_out} matched records excluded by the Handle filter.")
 
     # --- Duplicate resolution ---
     output_rows, duplicate_rows, duplicate_groups = resolve_duplicates(output_rows)
