@@ -11,6 +11,16 @@ Output columns:
     dspace_file_id, pure_file_id, pure_file_pure_id, pure_file_name,
     file_match_type, handle
 
+dspace_file_id format:
+    "{handle}:{seq}/{file uuid}:{filename}", e.g.
+    "10379/1034:1/3c246f30-8d3a-4077-a013-6ca4ef262a3e:paper_0078.pdf"
+    — the handle comes from the CSV's "handle" column, the sequence and
+    filename come from "pdf_handle_paths", and the file UUID is extracted
+    from the matching "pdf_links" entry. This mirrors how create_pure_xml.py
+    builds DSpace <file id="..."> values. If a file UUID can't be found for
+    an entry, the raw pdf_handle_paths value is used instead so no file
+    information is silently dropped.
+
 Usage:
     python get_file_ids.py --csv input.csv --json input.json --output output.csv
     python get_file_ids.py --csv input.csv --json input.json --modified-by "john@example.com"
@@ -25,9 +35,17 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 
 HANDLE_BASE_URL = "http://hdl.handle.net/"
+
+# Matches a DSpace bitstream/file UUID embedded in a content URL, e.g.
+# '.../server/api/core/bitstreams/{uuid}/content' -> {uuid}.
+# (Same pattern used by create_pure_xml.py to build DSpace file IDs.)
+BITSTREAM_UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
 
 def build_handle_url(raw_handle: str) -> str:
@@ -81,6 +99,99 @@ def extract_handles_from_json_record(record: dict) -> list[str]:
     return handles
 
 
+def extract_bitstream_uuid(url: str) -> str | None:
+    """Pull the DSpace bitstream UUID out of a bitstream content URL, e.g.
+    '.../server/api/core/bitstreams/{uuid}/content' -> {uuid}.
+    (Same logic as create_pure_xml.py's extract_bitstream_uuid.)"""
+    if not url:
+        return None
+    m = BITSTREAM_UUID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def parse_pdf_handle_path(path: str, handle: str) -> tuple[str, str] | tuple[None, None]:
+    """
+    Split a DSpace 'pdf_handle_paths' entry (e.g. '/10379/1034/1/paper.pdf')
+    into (sequence, filename), stripping the leading handle if present.
+    (Same logic as create_pure_xml.py's parse_pdf_handle_path.)
+    """
+    path = (path or "").strip()
+    if not path:
+        return None, None
+    handle = (handle or "").strip().strip("/")
+    remainder = path.strip("/")
+    prefix = handle + "/"
+    if handle and remainder.startswith(prefix):
+        remainder = remainder[len(prefix):]
+    parts = remainder.split("/", 1)
+    if len(parts) == 2:
+        sequence, filename = parts
+    elif len(parts) == 1 and parts[0]:
+        sequence, filename = "1", parts[0]
+    else:
+        return None, None
+    filename = unquote(filename).strip()
+    sequence = sequence.strip() or "1"
+    if not filename:
+        return None, None
+    return sequence, filename
+
+
+def build_dspace_file_ids(
+    pdf_handle_paths: str,
+    pdf_links: str,
+    handle: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Build the DSpace-style file IDs for a record, in the format
+    "{handle}:{seq}/{file uuid}:{filename}", e.g.
+    "10379/1034:1/3c246f30-8d3a-4077-a013-6ca4ef262a3e:paper_0078.pdf".
+    (Same ID construction as create_pure_xml.py's DSpace <file id="..."> values,
+    which use "{handle}:{seq}/{bitstream_uuid}:{filename}".)
+
+    Iteration is driven by 'pdf_handle_paths' (semicolon-separated), exactly
+    as get_file_ids.py has always done, so every DSpace file entry is still
+    included even if 'pdf_links' is missing, shorter, or misaligned. The
+    matching entry (by index) in 'pdf_links' supplies the bitstream UUID
+    needed to build the full ID.
+
+    Returns a pair of parallel lists:
+        filenames — plain filenames, one per DSpace file (used for
+                    filename-based matching against Pure files)
+        file_ids  — the constructed "{handle}:{seq}/{uuid}:{filename}" IDs;
+                    when a UUID can't be found (e.g. missing/misaligned
+                    pdf_links entry), falls back to the original raw
+                    pdf_handle_paths entry so no file information is lost.
+    """
+    raw_paths = [p.strip() for p in (pdf_handle_paths or "").split(";") if p.strip()]
+    raw_links = [l.strip() for l in (pdf_links or "").split(";") if l.strip()]
+
+    filenames: list[str] = []
+    file_ids:  list[str] = []
+
+    for idx, raw_path in enumerate(raw_paths):
+        sequence, filename = parse_pdf_handle_path(raw_path, handle)
+        if not filename:
+            # Malformed entry: preserve the previous behaviour of using the
+            # raw path string as-is rather than dropping it.
+            filename = raw_path
+            sequence = "1"
+        filenames.append(filename)
+
+        raw_url = raw_links[idx] if idx < len(raw_links) else ""
+        bitstream_uuid = extract_bitstream_uuid(raw_url)
+
+        if handle and bitstream_uuid and filename:
+            file_ids.append(f"{handle}:{sequence}/{bitstream_uuid}:{filename}")
+        else:
+            # Could not build the full ID (e.g. no bitstream UUID found in
+            # the corresponding pdf_links entry) — fall back to the raw
+            # pdf_handle_paths value rather than dropping the file.
+            file_ids.append(raw_path)
+
+    return filenames, file_ids
+
+
 def pure_normalize_filename(name: str) -> str:
     """
     Normalize a filename the same way Pure does when storing uploaded files.
@@ -128,8 +239,6 @@ def match_dspace_to_pure_files(
     using these index sets. Unmatched entries from either side are preserved by the
     caller so that no file information is ever silently dropped.
     """
-    from urllib.parse import unquote
-
     def base_name(path: str) -> str:
         return pure_normalize_filename(unquote(path.rstrip("/").split("/")[-1]))
 
@@ -281,10 +390,18 @@ def match_records(
         )
 
         # --- DSpace file paths (all of them, unconditionally) ---
-        pdf_paths_raw = csv_rec.get("pdf_handle_paths", "").strip()
-        dspace_pdf_paths = (
-            [p.strip() for p in pdf_paths_raw.split(";") if p.strip()]
-            if pdf_paths_raw else []
+        # bare_handle (no "http://hdl.handle.net/" prefix) is what DSpace
+        # file IDs are keyed on, same as create_pure_xml.py.
+        bare_handle = csv_rec.get("handle", "").strip()
+        pdf_handle_paths_raw = csv_rec.get("pdf_handle_paths", "").strip()
+        pdf_links_raw = csv_rec.get("pdf_links", "").strip()
+
+        # dspace_pdf_paths: plain filenames, used for filename-based matching
+        #                   against Pure files (unchanged from before).
+        # dspace_file_ids:  full "{handle}:{seq}/{file uuid}:{filename}" IDs,
+        #                   used for the output "dspace_file_id" column.
+        dspace_pdf_paths, dspace_file_ids = build_dspace_file_ids(
+            pdf_handle_paths_raw, pdf_links_raw, bare_handle
         )
 
         # --- Pure file metadata (all of them, unconditionally) ---
@@ -314,14 +431,15 @@ def match_records(
             "pure_uuid":         pure_uuid,
             "pure_id":           pure_id,
             "title":             title,
-            "dspace_file_id":    "; ".join(dspace_pdf_paths),
+            "dspace_file_id":    "; ".join(dspace_file_ids),
             "pure_file_id":      "; ".join(pure_fids),
             "pure_file_pure_id": "; ".join(pure_fpids),
             "pure_file_name":    "; ".join(pure_fnames),
             "file_match_type":   file_match_type,
             "handle":            handle_url,
-            # Internal field used for duplicate scoring; stripped before CSV output.
+            # Internal fields used for duplicate scoring; stripped before CSV output.
             "_modified_date":    json_rec.get("modifiedDate", ""),
+            "_dspace_filenames": "; ".join(dspace_pdf_paths),
         }
 
         # Require at minimum the four core identifiers to be non-empty
@@ -347,17 +465,21 @@ def _score_row(row: dict) -> tuple:
     For criterion 1 we re-derive the matched count cheaply from the already-
     computed file_match_type and the semicolon-separated file lists rather than
     re-running the full matching logic.
+
+    Note: matching is done on plain DSpace filenames (the internal
+    '_dspace_filenames' field), not on 'dspace_file_id', since the latter
+    now holds the full "{handle}:{seq}/{file uuid}:{filename}" identifier
+    rather than a bare filename.
     """
     fmt = row.get("file_match_type", "")
-    dspace_files  = [f for f in row.get("dspace_file_id",  "").split(";") if f.strip()]
-    pure_files    = [f for f in row.get("pure_file_id",    "").split(";") if f.strip()]
-    n_pure        = len(pure_files)
-    n_dspace      = len(dspace_files)
+    dspace_filenames = [f for f in row.get("_dspace_filenames", "").split(";") if f.strip()]
+    pure_files       = [f for f in row.get("pure_file_id",      "").split(";") if f.strip()]
+    n_pure           = len(pure_files)
 
     # With an exact recount:
     if fmt in ("full_match", "partial_match"):
         pure_names = [f.strip() for f in row.get("pure_file_name", "").split(";") if f.strip()]
-        _, matched_pure = match_dspace_to_pure_files(dspace_files, pure_names)
+        _, matched_pure = match_dspace_to_pure_files(dspace_filenames, pure_names)
         n_matched = len(matched_pure)
     else:
         n_matched = 0
