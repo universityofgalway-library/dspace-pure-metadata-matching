@@ -29,12 +29,12 @@ COLLECT_EXTERNAL_ORGS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_all_items_with_collection_uuids_pdfs_2026-04-20.csv"
-PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-07-22.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_merged_all_authors_strict_with_allow_block_cachefirst_20260720.json"
+DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-09-09.csv"
+PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-09-11.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/2026-07-16/pure_temp_publishers_2026-07-22.json"
-OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-27.json"
+OUTPUT_DIR = f"./record_matching/output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -306,6 +306,11 @@ def strip_system_fields(record):
         for k, v in record.items()
         if k not in SYSTEM_FIELDS_TO_EXCLUDE
     }
+
+
+def fix_apostrophe(s):
+    """Replace curly/curved apostrophe with a straight one."""
+    return s.replace("\u2019", "'") if s else s
 
 
 def normalize(s):
@@ -646,7 +651,7 @@ def build_person_name_index(person_mapping):
     person_index = {}
     
     for person in person_mapping:
-        # --- NEW: Pre-index this person's known paper identifiers ---
+        # Pre-index this person's known paper identifiers
         paper_dois = set()
         paper_handles = set()
         paper_titles = set()
@@ -660,13 +665,22 @@ def build_person_name_index(person_mapping):
         person["_paper_dois"] = paper_dois
         person["_paper_handles"] = paper_handles
         person["_paper_titles"] = paper_titles
-        # --- END NEW ---
 
-        p_first = person.get("firstName", "")
-        p_last = person.get("lastName", "")
-        alt_firsts = person.get("alternativeFirstName", []) or []
-        alt_lasts = person.get("alternativeLastName", []) or []
-        
+        # Normalize curved apostrophes to straight ones, and persist the fix
+        # back onto the person dict so every downstream consumer (matching,
+        # contributor building, output files, etc.) uses the corrected name.
+        p_first = fix_apostrophe(person.get("firstName", ""))
+        p_last = fix_apostrophe(person.get("lastName", ""))
+        alt_firsts = [fix_apostrophe(af) for af in (person.get("alternativeFirstName", []) or [])]
+        alt_lasts = [fix_apostrophe(al) for al in (person.get("alternativeLastName", []) or [])]
+
+        person["firstName"] = p_first
+        person["lastName"] = p_last
+        if person.get("alternativeFirstName") is not None:
+            person["alternativeFirstName"] = alt_firsts
+        if person.get("alternativeLastName") is not None:
+            person["alternativeLastName"] = alt_lasts
+
         all_firsts = [p_first] if p_first else []
         all_firsts.extend(alt_firsts)
         all_lasts = [p_last] if p_last else []
@@ -2965,42 +2979,42 @@ def main():
             writer.writerows(_unmatched_publishers)
         print(f"✅ Unmatched publishers saved to: {unmatched_publishers_csv}")
 
+ 
+    # Count results
+    # Every record lands in exactly one of these buckets per breakdown, so
+    # nothing below is counted in more than one place within the same total.
+    not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
+    no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
+    skipped_count = not_publications_count + no_contributors_count
+
+    matched_count = sum(1 for e in log_entries if e['matched'])
+    unmatched_new_record_count = sum(1 for e in log_entries if not e['matched'] and e['success'])
+    no_matched_authors_count = sum(1 for e in log_entries if e.get('error') == "No matched contributors")
+    error_count = len(error_log)  # exceptions raised while updating or creating a record
+    failed_count = no_matched_authors_count + error_count
+
+    success_count = sum(1 for e in log_entries if e['success'])
+
+    print(f"\n✅ Done! {len(log_entries)} records processed.")
+    print(f"   Skipped (out of scope): {skipped_count}")
+    print(f"     ↳ Not in Publications collection: {not_publications_count}")
+    print(f"     ↳ No contributors in any field: {no_contributors_count}")
+    print(f"   Matched to existing Pure record: {matched_count}")
+    print(f"   Unmatched (new records created): {unmatched_new_record_count}")
+    print(f"   Successfully processed: {success_count}")
+    print(f"   Failed (total): {failed_count}")
+    print(f"     ↳ No contributors matched to Pure persons: {no_matched_authors_count}")
+    print(f"     ↳ Other errors: {error_count}")
+    print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
+    print(f"   Unmatched funders: {len(_unmatched_funders)}")
+    print(f"   Unmatched publishers: {len(_unmatched_publishers)}")
+    print(f"   Logs saved to: {LOG_DIR}")
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
     hours = int(elapsed_time // 3600)
     minutes = int((elapsed_time % 3600) // 60)
     seconds = int(elapsed_time % 60)
-    
-    # Count results
-    SKIP_ERRORS = {
-    "Skipped: not in a Publications collection",
-    "No contributors found in any contributor field",
-    "No matched contributors",
-}
-    
-    matched_count = sum(1 for e in log_entries if e['matched'])
-    not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
-    no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
-    no_matched_authors_count = sum(1 for e in log_entries if e.get('error') == "No matched contributors")
-    unmatched_count = sum(1 for e in log_entries if not e['matched'] and e.get('error') not in SKIP_ERRORS)
-    success_count = sum(1 for e in log_entries if e['success'])
-    failed_count = sum(1 for e in log_entries if not e['success'] and e.get('error') not in SKIP_ERRORS)
-    error_count = len(error_log)
-
-    print(f"\n✅ Done! {len(log_entries)} records processed.")
-    print(f"   Matched to existing Pure record: {matched_count}")
-    print(f"   Unmatched (new records created): {unmatched_count}")
-    print(f"   Successfully processed: {success_count}")
-    print(f"   Failed (total): {failed_count}")
-    print(f"     ↳ No contributors in any field: {no_contributors_count}")
-    print(f"     ↳ No contributors matched to Pure persons: {no_matched_authors_count}")
-    print(f"     ↳ Other errors: {error_count}")
-    print(f"     ↳ Not in Publications collection: {not_publications_count}")
-    print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
-    print(f"   Unmatched funders: {len(_unmatched_funders)}")
-    print(f"   Unmatched publishers: {len(_unmatched_publishers)}")
-    print(f"   Logs saved to: {LOG_DIR}")
     print(f"\n⏱️  Total time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     logger.close()

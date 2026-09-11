@@ -446,6 +446,8 @@ def build_pure_index(pure_items: list) -> dict:
                     by_doi[ndoi] = item
 
         for link in item.get("links", []):
+            if not isinstance(link, dict):
+                continue
             url = link.get("url", "")
             if not url:
                 continue
@@ -458,6 +460,8 @@ def build_pure_index(pure_items: list) -> dict:
 
         # Index by DSpace UUID from identifiers list
         for id_entry in item.get("identifiers", []):
+            if not isinstance(id_entry, dict):
+                continue
             if id_entry.get("idSource", "") == "DSpace":
                 dspace_uuid = id_entry.get("value", "").strip()
                 if dspace_uuid:
