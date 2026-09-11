@@ -82,6 +82,7 @@ python delete_records.py \
 | `--log-output-dir` | `str` | See below | Directory to write deletion result logs. Defaults to a `deletion_logs/` folder next to the input file, or inside `--log-dir` if that was used. |
 | `--after-date` | `str` | `None` | Only delete records with a `modifiedDate` strictly after this value. Accepts `YYYY-MM-DD` or full ISO datetime `YYYY-MM-DDTHH:MM:SSZ`. If omitted, all records in the log are eligible for deletion. |
 | `--test` | flag | *(omit for production)* | Include to target the UAT staging environment. Omit to target production (the default). |
+| `--temp` | flag | *(omit for production)* | Include to target the TEMP environment. Omit to target production (the default). |
 | `--dry-run` | flag | `False` | Print a preview of records that would be deleted without making any API calls or asking for confirmation. |
 
 ---
