@@ -324,7 +324,8 @@ def patch_workflow(
 
     Default mode (from_upload_log=False):
       Input is standard Pure research output records.  Every record that passes
-      the date filter is included in the patch.
+      the date filter AND whose current workflow step is not already "validated"
+      is included in the patch.
 
     Upload-log mode (from_upload_log=True):
       Input is the JSON log produced by a Pure upload operation.  Each entry is
@@ -333,7 +334,8 @@ def patch_workflow(
     """
     result = []
     skipped_date = 0
-    skipped_log  = 0
+    skipped_log = 0
+    skipped_already_validated = 0
 
     for record in tqdm(records, desc="[workflow] Processing", unit="rec"):
         if not isinstance(record, dict):
@@ -350,11 +352,18 @@ def patch_workflow(
             result.append({"uuid": record["uuid"], "workflow": {"step": "validated"}})
             tqdm.write(f"  ✅ [{record['uuid']}] → validated")
         else:
-            # Standard research output records: apply date filter, patch all
+            # Standard research output records: apply date filter, then skip
+            # anything already validated, patch the rest
             mod_date = parse_modified_date(record.get("modifiedDate", ""))
             if mod_date is None or mod_date <= modified_after:
                 skipped_date += 1
                 continue
+
+            current_workflow = record.get("workflow") or {}
+            if current_workflow.get("step") == "validated":
+                skipped_already_validated += 1
+                continue
+
             result.append({"uuid": record["uuid"], "workflow": {"step": "validated"}})
 
     output_path = os.path.join(output_dir, f"workflow_patch_{TODAY}.json")
@@ -369,6 +378,7 @@ def patch_workflow(
         stats["skipped_not_research_outputs_or_failed"] = skipped_log
     else:
         stats["skipped_date_filter"] = skipped_date
+        stats["skipped_already_validated"] = skipped_already_validated
     return stats
 
 
@@ -994,7 +1004,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the input JSON file (list of Pure research output records).",
     )
     parser.add_argument(
-        "output_dir",
+        "--output_dir",
         help="Directory where patch files will be written.",
         default = "./patches"
     )
