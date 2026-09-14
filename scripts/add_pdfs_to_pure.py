@@ -37,6 +37,8 @@ import sys
 import csv
 import json
 import time
+import html
+import unicodedata
 import argparse
 import requests
 from collections import defaultdict
@@ -108,6 +110,21 @@ def pure_normalize_filename(name: str) -> str:
     the skip check, where an exact match on the original name is not reliable.
     """
     return re.sub(r'[^\w.\- ]', '_', name)
+
+
+def clean_dspace_filename(filename: str) -> str:
+    """
+    DSpace-exported filenames can be HTML-entity-encoded (e.g. an accented
+    character rendered as "&#769;") and then percent-encoded on top of that,
+    so unquote() alone leaves literal "&#769;" text in the filename instead
+    of the real character. This decodes any HTML character references, then
+    NFKC-normalizes so combining marks merge into the preceding letter and
+    compatibility characters (e.g. the "fl" ligature) fold to plain letters.
+    """
+    if not filename:
+        return filename
+    unescaped = html.unescape(filename)
+    return unicodedata.normalize("NFKC", unescaped)
 
 
 def is_valid_pdf(content: bytes) -> bool:
@@ -1116,7 +1133,7 @@ def main():
 
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
-            safe_file_name = unquote(file_name)                       # decoded — used as Pure fileName
+            safe_file_name = clean_dspace_filename(unquote(file_name))  # decoded
 
             # Sanitize for local disk (replaces chars illegal on Windows, e.g. |)
             disk_file_name = sanitize_filename(safe_file_name)
@@ -1406,6 +1423,7 @@ def main():
         entry["pure_file_pure_id"]  = "; ".join(all_pure_file_pure_ids) if all_pure_file_pure_ids else None
         entry["pure_file_name"]     = "; ".join(all_pure_file_names)    if all_pure_file_names    else None
         entry["dspace_file_id"]     = "; ".join(pdf_paths)
+        entry["detail"] = f"Would upload: {'; '.join(clean_dspace_filename(unquote(p.rstrip('/').split('/')[-1])) for p in pdf_paths)}"
 
         # A record belongs in matched_ref_csv only when every DSpace PDF has a
         # confirmed Pure file — i.e. all paths either uploaded successfully or
