@@ -37,6 +37,8 @@ import sys
 import csv
 import json
 import time
+import html
+import unicodedata
 import argparse
 import requests
 from collections import defaultdict
@@ -108,6 +110,21 @@ def pure_normalize_filename(name: str) -> str:
     the skip check, where an exact match on the original name is not reliable.
     """
     return re.sub(r'[^\w.\- ]', '_', name)
+
+
+def clean_dspace_filename(filename: str) -> str:
+    """
+    DSpace-exported filenames can be HTML-entity-encoded (e.g. an accented
+    character rendered as "&#769;") and then percent-encoded on top of that,
+    so unquote() alone leaves literal "&#769;" text in the filename instead
+    of the real character. This decodes any HTML character references, then
+    NFKC-normalizes so combining marks merge into the preceding letter and
+    compatibility characters (e.g. the "fl" ligature) fold to plain letters.
+    """
+    if not filename:
+        return filename
+    unescaped = html.unescape(filename)
+    return unicodedata.normalize("NFKC", unescaped)
 
 
 def is_valid_pdf(content: bytes) -> bool:
@@ -1116,7 +1133,7 @@ def main():
 
         for single_path in pdf_paths:
             file_name      = single_path.rstrip("/").split("/")[-1]  # original encoded
-            safe_file_name = unquote(file_name)                       # decoded — used as Pure fileName
+            safe_file_name = clean_dspace_filename(unquote(file_name))  # decoded
 
             # Sanitize for local disk (replaces chars illegal on Windows, e.g. |)
             disk_file_name = sanitize_filename(safe_file_name)
@@ -1169,12 +1186,21 @@ def main():
             # 2. Skip check — compare against Pure-normalized filename
             if args.skip_existing:
                 norm_safe_file_name = pure_normalize_filename(safe_file_name)
-                # Find the actual stored filename in Pure that normalizes to the same value
+                # Files uploaded by the old script (before HTML-entity decoding
+                # and Unicode normalization were added) were sent to Pure as
+                # the raw unquoted name, so Pure's stored fileName may still be
+                # normalized from that uncleaned form (e.g. "Me_769_liacin.pdf"
+                # instead of "Méliacin.pdf"). Accept either normalized form so
+                # files already uploaded under the old, mangled name are still
+                # recognized and not uploaded again as duplicates.
+                norm_legacy_file_name = pure_normalize_filename(unquote(file_name))
+                acceptable_norm_names = {norm_safe_file_name, norm_legacy_file_name}
+                # Find the actual stored filename in Pure that normalizes to any accepted value
                 matched_ev_name = next(
                     (ev.get("file", {}).get("fileName", "")
                      for ev in pure_record.get("electronicVersions", [])
                      if ev.get("typeDiscriminator") == "FileElectronicVersion"
-                     and pure_normalize_filename(ev.get("file", {}).get("fileName", "")) == norm_safe_file_name),
+                     and pure_normalize_filename(ev.get("file", {}).get("fileName", "")) in acceptable_norm_names),
                     None,
                 )
                 if matched_ev_name is not None:
@@ -1417,7 +1443,7 @@ def main():
 
         if args.dry_run:
             entry["status"] = "dry_run"
-            entry["detail"] = f"Would upload: {'; '.join(unquote(p.rstrip('/').split('/')[-1]) for p in pdf_paths)}"
+            entry["detail"] = f"Would upload: {'; '.join(clean_dspace_filename(unquote(p.rstrip('/').split('/')[-1])) for p in pdf_paths)}"
             results.append(entry)
             continue
 
