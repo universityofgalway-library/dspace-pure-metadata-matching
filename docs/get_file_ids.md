@@ -129,9 +129,10 @@ All DSpace PDF paths and all Pure `FileElectronicVersion` entries are always wri
 
 When both sides have files, the script attempts to correlate them by filename:
 
-- The base filename is extracted from each DSpace path (URL-decoded, trailing slashes stripped).
-- Both the DSpace filename and the Pure `fileName` are normalised using Pure's filename normalisation rules: characters that are not alphanumeric, hyphens, underscores, dots, or spaces are replaced with underscores.
+- The base filename is extracted from each DSpace path (URL-decoded, trailing slashes stripped), then cleaned: HTML character references still literally present (e.g. an accented character rendered as `&#769;`) are decoded, and the result is Unicode-normalized (NFKC).
+- Both the cleaned DSpace filename and the Pure `fileName` are normalised using Pure's filename normalisation rules: characters that are not alphanumeric, hyphens, underscores, dots, or spaces are replaced with underscores.
 - A DSpace path is considered matched if its normalised filename equals a normalised Pure `fileName`.
+- If that direct comparison doesn't find a match, a looser fallback is tried: both names are further reduced by stripping diacritics and collapsing any `_NNN_` remnant (the shape Pure's own storage-time normalization leaves behind when a file was uploaded before entity-decoding existed, e.g. `Me_769_liacin.pdf`). This recovers matches for files uploaded under their old, mangled name without affecting any name that already matched directly.
 
 The result of this correlation determines the `file_match_type` column — see [PDF Filter](#pdf-filter).
 

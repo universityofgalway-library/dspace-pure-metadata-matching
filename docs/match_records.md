@@ -101,9 +101,10 @@ The org config file is required and must be a JSON object with the following key
 | `dc.description.sponsorship` | Funding acknowledgement text |
 | `dc.language.iso` | ISO 639-3 language code (e.g. `eng`, `gle`) |
 | `dc.publisher` | Publisher name — matched against `PUBLISHER_MAPPING_JSON` for applicable record types |
-| `dc.rights` | Rights/licence label (e.g. `CC BY-NC-ND`) |
 | `dc.type` | Resource type (e.g. `journal article`, `book`) |
 | `journal_uuid` | Pure journal UUID (required for journal contributions) |
+| `dc.subject` | Semicolon-separated free-text keywords (optional) — added as a free-keywords group; see [Subject Keywords](#subject-keywords) |
+| `pdf_handle_paths` | Semicolon-separated PDF paths (optional). Only used to clean up HTML-entity-encoded filenames for logging — see [Filename Cleaning](#filename-cleaning); does not otherwise affect matching or field updates. |
 
 ---
 
@@ -142,14 +143,14 @@ When multiple Pure records match, the best is selected by: visibility (FREE/CAMP
 | `dc.contributor.funder` | `fundingDetails` | Add new funders |
 | `dc.date.issued` | `publicationStatuses[0].publicationDate` | Fill if blank |
 | `dc.identifier.doi` | `electronicVersions` (publisher version) | Add if missing |
-| `dc.identifier.uri` (DOI `10.13025/*`) | `electronicVersions` (repository version) | Add if missing; always overwrites `licenseType`, `versionType`, embargo |
+| `dc.identifier.uri` (DOI `10.13025/*`) | `electronicVersions` (repository version) | Add if missing |
 | `dc.identifier.uri` (handle) | `links` | Set as repository handle link |
 | `dc.description.abstract` | `abstract` | Fill if blank |
 | `dc.description.sponsorship` | `fundingText` | Fill if blank |
 | `dc.title` + `dc.title.subtitle` | `title` + `subTitle` | Fill if blank; subtitle stripped from title if embedded (see below) |
 | `dc.language.iso` | `language` | Fill if blank |
-| `dc.rights` | Repository version `licenseType` | Always overwrite |
-| `dc.date.embargo` | Repository version `embargoPeriod` | Always overwrite |
+| `dc.date.embargo` | `FileElectronicVersion.accessType` / `embargoPeriod` | Always overwrite — see [Electronic Versions & Links](#electronic-versions--links) |
+| `dc.subject` | `keywordGroups` (free keywords) | Add new keywords; existing ones are preserved, not overwritten — see below |
 | `dc.publisher` | `publisher` | Fill if blank (BookAnthology, ContributionToBookAnthology, OtherContribution, WorkingPaper, NonTextual types only) |
 | `journal_uuid` | `journalAssociation.journal.uuid` | Fill if blank; if missing on journal/periodical types, record is downgraded to `OtherContribution` |
 | _(always)_ | `workflow.step` | Always set to `validated` on every output record |
@@ -302,13 +303,30 @@ The following fields are hardcoded on all newly created records (unmatched DSpac
 
 ## Electronic Versions & Links
 
-Repository DOIs (`10.13025/*`) are added as `authorsVersion` with the license derived from `dc.rights` (defaulting to `CC BY-NC`) and `OPEN` access (or `EMBARGOED` if an active embargo date is present).
+Repository DOIs (`10.13025/*`) and publisher DOIs are added to `electronicVersions` as `DoiElectronicVersion` entries carrying only the DOI itself — no `licenseType`, `accessType`, or `versionType` is ever set on a DOI electronic version, nor on any other non-file electronic version. Those fields belong exclusively to the actual deposited file.
 
-Publisher DOIs are added as `publishersVersion`.
+Any existing `FileElectronicVersion` on the record has its `accessType`, `licenseType`, and `versionType` set as follows, but **only when the record is linked to DSpace** (an `identifiers` entry with `idSource: "DSpace"`, present already or added this run via the `uuid` column):
+- `accessType`: `open`, unless an active embargo is present (`dc.date.embargo` / `dc.description.embargo`), in which case `embargoed` with `embargoPeriod` set to the resolved end date.
+- `licenseType`: always `cc_by`.
+- `versionType`: always `authorsversion` ("Author accepted manuscript").
 
-Version order in the output: repository DOI → publisher DOIs → other.
+A record with a `FileElectronicVersion` that is **not** DSpace-linked is left completely untouched — this guards against mutating file metadata on a Pure record that merely matched by title or DOI but wasn't actually sourced from DSpace.
+
+Version order in the output: repository DOI → publisher DOIs → other → file versions.
 
 DOI links are removed from `links`; handles are kept. If DSpace and Pure have conflicting handles, a warning is printed and manual review is flagged.
+
+---
+
+## Subject Keywords
+
+`dc.subject` (semicolon-separated) is parsed and added to the record's `keywordGroups` as a free-keywords group. Existing keyword groups — including any pre-existing free-keywords group — are preserved; new subjects are added alongside them rather than replacing them. Applies to both updated and newly created records.
+
+---
+
+## Filename Cleaning
+
+DSpace-exported filenames in `pdf_handle_paths` can be HTML-entity-encoded (e.g. an accented character rendered as `&#769;`). Before being written to any log or output, these are decoded (HTML entity unescape) and Unicode-normalized (NFKC) so accented characters and ligatures render correctly instead of showing raw entity markup.
 
 ---
 

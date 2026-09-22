@@ -57,13 +57,14 @@ python patch_records.py <input> <output_dir> [OPTIONS]
 | `--patch-publishers` | Inject publisher UUIDs into eligible Pure records that have no publisher set, sourced from DSpace `dc.publisher`. Requires `--publisher-mapping` and `--dspace-csv`. |
 | `--patch-file-versions` | Set a default `versionType` ("Accepted author manuscript") on `FileElectronicVersion` entries in `electronicVersions` that have no `versionType` assigned. |
 | `--patch-urls` | Clean `links[]`: keep exactly one Handle link (description normalised to "Repository Handle"), drop DOI links and Pure portal links, and de-duplicate remaining links by URL (preferring the copy that has a description). |
+| `--patch-duplicate-files` | Remove duplicate `FileElectronicVersion` entries left behind by repeated upload attempts on the same file. |
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--modified-after YYYY-MM-DD` | `1970-01-01` | Skip records with a `modifiedDate` on or before this date. Applies to **all modes except `--patch-nulls`** and `--patch-workflow --workflow-from-log`. |
-| `--workflow-from-log` | `False` | `[--patch-workflow only]` Treat the input as a Pure upload-log file (records with `uuid`, `success`, and `type` fields) instead of standard research output records. Only entries where `success = true` and `type = "research-outputs"` are patched. The `--modified-after` date filter is **not** applied in this mode. |
+| `--workflow-from-log` | `False` | `[--patch-workflow only]` Treat the input as a Pure upload-log file (records with `uuid`, `success`, and `data` fields) instead of standard research output records. Only entries where `success = true` and `data = "research-outputs"` are patched. The `--modified-after` date filter is **not** applied in this mode. |
 | `--publisher-mapping PATH` | *(none)* | `[--patch-publishers only]` Path to the publisher mapping JSON file (array of objects with `name` and `uuid` keys). |
 | `--dspace-csv PATH` | *(none)* | `[--patch-publishers only]` Path to the DSpace source CSV file. |
 
@@ -116,7 +117,7 @@ Sets `workflow.step = "validated"` on qualifying records. Operates in two modes 
 Every record that passes the `--modified-after` date filter is included in the patch. Use this when your input file is a standard Pure research output export.
 
 **Uploader log mode (`--workflow-from-log`):**  
-Expects a JSON log produced by a Pure upload operation. Each entry must have a `uuid`, a `success` boolean, and a `type` string. Only entries where **`success = true`** *and* **`type = "research-outputs"`** are included in the patch — failed records and non-research-output types are silently skipped. The `--modified-after` date filter is not applied in this mode.
+Expects a JSON log produced by a Pure upload operation. Each entry must have a `uuid`, a `success` boolean, and a `data` string. Only entries where **`success = true`** *and* **`data = "research-outputs"`** are included in the patch — failed records and non-research-output types are silently skipped. (`type`, when present on a log entry, is the record's own research-output type URI, e.g. a `ContributionToJournal` term — not a substitute for `data`.) The `--modified-after` date filter is not applied in this mode.
 
 Output file: `workflow_patch_YYYY-MM-DD.json`  
 Patch shape: `{ "uuid": "…", "workflow": { "step": "validated" } }`
@@ -225,6 +226,24 @@ Patch shape: `{ "uuid": "…", "links": [ /* cleaned links */ ] }`
 
 ---
 
+### `--patch-duplicate-files`
+
+Removes duplicate `FileElectronicVersion` entries from a record's `electronicVersions` — typically left behind by repeated/retried upload attempts on the same underlying file (e.g. a filename-decoding bug that made earlier attempts fail, or simply re-running an upload job).
+
+Two entries are only considered duplicates of each other if **all** of the following match exactly: normalized filename, file size, `versionType.uri`, `licenseType.uri`, and `file.fileStoreLocations`. Filename normalization is fuzzy enough to bridge an HTML-entity-corrupted name and its correctly-decoded counterpart (e.g. `Me_769_liacin.pdf` and `Méliacin.pdf` are recognised as the same file) — file size acts as the safety net against two genuinely different files coincidentally colliding on name alone.
+
+Each duplicate group is resolved differently depending on its contents:
+
+1. **Corrupted name alongside a clean one** — each corrupted-named entry is removed, keeping the clean-named entry(ies), but only when a clean sibling in the same group has at least as many accented characters as the corrupted name has digit-runs (each artifact replaces exactly one accented character). This guards against a filename that merely contains an ordinary bare number (a year, an ID) being wrongly treated as a corrupted duplicate of an unrelated file. A group with no clean-named entry at all, or where a corrupted candidate fails this check, is left untouched.
+2. **Two or more genuinely identical clean-named duplicates** — nothing left to distinguish them via the matching key, so one is kept based on a weighted score: uploaded by a real Pure user (not `root`/`atira`/`sync_user`/`admin`/`system`) > most complete metadata (`accessType`, `visibleOnPortalDate`, `embargoPeriod`, `title`) > most recently created. Ties fall back to the earliest entry in the original order.
+
+Records with no `electronicVersions`, or where no group is actionable, are skipped. Nothing outside `electronicVersions` is changed. The `--modified-after` date filter applies.
+
+Output file: `duplicate_file_patch_YYYY-MM-DD.json`
+Patch shape: `{ "uuid": "…", "electronicVersions": [ /* full list, with duplicates removed */ ] }`
+
+---
+
 ## Output files summary
 
 | Patch mode | Output file(s) |
@@ -237,6 +256,7 @@ Patch shape: `{ "uuid": "…", "links": [ /* cleaned links */ ] }`
 | `--patch-publishers` | `publisher_patch_YYYY-MM-DD.json` |
 | `--patch-file-versions` | `file_version_patch_YYYY-MM-DD.json` |
 | `--patch-urls` | `url_patch_YYYY-MM-DD.json` |
+| `--patch-duplicate-files` | `duplicate_file_patch_YYYY-MM-DD.json` |
 
 All files are written to `<output_dir>/`. The date in each filename is the date the script is run.
 
@@ -282,6 +302,11 @@ python patch_records.py data/records.json patches/ \
     --publisher-mapping data/publishers.json \
     --dspace-csv data/dspace_export.csv \
     --modified-after 2023-06-01
+
+# 8. Clean up duplicate FileElectronicVersions left by repeated uploads
+python patch_records.py data/records.json patches/ \
+    --patch-duplicate-files \
+    --modified-after 2024-01-01
 ```
 
 ---

@@ -28,7 +28,13 @@ NAME_STOPWORDS = [
     "college",
     "academy",
     "institute",
-    "association"
+    "association",
+    "department",
+    "school",
+    "nuig",
+    "ollscoil",
+    "centre",
+    "society"
 ]
 ```
 
@@ -104,7 +110,7 @@ Fixed:   "Mary", "Mac Donald"
 
 **Filters**:
 1. **Any digits** anywhere in the name (regex: `\d`)
-2. **Stopwords** (case-insensitive substring match)
+2. **Stopwords** (case-insensitive, whole-word match — a stopword must match a complete word in the name, not just appear as a substring, so a short stopword like "school" or "centre" doesn't wrongly match inside an unrelated real name such as the surname "Schoolcraft" or the Italian surname "Centrella". A stopword containing a space, such as a multi-word institution phrase, still falls back to a substring check, since it can't be a single word.)
 
 **Examples**:
 ```python
@@ -113,6 +119,7 @@ Fixed:   "Mary", "Mac Donald"
 "Author1 Test"       → Filter (digit)
 "John University"    → Filter (stopword)
 "College Office"     → Filter (stopword)
+"Nicola Centrella"   → Keep (real surname, not a whole-word stopword match)
 ```
 
 ### `valid_author_name(first, last, strict=True)`
@@ -231,7 +238,7 @@ Authors found: 487
 JSON written to: output.json
 
 Excluded DC types: doctoral thesis, master thesis
-Name stopwords: university, college, academy, institute, association
+Name stopwords: university, college, academy, institute, association, department, school, nuig, ollscoil, centre, society
 ```
 
 ## Special Handling
