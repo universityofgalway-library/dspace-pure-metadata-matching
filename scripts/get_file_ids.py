@@ -36,6 +36,8 @@ import csv
 import json
 import re
 import sys
+import html
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -50,6 +52,63 @@ HANDLE_BASE_URL = "http://hdl.handle.net/"
 BITSTREAM_UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
+
+
+def clean_dspace_filename(filename: str) -> str:
+    """
+    DSpace-exported filenames can be HTML-entity-encoded (e.g. an accented
+    character rendered as "&#769;") and then percent-encoded on top of that,
+    so unquote() alone leaves literal "&#769;" text in the filename instead
+    of the real character. This decodes any HTML character references, then
+    NFKC-normalizes so combining marks merge into the preceding letter and
+    compatibility characters (e.g. the "fl" ligature) fold to plain letters.
+    """
+    if not filename:
+        return filename
+    unescaped = html.unescape(filename)
+    return unicodedata.normalize("NFKC", unescaped)
+
+
+def _strip_diacritics(name: str) -> str:
+    """Decompose accented characters and drop the combining marks, e.g. "é" -> "e"."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+# A run of 2-6 digits bounded by underscores on both sides -- the shape left
+# behind when Pure's own storage-time filename normalization turns a literal,
+# un-decoded HTML character reference like "&#769;" into "_769_" (the "&" and
+# ";" each become "_", the digits survive as-is since they're word characters).
+_ENTITY_DIGIT_RUN_RE = re.compile(r'_\d{2,6}_')
+
+
+def _strip_entity_digit_runs(name: str) -> str:
+    return _ENTITY_DIGIT_RUN_RE.sub("", name)
+
+
+def _legacy_skeleton(name: str) -> str:
+    """
+    Aggressive fallback normalization for matching a filename against a
+    *legacy* Pure-stored name that predates clean_dspace_filename(): decode
+    HTML entities, strip diacritics, collapse any Pure "_NNN_" entity-digit
+    remnant, apply Pure's own punctuation normalization, then lowercase.
+
+    A correctly-decoded filename (e.g. "Méliacin.pdf") and a file uploaded
+    by the old script before this fix existed (stored by Pure as
+    "Me_769_liacin.pdf", since Pure's own normalization turned the literal
+    "&#769;" markup into "_769_") reduce to the same skeleton here even
+    though clean_dspace_filename() alone can't reconcile them -- the "_769_"
+    remnant no longer looks like an HTML entity by the time it reaches this
+    script, so there's nothing left for clean_dspace_filename() to decode.
+    Used only as a fallback when the direct normalized match fails, to keep
+    the extra risk of a same-skeleton coincidence limited to names that
+    would otherwise be reported as unmatched anyway.
+    """
+    step = clean_dspace_filename(name)
+    step = _strip_diacritics(step)
+    step = _strip_entity_digit_runs(step)
+    step = pure_normalize_filename(step)
+    return step.lower()
 
 
 def build_handle_url(raw_handle: str) -> str:
@@ -180,7 +239,7 @@ def parse_pdf_handle_path(path: str, handle: str) -> tuple[str, str] | tuple[Non
         sequence, filename = "1", parts[0]
     else:
         return None, None
-    filename = unquote(filename).strip()
+    filename = clean_dspace_filename(unquote(filename)).strip()
     sequence = sequence.strip() or "1"
     if not filename:
         return None, None
@@ -288,20 +347,36 @@ def match_dspace_to_pure_files(
     The caller is responsible for assembling output columns from the original lists
     using these index sets. Unmatched entries from either side are preserved by the
     caller so that no file information is ever silently dropped.
+
+    Matching is two-tier. The direct pure_normalize_filename() comparison
+    handles the normal case. Files uploaded before clean_dspace_filename()
+    existed can have a Pure-stored fileName that Pure itself already mangled
+    at storage time (e.g. "Me_769_liacin.pdf" for what should be
+    "Méliacin.pdf") -- clean_dspace_filename() can't reconcile that on its
+    own, since the literal HTML-entity markup is long gone by the time either
+    side reaches this function. For any DSpace path that doesn't find a
+    direct match, _legacy_skeleton() is tried as a fallback so those files
+    aren't wrongly reported as unmatched (or picked as the loser in
+    resolve_duplicates' scoring) just because of how they happened to get
+    uploaded.
     """
     def base_name(path: str) -> str:
-        return pure_normalize_filename(unquote(path.rstrip("/").split("/")[-1]))
+        return pure_normalize_filename(clean_dspace_filename(unquote(path.rstrip("/").split("/")[-1])))
 
-    # Build a lookup: normalized Pure filename -> Pure index
+    # Build lookups: normalized Pure filename -> Pure index, both tiers.
     norm_pure: dict[str, int] = {}
+    legacy_pure: dict[str, int] = {}
     for i, fname in enumerate(pure_file_names):
         norm_pure[pure_normalize_filename(fname)] = i
+        legacy_pure.setdefault(_legacy_skeleton(fname), i)
 
     matched_dspace_indices: set[int] = set()
     matched_pure_indices:   set[int] = set()
 
     for d_idx, dpath in enumerate(dspace_pdf_paths):
         p_idx = norm_pure.get(base_name(dpath))
+        if p_idx is None:
+            p_idx = legacy_pure.get(_legacy_skeleton(dpath.rstrip("/").split("/")[-1]))
         if p_idx is not None:
             matched_dspace_indices.add(d_idx)
             matched_pure_indices.add(p_idx)
