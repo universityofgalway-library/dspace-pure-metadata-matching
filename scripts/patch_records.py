@@ -15,6 +15,9 @@ Patch modes (one or more may be combined):
                          that don't have one assigned.
   --patch-urls            Clean links[]: keep one Handle link (desc "Repository
                            Handle"), drop DOIs/portal links, dedupe the rest.
+  --patch-duplicate-files Remove duplicate FileElectronicVersion entries (same
+                           normalized fileName + size), keeping the most
+                           complete one.
 
 See README.md for full usage examples.
 """
@@ -22,9 +25,12 @@ See README.md for full usage examples.
 import os
 import re
 import csv
+import html
 import json
 import argparse
-from datetime import date, datetime
+import unicodedata
+from collections import defaultdict
+from datetime import date, datetime, timezone
 from tqdm import tqdm
 
 
@@ -61,6 +67,19 @@ DEFAULT_VERSION_TYPE = {
     "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
     "term": {"en_IE": "Accepted author manuscript"},
 }
+
+# Creator values treated as system/import accounts rather than real Pure
+# users (see _is_uploaded_by_real_user, used when weighing identical
+# duplicate FileElectronicVersions in patch_duplicate_files).
+SYSTEM_CREATORS = {"root", "atira", "sync_user", "admin", "system", ""}
+
+# FileElectronicVersion fields counted towards "metadata completeness" when
+# weighing identical duplicates (see _completeness_count). Deliberately
+# excludes: licenseType/versionType (part of the duplicate-matching key,
+# already guaranteed identical within a group) and pureId/creator/created/
+# file.fileId/file.url/file.mimeType (system/internal fields, not
+# descriptive metadata).
+IDENTICAL_DUPLICATE_METADATA_FIELDS = ("accessType", "visibleOnPortalDate", "embargoPeriod", "title")
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +348,9 @@ def patch_workflow(
 
     Upload-log mode (from_upload_log=True):
       Input is the JSON log produced by a Pure upload operation.  Each entry is
-      expected to have 'uuid', 'success' (bool), and optionally 'type'.  Only
-      entries where success=True and type="research-outputs" are patched.
+      expected to have 'uuid', 'success' (bool), and 'data' (record type,
+      e.g. "research-outputs"). Only entries where success=True and
+      data="research-outputs" are patched.
     """
     result = []
     skipped_date = 0
@@ -342,8 +362,17 @@ def patch_workflow(
             continue
 
         if from_upload_log:
-            # Log format: filter by success flag and record type
-            if record.get("type") != "research-outputs":
+            # Log format: filter by success flag and record type. The upload
+            # log's constant discriminator for a research-output entry is
+            # the "data" field (e.g. {"data": "research-outputs", ...} —
+            # see the log entries this script itself writes, and real
+            # created/deleted-records logs), NOT "type" — "type" on these
+            # entries, when present, is the record's own research-output
+            # type URI (e.g. ContributionToJournal), which will essentially
+            # never equal the literal string "research-outputs". Checking
+            # "type" here always fails to match, silently producing an
+            # empty patch for every real upload-log file.
+            if record.get("data") != "research-outputs":
                 skipped_log += 1
                 continue
             if record.get("success") is not True:
@@ -605,6 +634,443 @@ def patch_file_versions(
         "patched":             patched,
         "files_patched":       files_patched,
         "files":               [output_path],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Patch: duplicate file versions
+# ---------------------------------------------------------------------------
+#
+# Ported from add_pdfs_to_pure.py's duplicate-resolution logic (same scoring
+# and tie-breaking rules), adapted to operate on a plain electronicVersions
+# list rather than a whole Pure record, so it can run as a standalone patch
+# mode here.
+
+def _clean_dspace_filename(filename: str) -> str:
+    """
+    Reverse HTML-entity encoding artifacts still literally present in a
+    filename (e.g. "Me&#769;liacin.pdf" -> "Méliacin.pdf"): decode any HTML
+    character references, then NFKC-normalize so a decoded combining mark
+    merges into the preceding base letter and compatibility characters
+    (e.g. the "fl" ligature) fold to plain letters. A no-op on filenames
+    with no entity markup.
+    """
+    if not filename:
+        return filename
+    unescaped = html.unescape(filename)
+    return unicodedata.normalize("NFKC", unescaped)
+
+
+def _strip_diacritics(name: str) -> str:
+    """Decompose accented characters and drop the combining marks, e.g. "é" -> "e"."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+# A run of 2-6 digits bounded by underscores on both sides. This is the shape
+# left behind when Pure's own storage-time filename normalization turns a
+# literal, un-decoded HTML character reference like "&#769;" into "_769_"
+# (the "&" and ";" each become "_", the digits survive as-is since they're
+# word characters). Matched only within _is_clean_filename/_normalize_for_dedup,
+# never used to alter a filename that's actually kept or displayed.
+_ENTITY_DIGIT_RUN_RE = re.compile(r'_\d{2,6}_')
+
+
+def _strip_entity_digit_runs(name: str) -> str:
+    return _ENTITY_DIGIT_RUN_RE.sub("", name)
+
+
+def _diacritic_char_count(name: str) -> int:
+    """
+    Count of base characters in `name` that carry a combining mark once
+    NFKD-decomposed (i.e. accented letters, such as the "e" in "é"). Used
+    to check that a candidate "_NNN_" entity-digit-run artifact is actually
+    plausible: a genuine artifact replaces exactly one accented character,
+    so a clean counterpart must have at least as many accented characters
+    as the corrupted name has digit-runs. Without this check, a filename
+    that merely contains an ordinary bare number ("Report_2024_final.pdf")
+    can be misidentified as a corrupted duplicate of an unrelated file
+    that happens to share its normalized skeleton and exact-match fields.
+    """
+    decomposed = unicodedata.normalize("NFKD", _clean_dspace_filename(name))
+    return sum(1 for c in decomposed if unicodedata.combining(c))
+
+
+def _is_clean_filename(name: str) -> bool:
+    """
+    True if a filename shows no sign of the HTML-entity corruption: neither
+    literal "&#NNN;" markup nor Pure's own "_NNN_" remnant of it. Used to
+    prefer an un-corrupted duplicate over a corrupted one regardless of
+    which copy happens to have more complete metadata.
+    """
+    if not name:
+        return False
+    unescaped = _clean_dspace_filename(name)
+    if unescaped != name:
+        return False
+    if _strip_entity_digit_runs(unescaped) != unescaped:
+        return False
+    return True
+
+
+def _pure_normalize_filename(name: str) -> str:
+    """
+    Normalize a filename the same way Pure does when storing uploaded files.
+    Pure replaces characters that are not alphanumeric, hyphen, underscore,
+    dot, or space with underscores. Used to group duplicates even when the
+    exact fileName text differs slightly (e.g. punctuation).
+    """
+    return re.sub(r'[^\w.\- ]', '_', name)
+
+
+def _normalize_for_dedup(name: str) -> str:
+    """
+    Full normalization used as the duplicate-grouping key: HTML-entity
+    decoding, diacritic stripping, collapsing any "_NNN_" entity-digit
+    remnant, Pure's own punctuation normalization, then lowercasing.
+
+    This is deliberately aggressive so that a correctly-decoded filename
+    (e.g. "Méliacin_(ARAN).pdf") and a corrupted copy of the very same file
+    (e.g. "Me_769_liacin_(ARAN).pdf", which is what Pure's own storage-time
+    normalization leaves behind once the literal "&#769;" markup is gone)
+    reduce to the identical key and are therefore grouped as duplicates —
+    which they are: the same underlying file, uploaded under two different
+    spellings of its name. The "size" half of the grouping key (see
+    _find_duplicate_file_groups) is the safety net against this being too
+    aggressive: two genuinely different files are extremely unlikely to
+    also share an exact byte size, even if their names coincidentally
+    collapse to the same skeleton.
+    """
+    step = _clean_dspace_filename(name)
+    step = _strip_diacritics(step)
+    step = _strip_entity_digit_runs(step)
+    step = _pure_normalize_filename(step)
+    return step.lower()
+
+
+def _version_type_uri(ev: dict) -> str | None:
+    return (ev.get("versionType") or {}).get("uri")
+
+
+def _license_uri(ev: dict) -> str | None:
+    return (ev.get("licenseType") or {}).get("uri")
+
+
+def _file_store_locations_key(file_block: dict) -> tuple:
+    """Order-independent, hashable representation of file.fileStoreLocations."""
+    locations = file_block.get("fileStoreLocations") or {}
+    return tuple(sorted(locations.items()))
+
+
+def _is_uploaded_by_real_user(ev: dict) -> bool:
+    """
+    Heuristic: entries created by a known system/import account (see
+    SYSTEM_CREATORS) are treated as system/import uploads; any other
+    creator is treated as a real Pure user.
+    """
+    creator = (ev.get("creator") or "").strip().lower()
+    return creator not in SYSTEM_CREATORS
+
+
+def _completeness_count(ev: dict) -> int:
+    """
+    Count how many of IDENTICAL_DUPLICATE_METADATA_FIELDS are meaningfully
+    populated on a FileElectronicVersion. Higher = more complete metadata.
+    """
+    count = 0
+    for field in IDENTICAL_DUPLICATE_METADATA_FIELDS:
+        value = ev.get(field)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, str)) and not value:
+            continue
+        count += 1
+    return count
+
+
+def _parse_ev_created(value: str):
+    """
+    Parse a FileElectronicVersion's 'created' timestamp (ISO 8601 with a
+    UTC offset and variable-precision fractional seconds, e.g.
+    "2026-09-14T17:22:08.79266+01:00") into a timezone-aware datetime, or
+    None if it's missing/unparsable.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        pass
+    # Fallback for Python versions where fromisoformat needs exactly 3 or 6
+    # fractional-second digits: pad/truncate to exactly 6.
+    match = re.match(r'^(.*?)(\.\d+)?([+-]\d{2}:\d{2}|Z)?$', value)
+    if not match:
+        return None
+    base, frac, offset = match.groups()
+    frac = "." + (frac[1:] + "000000")[:6] if frac else ""
+    offset = "+00:00" if not offset or offset == "Z" else offset
+    try:
+        return datetime.fromisoformat(f"{base}{frac}{offset}")
+    except ValueError:
+        return None
+
+
+def _normalize_scores(values: list) -> list:
+    """Min-max normalize a list of numbers to [0, 1]. If every value is
+    identical, that criterion has no discriminating power in this group,
+    so everyone gets the same score (1.0) rather than an arbitrary 0."""
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return [1.0] * len(values)
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _choose_among_identical_duplicates(duplicates: list) -> dict:
+    """
+    Given 2+ FileElectronicVersion entries that are genuine, non-corrupted
+    duplicates (identical fileName, size, versionType, licenseType, and
+    fileStoreLocations — see _find_duplicate_file_groups), choose the
+    single entry to keep.
+
+    Three criteria are each min-max normalized to [0, 1] across the
+    candidates in this specific group, then SUMMED with equal weight to
+    produce a composite score; the highest-scoring entry wins:
+      1. Uploaded by a real Pure user rather than a system/import account
+         (_is_uploaded_by_real_user).
+      2. Most complete metadata, counting only non-key, non-system fields
+         (_completeness_count).
+      3. Most recently created (ev.created, _parse_ev_created).
+    A missing/unparsable 'created' value is treated as older than every
+    parsed value in the group, so it never wins on recency.
+
+    Ties (identical composite score) fall back to the earliest entry in
+    the original electronicVersions order, for determinism.
+
+    Note: the three criteria are equally weighted by construction (each
+    normalized to the same [0, 1] range before summing) since no explicit
+    relative weighting was specified. Adjust here if one criterion should
+    matter more than the others.
+    """
+    real_user_vals = [1.0 if _is_uploaded_by_real_user(ev) else 0.0 for ev in duplicates]
+    completeness_vals = [float(_completeness_count(ev)) for ev in duplicates]
+
+    created_dts = [_parse_ev_created(ev.get("created", "")) for ev in duplicates]
+    parsed = [dt for dt in created_dts if dt is not None]
+    oldest_fallback = (min(parsed) if parsed else datetime.min.replace(tzinfo=timezone.utc)).timestamp() - 1
+    created_vals = [dt.timestamp() if dt is not None else oldest_fallback for dt in created_dts]
+
+    norm_real_user = _normalize_scores(real_user_vals)
+    norm_completeness = _normalize_scores(completeness_vals)
+    norm_created = _normalize_scores(created_vals)
+
+    best_idx = None
+    best_key = None
+    for idx in range(len(duplicates)):
+        score = norm_real_user[idx] + norm_completeness[idx] + norm_created[idx]
+        key = (score, -idx)  # tie-break: earliest original entry wins
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = idx
+    return duplicates[best_idx]
+
+
+def _find_duplicate_file_groups(electronic_versions: list) -> dict:
+    """
+    Group FileElectronicVersions into candidate duplicate sets. Two entries
+    are only considered duplicates of each other if ALL of the following
+    match exactly:
+      - fuzzy-normalized fileName (_normalize_for_dedup) — same file,
+        allowing for the HTML-entity corruption vs. correctly-decoded
+        spelling difference
+      - file size
+      - versionType.uri
+      - licenseType.uri
+      - file.fileStoreLocations (order-independent)
+
+    Returns {key: [ev, ev, ...]} for groups with more than one entry.
+    """
+    groups = defaultdict(list)
+    for ev in electronic_versions:
+        if not isinstance(ev, dict) or ev.get("typeDiscriminator") != "FileElectronicVersion":
+            continue
+        file_block = ev.get("file") or {}
+        file_name = file_block.get("fileName")
+        if not file_name:
+            continue
+        key = (
+            _normalize_for_dedup(file_name),
+            file_block.get("size"),
+            _version_type_uri(ev),
+            _license_uri(ev),
+            _file_store_locations_key(file_block),
+        )
+        groups[key].append(ev)
+
+    return {key: evs for key, evs in groups.items() if len(evs) > 1}
+
+
+def _resolve_duplicate_file_versions(electronic_versions: list) -> tuple[bool, list, list]:
+    """
+    Find duplicate FileElectronicVersion groups (see _find_duplicate_file_groups
+    — size, versionType, licenseType, and fileStoreLocations must all match
+    exactly) and resolve each group down to a single entry, handling two
+    distinct cases differently:
+
+    1. Group contains at least one corrupted-name entry (fileName still
+       shows the HTML-entity artifact — _is_clean_filename is False): each
+       corrupted entry is removed ONLY if some clean-named entry in the same
+       group plausibly explains it (see _diacritic_char_count — a "_NNN_"
+       digit-run is only trusted as a corruption artifact if a clean sibling
+       has at least that many accented characters). A group with no
+       clean-named entry at all is left completely untouched. If there's
+       more than one clean-named entry alongside the corrupted one(s), all
+       of them are kept as-is — this case doesn't touch clean-vs-clean
+       resolution.
+
+    2. Group is entirely clean-named (no corruption artifact anywhere) but
+       has more than one entry: these are genuine identical duplicates —
+       same name, size, versionType, licenseType, and fileStoreLocations —
+       with nothing left to distinguish them via the matching key. Exactly
+       one is kept, chosen by _choose_among_identical_duplicates (weighted
+       sum of: real-user creator, metadata completeness, recency).
+
+    Returns (changed, deduped_versions, removed_evs):
+      - changed: True if any duplicates were found and removed
+      - deduped_versions: a new electronicVersions list with the resolved
+        duplicates removed
+      - removed_evs: the FileElectronicVersion dicts that were dropped
+    """
+    groups = _find_duplicate_file_groups(electronic_versions)
+    if not groups:
+        return False, electronic_versions, []
+
+    to_remove_ids = set()
+    removed = []
+    for evs in groups.values():
+        clean_evs = [ev for ev in evs if _is_clean_filename((ev.get("file") or {}).get("fileName", ""))]
+        clean_ids = {id(ev) for ev in clean_evs}
+        corrupted_evs = [ev for ev in evs if id(ev) not in clean_ids]
+
+        if corrupted_evs:
+            # Case 1: mixed or all-corrupted group.
+            if not clean_evs:
+                continue  # no clean copy to keep — nothing actionable
+            # A "_NNN_" digit-run is only real evidence of entity corruption
+            # if some clean sibling in this exact-match group has at least as
+            # many accented characters as this candidate has digit-runs (each
+            # artifact replaces exactly one accented character). Otherwise a
+            # filename that merely contains an ordinary bare number (a year,
+            # an ID) could be wrongly removed as if it were the corrupted
+            # copy of an unrelated file that happens to share this group's
+            # exact-match fields. A candidate that doesn't clear this bar is
+            # left in place rather than removed.
+            for ev in corrupted_evs:
+                file_name = (ev.get("file") or {}).get("fileName", "")
+                digit_run_count = len(_ENTITY_DIGIT_RUN_RE.findall(file_name))
+                plausible = any(
+                    _diacritic_char_count((clean_ev.get("file") or {}).get("fileName", "")) >= digit_run_count
+                    for clean_ev in clean_evs
+                )
+                if plausible:
+                    to_remove_ids.add(id(ev))
+                    removed.append(ev)
+            continue
+
+        # Case 2: every entry in this group is clean-named. If there's more
+        # than one, they're genuine identical duplicates — pick one to keep.
+        if len(clean_evs) > 1:
+            keeper = _choose_among_identical_duplicates(clean_evs)
+            for ev in clean_evs:
+                if ev is not keeper:
+                    to_remove_ids.add(id(ev))
+                    removed.append(ev)
+
+    if not removed:
+        return False, electronic_versions, []
+
+    deduped_versions = [ev for ev in electronic_versions if id(ev) not in to_remove_ids]
+    return True, deduped_versions, removed
+
+
+def patch_duplicate_files(
+    records: list,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    Remove duplicate FileElectronicVersion entries where an already-present
+    copy of the same file exists — matched on fileName (fuzzy, allowing for
+    HTML-entity corruption), size, versionType, licenseType, and
+    fileStoreLocations all being otherwise identical (see
+    _find_duplicate_file_groups). Handles two cases (see
+    _resolve_duplicate_file_versions for the full rules):
+      1. Corrupted-name duplicate(s) alongside a correctly-named copy —
+         the corrupted ones are removed, the clean one(s) kept.
+      2. Two or more genuinely identical clean-named duplicates with
+         nothing left to tell them apart via the matching key — one is
+         kept, chosen by a weighted sum of real-user creator, metadata
+         completeness, and recency (_choose_among_identical_duplicates).
+    Produces a PATCH-compatible JSON (uuid + full electronicVersions list
+    with the resolved duplicates removed) for every record that had at
+    least one actionable group.
+
+    Typical cause: repeated failed/retried upload attempts on the same
+    DSpace file (e.g. due to a filename-decoding bug that made earlier
+    attempts fail, or simply re-running an upload job) create a new
+    FileElectronicVersion each time instead of updating the existing one,
+    leaving several duplicate copies on the record. Nothing else on the
+    record is changed.
+    """
+    patches = []
+    skipped_date = 0
+    skipped_no_evs = 0
+    skipped_no_duplicates = 0
+    patched = 0
+    files_removed = 0
+
+    for record in tqdm(records, desc="[duplicate-files] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        uuid = record.get("uuid", "")
+        electronic_versions = record.get("electronicVersions", [])
+
+        if not electronic_versions:
+            skipped_no_evs += 1
+            continue
+
+        changed, deduped_versions, removed = _resolve_duplicate_file_versions(electronic_versions)
+        if not changed:
+            skipped_no_duplicates += 1
+            continue
+
+        for ev in removed:
+            file_block = ev.get("file", {}) if isinstance(ev.get("file"), dict) else {}
+            tqdm.write(
+                f"  🗑️  [{uuid}] — removing duplicate file "
+                f"'{file_block.get('fileName', '')}' (file pureId={file_block.get('pureId', '')})"
+            )
+
+        patches.append({
+            "uuid":               uuid,
+            "electronicVersions": deduped_versions,
+        })
+        patched += 1
+        files_removed += len(removed)
+
+    output_path = os.path.join(output_dir, f"duplicate_file_patch_{TODAY}.json")
+    write_json(output_path, patches)
+
+    return {
+        "total":                 len(records),
+        "skipped_date_filter":   skipped_date,
+        "skipped_no_evs":        skipped_no_evs,
+        "skipped_no_duplicates": skipped_no_duplicates,
+        "patched":               patched,
+        "files_removed":         files_removed,
+        "files":                 [output_path],
     }
 
 
@@ -1067,6 +1533,16 @@ def build_parser() -> argparse.ArgumentParser:
             "links, and de-duplicate remaining links by URL."
         ),
     )
+    modes.add_argument(
+        "--patch-duplicate-files",
+        action="store_true",
+        help=(
+            "Remove duplicate FileElectronicVersion entries (same "
+            "normalized fileName + size), keeping the most complete one. "
+            "Useful after repeated failed upload attempts left several "
+            "copies of the same file on a record."
+        ),
+    )
 
     opts = parser.add_argument_group("Options")
     opts.add_argument(
@@ -1131,6 +1607,7 @@ def main() -> None:
         args.patch_publishers,
         args.patch_file_versions,
         args.patch_urls,
+        args.patch_duplicate_files,
     ]
     
     if not any(modes_selected):
@@ -1138,7 +1615,7 @@ def main() -> None:
             "No patch mode selected. Choose at least one of: "
             "--patch-nulls, --patch-titles, --patch-workflow, "
             "--patch-external-orgs, --patch-author-keywords, --patch-publishers, "
-            "--patch-file-versions, --patch-urls"
+            "--patch-file-versions, --patch-urls, --patch-duplicate-files"
         )
 
     if args.patch_publishers and not args.publisher_mapping:
@@ -1219,6 +1696,10 @@ def main() -> None:
     if args.patch_urls:
         stats = patch_urls(records, args.output_dir, modified_after)
         print_summary("URLs", stats)
+
+    if args.patch_duplicate_files:
+        stats = patch_duplicate_files(records, args.output_dir, modified_after)
+        print_summary("Duplicate file versions", stats)
 
     print(f"\n✅ All done. Output directory: {args.output_dir}\n")
 
