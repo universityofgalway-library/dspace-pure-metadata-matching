@@ -29,7 +29,19 @@ NAME_STOPWORDS = [
     "college",
     "academy",
     "institute",
-    "association"
+    "association",
+    "department",
+    "school",
+    "nuig",
+    "ollscoil",
+    "centre",
+    "center",
+    "laboratory",
+    "institution",
+    "organisation",
+    "organization",
+    "foundation",
+    "society"
 ]
 
 
@@ -158,6 +170,14 @@ def contains_stopword(first, last, stopwords):
     Check if first or last name contains any institutional stopwords or digits.
     Returns True if a stopword is found (should be excluded).
     Case-insensitive comparison.
+
+    Stopwords are matched against whole words in the name, not as a raw
+    substring, so a short common word like "school" or "centre" doesn't
+    wrongly match inside an unrelated real name that merely contains those
+    letters (e.g. the surname "Schoolcraft", or the Italian surname
+    "Centrella"). A stopword containing a space (a multi-word institution
+    phrase) still falls back to a substring check, since it can't be a
+    single token.
     """
     import re
     
@@ -171,10 +191,17 @@ def contains_stopword(first, last, stopwords):
     if re.search(r'\d', first_lower) or re.search(r'\d', last_lower):
         return True
     
+    # Whole-word tokens from both name parts, for word-boundary matching.
+    name_words = set(re.findall(r"[a-z']+", first_lower)) | set(re.findall(r"[a-z']+", last_lower))
+
     # Check for stopwords
     for stopword in stopwords:
         stopword_lower = stopword.strip().lower()
-        if stopword_lower in first_lower or stopword_lower in last_lower:
+        if " " in stopword_lower:
+            # Multi-word phrase: can't be a single token, fall back to substring.
+            if stopword_lower in first_lower or stopword_lower in last_lower:
+                return True
+        elif stopword_lower in name_words:
             return True
     
     return False
