@@ -36,8 +36,6 @@ import csv
 import json
 import re
 import sys
-import html
-import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -52,21 +50,6 @@ HANDLE_BASE_URL = "http://hdl.handle.net/"
 BITSTREAM_UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
-
-
-def clean_dspace_filename(filename: str) -> str:
-    """
-    DSpace-exported filenames can be HTML-entity-encoded (e.g. an accented
-    character rendered as "&#769;") and then percent-encoded on top of that,
-    so unquote() alone leaves literal "&#769;" text in the filename instead
-    of the real character. This decodes any HTML character references, then
-    NFKC-normalizes so combining marks merge into the preceding letter and
-    compatibility characters (e.g. the "fl" ligature) fold to plain letters.
-    """
-    if not filename:
-        return filename
-    unescaped = html.unescape(filename)
-    return unicodedata.normalize("NFKC", unescaped)
 
 
 def build_handle_url(raw_handle: str) -> str:
@@ -197,7 +180,7 @@ def parse_pdf_handle_path(path: str, handle: str) -> tuple[str, str] | tuple[Non
         sequence, filename = "1", parts[0]
     else:
         return None, None
-    filename = clean_dspace_filename(unquote(filename)).strip()
+    filename = unquote(filename).strip()
     sequence = sequence.strip() or "1"
     if not filename:
         return None, None
@@ -307,7 +290,7 @@ def match_dspace_to_pure_files(
     caller so that no file information is ever silently dropped.
     """
     def base_name(path: str) -> str:
-        return pure_normalize_filename(clean_dspace_filename(unquote(path.rstrip("/").split("/")[-1])))
+        return pure_normalize_filename(unquote(path.rstrip("/").split("/")[-1]))
 
     # Build a lookup: normalized Pure filename -> Pure index
     norm_pure: dict[str, int] = {}

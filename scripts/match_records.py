@@ -3,8 +3,6 @@ import re
 import sys
 import csv
 import json
-import unicodedata
-import html
 import requests
 from datetime import date
 from collections import defaultdict
@@ -31,12 +29,12 @@ COLLECT_EXTERNAL_ORGS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/filtered_dspace_test_2026-09-14_16-21-49.csv"
-PURE_JSON = "./pure_research_outputs/search_result_temp_2026-09-14_15-25-35.json"
+DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-09-09.csv"
+PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-09-11.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-27.json"
-OUTPUT_DIR = f"./record_matching/temp_output_patch_{TODAY}"
+OUTPUT_DIR = f"./record_matching/output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -313,28 +311,6 @@ def strip_system_fields(record):
 def fix_apostrophe(s):
     """Replace curly/curved apostrophe with a straight one."""
     return s.replace("\u2019", "'") if s else s
-
-
-def clean_dspace_filename(filename: str) -> str:
-    """
-    Some DSpace-exported filenames in the CSV have been HTML-entity-encoded
-    (e.g. an accented/ligature character rendered as "&#769;" or "&#64258;")
-    and then percent-encoded on top of that, leaving literal text like
-    "&#769;" embedded in the filename instead of the intended character
-    (e.g. "Me&#769;liacin.pdf" instead of "Méliacin.pdf").
-
-    Decodes any HTML character references, then normalizes with NFKC so a
-    decoded combining mark merges into the preceding base letter and
-    compatibility characters like the "fl" ligature fold back to plain
-    letters — matching the plain-Unicode form Pure stores.
-
-    Note: this doesn't fix cases where DSpace's filename itself contains a
-    genuinely different character rather than an encoding artifact.
-    """
-    if not filename:
-        return filename
-    unescaped = html.unescape(filename)
-    return unicodedata.normalize("NFKC", unescaped)
 
 
 def normalize(s):
@@ -2666,8 +2642,6 @@ def main():
     with open(DSPACE_CSV, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("pdf_handle_paths"):
-                row["pdf_handle_paths"] = clean_dspace_filename(row["pdf_handle_paths"])
             dspace_rows.append(row)
     print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
 
