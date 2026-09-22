@@ -3,6 +3,8 @@ import re
 import sys
 import csv
 import json
+import unicodedata
+import html
 import requests
 from datetime import date
 from collections import defaultdict
@@ -29,12 +31,12 @@ COLLECT_EXTERNAL_ORGS = False
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
-DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-09-09.csv"
-PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-09-11.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
-ORGANIZATION_MAPPING_JSON = "./pure_entities/organizations_mapping_2026-04-22.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/pure_publishers_2026-04-27.json"
-OUTPUT_DIR = f"./record_matching/output_{TODAY}"
+DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_items_2026-09-16.csv"
+PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-21.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_authors_temp_2026-09-17.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/temp_organizations_mapping_2026-09-16.json"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_temp_publishers_2026-09-16.json"
+OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -311,6 +313,28 @@ def strip_system_fields(record):
 def fix_apostrophe(s):
     """Replace curly/curved apostrophe with a straight one."""
     return s.replace("\u2019", "'") if s else s
+
+
+def clean_dspace_filename(filename: str) -> str:
+    """
+    Some DSpace-exported filenames in the CSV have been HTML-entity-encoded
+    (e.g. an accented/ligature character rendered as "&#769;" or "&#64258;")
+    and then percent-encoded on top of that, leaving literal text like
+    "&#769;" embedded in the filename instead of the intended character
+    (e.g. "Me&#769;liacin.pdf" instead of "Méliacin.pdf").
+
+    Decodes any HTML character references, then normalizes with NFKC so a
+    decoded combining mark merges into the preceding base letter and
+    compatibility characters like the "fl" ligature fold back to plain
+    letters — matching the plain-Unicode form Pure stores.
+
+    Note: this doesn't fix cases where DSpace's filename itself contains a
+    genuinely different character rather than an encoding artifact.
+    """
+    if not filename:
+        return filename
+    unescaped = html.unescape(filename)
+    return unicodedata.normalize("NFKC", unescaped)
 
 
 def normalize(s):
@@ -1555,6 +1579,45 @@ def resolve_funder_duplicate(matches, api_key, base_url):
     return sorted_matches[0]
 
 
+def parse_subjects(subject_str):
+    """Parse dc.subject field: semicolon-separated keywords."""
+    if not subject_str:
+        return []
+    return [s.strip() for s in subject_str.split(";") if s.strip()]
+
+
+def merge_keywords(existing_keywords, new_keywords):
+    """
+    Merge two lists of keyword strings into one, alphabetically sorted list
+    with no duplicates. Comparison for duplicates is case-insensitive, but
+    the original capitalisation of the first occurrence encountered is kept
+    (existing keywords take precedence over new ones with the same value).
+    """
+    seen = {}
+    for kw in existing_keywords + new_keywords:
+        key = kw.lower()
+        if key not in seen:
+            seen[key] = kw
+    return sorted(seen.values(), key=lambda k: k.lower())
+
+
+def build_free_keywords_group(keywords):
+    """Build a FreeKeywordsKeywordGroup dict (dc.subject -> Pure keywordGroups)."""
+    return {
+        "typeDiscriminator": "FreeKeywordsKeywordGroup",
+        "logicalName": "keywordContainers",
+        "name": {
+            "en_IE": "Keywords"
+        },
+        "keywords": [
+            {
+                "locale": "en_IE",
+                "freeKeywords": keywords
+            }
+        ]
+    }
+
+
 def parse_funders(funder_str):
     """Parse semicolon-separated funder names from DSpace"""
     if not funder_str:
@@ -2259,6 +2322,33 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
                     "pure_uuid": pure_record.get("uuid")
                 })
 
+    # --- 11a. Keywords (dc.subject) > add new keywords, don't overwrite existing ---
+    dspace_subjects = parse_subjects(dspace_row.get("dc.subject", ""))
+    if dspace_subjects:
+        # Base off whatever keywordGroups is currently staged for the update (e.g. after
+        # step 1c removed the authors group); fall back to the original Pure record.
+        base_keyword_groups = updated_record.get("keywordGroups", pure_record.get("keywordGroups", []))
+
+        existing_free_keywords = []
+        other_keyword_groups = []
+        for kg in base_keyword_groups:
+            if not kg:
+                continue
+            # Match ONLY the general free-keywords group (typeDiscriminator +
+            # logicalName both required). This intentionally excludes any other
+            # keyword group, including Pure's own "authors" free-keywords group
+            # (logicalName "/dk/atira/pure/authors") and any classification/
+            # discipline keyword groups — those are passed through untouched.
+            if kg.get("typeDiscriminator") == "FreeKeywordsKeywordGroup" and kg.get("logicalName") == "keywordContainers":
+                for locale_entry in kg.get("keywords", []):
+                    existing_free_keywords.extend(locale_entry.get("freeKeywords", []))
+            else:
+                other_keyword_groups.append(kg)
+
+        merged_keywords = merge_keywords(existing_free_keywords, dspace_subjects)
+        updated_record["keywordGroups"] = other_keyword_groups + [build_free_keywords_group(merged_keywords)]
+        print(f"  ✅ Keywords: added {len(dspace_subjects)} DSpace subject(s), {len(merged_keywords)} total after merge")
+
     # --- 12. Set workflow step ---
     updated_record["workflow"] = {
         "step": "validated"
@@ -2623,6 +2713,12 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
                     "pure_uuid": None
                 })
 
+    # Set keywords (dc.subject)
+    dspace_subjects = parse_subjects(dspace_row.get("dc.subject", ""))
+    if dspace_subjects:
+        merged_keywords = merge_keywords([], dspace_subjects)
+        record["keywordGroups"] = [build_free_keywords_group(merged_keywords)]
+
     return record
 
 
@@ -2642,6 +2738,8 @@ def main():
     with open(DSPACE_CSV, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            if row.get("pdf_handle_paths"):
+                row["pdf_handle_paths"] = clean_dspace_filename(row["pdf_handle_paths"])
             dspace_rows.append(row)
     print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
 
