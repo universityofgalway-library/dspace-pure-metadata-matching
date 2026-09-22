@@ -799,7 +799,7 @@ def resolve_author_duplicate(matches, paper_dois=None, paper_handles=None, paper
     Prefer Person over External Person, then by visibility (internal),
     then by metadata richness.
 
-    NEW: If a candidate's pre-indexed paper set contains any of the current
+    If a candidate's pre-indexed paper set contains any of the current
     record's DOIs, handles, or title, that candidate scores highest
     regardless of internal/external status — it is a confirmed match.
 
@@ -1254,37 +1254,51 @@ def resolve_record_duplicate(records):
     return sorted_records[0]
 
 
-def build_electronic_version(doi, version_type_uri, access_type="UNKNOWN",
+def build_electronic_version(doi, version_type_uri=None, access_type="UNKNOWN",
                              license_type=None, embargo_end_date=None):
     """
     Build electronic version object ONLY when a DOI exists.
     If no DOI is supplied, return None (Pure must not receive an electronicVersion entry).
+
+    A DoiElectronicVersion must never carry licence, openness status, or
+    manuscript-version metadata -- only the actual FileElectronicVersion does
+    (set directly in update_record_from_dspace, step 5f). version_type_uri,
+    access_type, license_type and embargo_end_date are kept as parameters
+    purely so every existing call site still works unchanged; they are
+    intentionally ignored.
     """
     if not doi:
         return None
 
-    ev = {
+    return {
         "typeDiscriminator": "DoiElectronicVersion",
         "doi": doi,
-        "accessType": {
-            "uri": f"/dk/atira/pure/core/openaccesspermission/{access_type.lower()}"
-        },
-        "versionType": {
-            "uri": version_type_uri
-        }
     }
 
-    if license_type:
-        ev["licenseType"] = {
-            "uri": f"/dk/atira/pure/core/document/licenses/{license_type.lower()}"
-        }
 
-    if embargo_end_date:
-        ev["embargoPeriod"] = {
-            "endDate": embargo_end_date
-        }
-
+def strip_file_only_ev_fields(ev):
+    """
+    Remove licence / openness-status / manuscript-type / embargo metadata from
+    a non-file electronic version (DOI or otherwise). These fields must only
+    ever live on a FileElectronicVersion.
+    """
+    for key in ("accessType", "licenseType", "versionType", "embargoPeriod"):
+        ev.pop(key, None)
     return ev
+
+
+def record_has_dspace_link(pure_record, dspace_row):
+    """
+    True only if this Pure record is actually connected to DSpace -- either it
+    already carries a "DSpace" identifier, or this dspace_row supplies a uuid
+    that will be attached to it this run. Guards against ever touching file
+    access/licence/version metadata on a Pure record that merely matched by
+    title or DOI but was never sourced from DSpace.
+    """
+    existing_identifiers = pure_record.get("identifiers", []) or []
+    if any(i.get("idSource") == "DSpace" for i in existing_identifiers):
+        return True
+    return bool(dspace_row.get("uuid", "").strip())
 
 
 def resolve_license_uri(rights_str):
@@ -2023,9 +2037,22 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     # Separate existing EVs into repository and publisher DOIs
     existing_repo_evs = []
     existing_publisher_evs = []
+    existing_file_evs = []
     existing_other_evs = []
     
     for ev in existing_evs:
+        # Work on a shallow COPY, never the original dict. repo_ev / file_ev
+        # below get mutated in place -- mutating the original would also
+        # mutate existing_evs (same object reference), which would make the
+        # "final_evs != existing_evs" check at the end always see no change,
+        # silently dropping electronicVersions from the update payload.
+        ev = dict(ev)
+        # FileElectronicVersion has no "doi" field -- pull it out FIRST so it
+        # never falls into "other" below. It's the only EV type that should
+        # carry accessType / licenseType / versionType (step 5f).
+        if ev.get("typeDiscriminator") == "FileElectronicVersion":
+            existing_file_evs.append(ev)
+            continue
         doi = normalize_doi(ev.get("doi", ""))
         if "hdl.handle.net" not in doi:
             if doi.startswith("https://doi.org/10.13025"):
@@ -2051,45 +2078,20 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         # Check if it's actually a repository DOI
         if "10.13025" in publisher_doi:
             if publisher_doi not in existing_repo_dois:
-                ev = build_electronic_version(
-                    doi=publisher_doi,
-                    version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type="EMBARGOED" if embargo_active else "OPEN",
-                    license_type="CC_BY_NC"
-                )
-                if embargo_period and ev:
-                    ev["embargoPeriod"] = embargo_period
+                ev = build_electronic_version(doi=publisher_doi)
                 if ev:
                     repo_ev = ev
         elif publisher_doi not in existing_publisher_dois:
-            ev = build_electronic_version(
-                doi=publisher_doi,
-                version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion",
-            )
+            ev = build_electronic_version(doi=publisher_doi)
             if ev:
                 new_publisher_ev = ev
 
-    if repo_ev:
-        # Update existing repo version
-        if embargo_period:
-            repo_ev["embargoPeriod"] = embargo_period
-            repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
-        elif embargo_date:
-            # Embargo date exists but is in the past — clear any stale embargo
-            repo_ev.pop("embargoPeriod", None)
-            repo_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
-
-
-        # Always enforce version type + license
-        repo_ev["versionType"] = {
-            "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
-        }
-        repo_ev["licenseType"] = {
-            "uri": "/dk/atira/pure/core/document/licenses/cc_by_nc"
-        }
+    # NOTE: repo_ev (a DoiElectronicVersion) no longer gets accessType /
+    # versionType / licenseType / embargoPeriod set here -- that metadata
+    # belongs on the FileElectronicVersion only (step 5f below).
 
     # --- 5c. Repository DOI & Handle (dc.identifier.uri) > always add ---
-    else:
+    if not repo_ev:
         uri_str = dspace_row.get("dc.identifier.uri", "").strip()
         if uri_str:
             dois = extract_dois_from_uri(uri_str)
@@ -2097,53 +2099,56 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             # Add repository DOI as electronic version (if starts with 10.13025)
             for doi in dois:
                 if doi.startswith("https://doi.org/10.13025") and doi not in existing_repo_dois:
-                    access_type = "EMBARGOED" if embargo_active else "OPEN"
-
-                    ev = build_electronic_version(
-                        doi=doi,
-                        version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                        access_type=access_type,
-                        license_type="CC_BY_NC"
-                    )
-
-                    if embargo_period and ev:
-                        ev["embargoPeriod"] = embargo_period
-
+                    ev = build_electronic_version(doi=doi)
                     if ev:
                         repo_ev = ev
                         break  # only one repo DOI expected
 
-
-    # --- 5d. Rights (dc.rights.uri) > overwrite for repo version ---
-    rights = dspace_row.get("dc.rights", "").strip()
-    if repo_ev:
-        repo_ev["licenseType"] = {"uri": resolve_license_uri(rights)}
-
-    # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others ---
+    # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others, then files ---
     final_evs = []
 
     # Add repository DOI first (if exists)
     if repo_ev:
         if "doi" in repo_ev and isinstance(repo_ev["doi"], str):
             repo_ev["doi"] = normalize_doi(repo_ev["doi"])
-        final_evs.append(repo_ev)
+        final_evs.append(strip_file_only_ev_fields(repo_ev))
 
     # Add publisher DOIs second
     for ev in existing_publisher_evs:
         if "doi" in ev and isinstance(ev["doi"], str):
             ev["doi"] = normalize_doi(ev["doi"])
-        final_evs.append(ev)
+        final_evs.append(strip_file_only_ev_fields(ev))
 
     if new_publisher_ev:
         if "doi" in new_publisher_ev and isinstance(new_publisher_ev["doi"], str):
             new_publisher_ev["doi"] = normalize_doi(new_publisher_ev["doi"])
-        final_evs.append(new_publisher_ev)
+        final_evs.append(strip_file_only_ev_fields(new_publisher_ev))
 
-    # Add other electronic versions last
+    # Add other electronic versions next
     for ev in existing_other_evs:
         if "doi" in ev and isinstance(ev["doi"], str):
             ev["doi"] = normalize_doi(ev["doi"])
-        final_evs.append(ev)
+        final_evs.append(strip_file_only_ev_fields(ev))
+
+    # --- 5f. File Electronic Version (access + licence + manuscript type) ---
+    # This is the only EV type these fields should ever be set on, and only
+    # when the record is genuinely linked to DSpace -- otherwise leave any
+    # existing file version completely untouched. Access is embargo-aware:
+    # open unless an active embargo says otherwise (licence/version-type are
+    # not embargo-dependent).
+    if record_has_dspace_link(pure_record, dspace_row):
+        for file_ev in existing_file_evs:
+            if embargo_active:
+                file_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
+                file_ev["embargoPeriod"] = embargo_period
+            else:
+                file_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
+                file_ev.pop("embargoPeriod", None)
+            file_ev["licenseType"] = {"uri": "/dk/atira/pure/core/document/licenses/cc_by"}
+            file_ev["versionType"] = {
+                "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
+            }
+    final_evs.extend(existing_file_evs)
 
     # Only update if changed
     if final_evs != existing_evs:
@@ -2624,25 +2629,15 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
         dois = extract_dois_from_uri(uri_str)
         
         # Add repository DOI first
+        # NOTE: a brand-new Pure record has no deposited file yet, so there is
+        # no FileElectronicVersion to apply access/licence/version-type to --
+        # this DOI electronic version correctly gets none of that metadata.
         for doi in dois:
             doi = normalize_doi(doi)
             if doi.startswith("https://doi.org/10.13025"):
-                access_type = "EMBARGOED" if embargo_active else "OPEN"
-
-                ev = build_electronic_version(
-                    doi=doi,
-                    version_type_uri="/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type=access_type,
-                    license_type="CC_BY_NC"
-                )
-
-                if embargo_period and ev:
-                    ev["embargoPeriod"] = embargo_period
-                
+                ev = build_electronic_version(doi=doi)
                 if ev:
-                    # Apply rights if specified
-                    ev["licenseType"] = {"uri": resolve_license_uri(dspace_row.get("dc.rights", ""))}
-                    electronic_versions.append(ev)
+                    electronic_versions.append(strip_file_only_ev_fields(ev))
                     break  # only one repo DOI expected
     
     # Second, add publisher DOI
@@ -2653,25 +2648,13 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
             # Treat as repo DOI if not already added
             already_added = any("10.13025" in ev.get("doi", "") for ev in electronic_versions)
             if not already_added:
-                access_type = "EMBARGOED" if embargo_active else "OPEN"
-                ev = build_electronic_version(
-                    publisher_doi,
-                    "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion",
-                    access_type=access_type,
-                    license_type="CC_BY_NC"
-                )
-                if embargo_period and ev:
-                    ev["embargoPeriod"] = embargo_period
+                ev = build_electronic_version(doi=publisher_doi)
                 if ev:
-                    ev["licenseType"] = {"uri": resolve_license_uri(dspace_row.get("dc.rights", ""))}
-                    electronic_versions.insert(0, ev)
+                    electronic_versions.insert(0, strip_file_only_ev_fields(ev))
         else:
-            ev = build_electronic_version(
-                publisher_doi,
-                "/dk/atira/pure/researchoutput/electronicversion/versiontype/publishersversion"
-            )
+            ev = build_electronic_version(publisher_doi)
             if ev:
-                electronic_versions.append(ev)
+                electronic_versions.append(strip_file_only_ev_fields(ev))
     
     # Set electronic versions on record (DOIs)
     if electronic_versions:
