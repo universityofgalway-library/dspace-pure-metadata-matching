@@ -143,17 +143,18 @@ When multiple Pure records match, the best is selected by: visibility (FREE/CAMP
 | `dc.contributor.funder` | `fundingDetails` | Add new funders |
 | `dc.date.issued` | `publicationStatuses[0].publicationDate` | Fill if blank |
 | `dc.identifier.doi` | `electronicVersions` (publisher version) | Add if missing |
-| `dc.identifier.uri` (DOI `10.13025/*`) | `electronicVersions` (repository version) | Add if missing |
+| `dc.identifier.uri` (DOI `10.13025/*`) | `electronicVersions` (repository version) | Add if missing; access/licence/version-type always set — see [Electronic Versions & Links](#electronic-versions--links) |
 | `dc.identifier.uri` (handle) | `links` | Set as repository handle link |
 | `dc.description.abstract` | `abstract` | Fill if blank |
 | `dc.description.sponsorship` | `fundingText` | Fill if blank |
 | `dc.title` + `dc.title.subtitle` | `title` + `subTitle` | Fill if blank; subtitle stripped from title if embedded (see below) |
 | `dc.language.iso` | `language` | Fill if blank |
-| `dc.date.embargo` | `FileElectronicVersion.accessType` / `embargoPeriod` | Always overwrite — see [Electronic Versions & Links](#electronic-versions--links) |
+| `dc.date.embargo` | `accessType` / `embargoPeriod` on the repository electronic version | Always overwrite — see [Electronic Versions & Links](#electronic-versions--links) |
 | `dc.subject` | `keywordGroups` (free keywords) | Add new keywords; existing ones are preserved, not overwritten — see below |
 | `dc.publisher` | `publisher` | Fill if blank (BookAnthology, ContributionToBookAnthology, OtherContribution, WorkingPaper, NonTextual types only) |
 | `journal_uuid` | `journalAssociation.journal.uuid` | Fill if blank; if missing on journal/periodical types, record is downgraded to `OtherContribution` |
 | _(always)_ | `workflow.step` | Always set to `validated` on every output record |
+| _(always)_ | `accessType` on every electronic version | Mandatory field in Pure — always ensured to be present; see [Electronic Versions & Links](#electronic-versions--links) for exactly how per EV type |
 
 ### Subtitle Stripping
 
@@ -303,14 +304,18 @@ The following fields are hardcoded on all newly created records (unmatched DSpac
 
 ## Electronic Versions & Links
 
-Repository DOIs (`10.13025/*`) and publisher DOIs are added to `electronicVersions` as `DoiElectronicVersion` entries carrying only the DOI itself — no `licenseType`, `accessType`, or `versionType` is ever set on a DOI electronic version, nor on any other non-file electronic version. Those fields belong exclusively to the actual deposited file.
+`accessType` is a mandatory field on every Pure electronic version, and each type is treated differently depending on whether it's sourced from the DSpace repository:
 
-Any existing `FileElectronicVersion` on the record has its `accessType`, `licenseType`, and `versionType` set as follows, but **only when the record is linked to DSpace** (an `identifiers` entry with `idSource: "DSpace"`, present already or added this run via the `uuid` column):
+**Repository-sourced** — the repository DOI (`10.13025/*`) electronic version, and any `FileElectronicVersion` on a record that is linked to DSpace (an `identifiers` entry with `idSource: "DSpace"`, present already or added this run via the `uuid` column). Both get identical, always-overwritten treatment:
 - `accessType`: `open`, unless an active embargo is present (`dc.date.embargo` / `dc.description.embargo`), in which case `embargoed` with `embargoPeriod` set to the resolved end date.
 - `licenseType`: always `cc_by`.
 - `versionType`: always `authorsversion` ("Author accepted manuscript").
 
-A record with a `FileElectronicVersion` that is **not** DSpace-linked is left completely untouched — this guards against mutating file metadata on a Pure record that merely matched by title or DOI but wasn't actually sourced from DSpace.
+A repository DOI only ever exists because the institutional repository minted it for a DSpace item, so it's treated as repository-sourced unconditionally — no DSpace-link check is applied to it (unlike the file version, which needs one, since a file could exist on a record that merely matched by title or DOI).
+
+**Everything else** — publisher DOI electronic versions, any other non-file electronic version (e.g. a link-type version), and a `FileElectronicVersion` on a record that is **not** DSpace-linked. Pure's own metadata always takes precedence here:
+- `accessType`: left exactly as Pure already has it; only defaulted to `Unknown` (`/dk/atira/pure/core/openaccesspermission/unknown`) if missing entirely.
+- `licenseType`, `versionType`, `embargoPeriod`: never touched — left exactly as Pure already has them, whether present or absent. (For a brand new record being created for the first time, there's nothing to preserve, so these are simply left unset — only the `Unknown` accessType default applies.)
 
 Version order in the output: repository DOI → publisher DOIs → other → file versions.
 

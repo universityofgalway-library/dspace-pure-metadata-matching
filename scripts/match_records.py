@@ -32,7 +32,7 @@ OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
 DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_items_2026-09-16.csv"
-PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-21.json"
+PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-22.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_authors_temp_2026-09-17.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/temp_organizations_mapping_2026-09-16.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_temp_publishers_2026-09-16.json"
@@ -1260,12 +1260,15 @@ def build_electronic_version(doi, version_type_uri=None, access_type="UNKNOWN",
     Build electronic version object ONLY when a DOI exists.
     If no DOI is supplied, return None (Pure must not receive an electronicVersion entry).
 
-    A DoiElectronicVersion must never carry licence, openness status, or
-    manuscript-version metadata -- only the actual FileElectronicVersion does
-    (set directly in update_record_from_dspace, step 5f). version_type_uri,
-    access_type, license_type and embargo_end_date are kept as parameters
-    purely so every existing call site still works unchanged; they are
-    intentionally ignored.
+    A DoiElectronicVersion built here never carries licence, openness-status,
+    or manuscript-version metadata directly from this function -- callers
+    apply the correct treatment afterwards depending on whether the DOI is
+    repository-sourced (apply_repository_access_license_version) or not
+    (ensure_default_access_type only -- licence/version/embargo are left
+    exactly as Pure already has them for anything not repository-sourced).
+    version_type_uri, access_type, license_type and embargo_end_date are
+    kept as parameters purely so every existing call site still works
+    unchanged; they are intentionally ignored.
     """
     if not doi:
         return None
@@ -1276,14 +1279,45 @@ def build_electronic_version(doi, version_type_uri=None, access_type="UNKNOWN",
     }
 
 
-def strip_file_only_ev_fields(ev):
+DEFAULT_UNKNOWN_ACCESS_TYPE = {
+    "uri": "/dk/atira/pure/core/openaccesspermission/unknown",
+    "term": {"en_IE": "Unknown"}
+}
+
+
+def ensure_default_access_type(ev):
     """
-    Remove licence / openness-status / manuscript-type / embargo metadata from
-    a non-file electronic version (DOI or otherwise). These fields must only
-    ever live on a FileElectronicVersion.
+    accessType is a mandatory field on every Pure electronic version. For
+    anything not sourced from the DSpace repository (a publisher DOI, any
+    other DOI/link electronic version, or a FileElectronicVersion on a
+    record that isn't DSpace-linked), Pure's existing accessType always
+    takes precedence and is left untouched; a default of "Unknown" is only
+    filled in when accessType is missing entirely.
     """
-    for key in ("accessType", "licenseType", "versionType", "embargoPeriod"):
-        ev.pop(key, None)
+    if not ev.get("accessType"):
+        ev["accessType"] = dict(DEFAULT_UNKNOWN_ACCESS_TYPE)
+    return ev
+
+
+def apply_repository_access_license_version(ev, embargo_active, embargo_period):
+    """
+    Apply the repository's standard electronic-version metadata: access is
+    open unless an active embargo says otherwise, licence is always CC BY,
+    and version type is always "Author accepted manuscript". Used for both
+    the repository DoiElectronicVersion (10.13025) and any FileElectronicVersion
+    on a DSpace-linked record -- both are, by definition, sourced from the
+    institutional repository, so both get identical treatment.
+    """
+    if embargo_active:
+        ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
+        ev["embargoPeriod"] = embargo_period
+    else:
+        ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
+        ev.pop("embargoPeriod", None)
+    ev["licenseType"] = {"uri": "/dk/atira/pure/core/document/licenses/cc_by"}
+    ev["versionType"] = {
+        "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
+    }
     return ev
 
 
@@ -2107,47 +2141,53 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others, then files ---
     final_evs = []
 
-    # Add repository DOI first (if exists)
+    # Add repository DOI first (if exists). Rule 1: a 10.13025 DOI only ever
+    # exists because the institutional repository minted it for a DSpace
+    # item, so it's unconditionally repository-sourced -- access, licence,
+    # and version type are always set here, the same treatment a
+    # DSpace-linked FileElectronicVersion gets below (step 5f).
     if repo_ev:
         if "doi" in repo_ev and isinstance(repo_ev["doi"], str):
             repo_ev["doi"] = normalize_doi(repo_ev["doi"])
-        final_evs.append(strip_file_only_ev_fields(repo_ev))
+        apply_repository_access_license_version(repo_ev, embargo_active, embargo_period)
+        final_evs.append(repo_ev)
 
-    # Add publisher DOIs second
+    # Add publisher DOIs second. Rule 2: not repository-sourced, so licence,
+    # version type, and embargo are left exactly as Pure already has them --
+    # only accessType is touched, and only to default to "Unknown" if Pure
+    # doesn't already have a value.
     for ev in existing_publisher_evs:
         if "doi" in ev and isinstance(ev["doi"], str):
             ev["doi"] = normalize_doi(ev["doi"])
-        final_evs.append(strip_file_only_ev_fields(ev))
+        ensure_default_access_type(ev)
+        final_evs.append(ev)
 
     if new_publisher_ev:
         if "doi" in new_publisher_ev and isinstance(new_publisher_ev["doi"], str):
             new_publisher_ev["doi"] = normalize_doi(new_publisher_ev["doi"])
-        final_evs.append(strip_file_only_ev_fields(new_publisher_ev))
+        ensure_default_access_type(new_publisher_ev)
+        final_evs.append(new_publisher_ev)
 
-    # Add other electronic versions next
+    # Add other electronic versions next -- same rule 2 treatment as publisher DOIs.
     for ev in existing_other_evs:
         if "doi" in ev and isinstance(ev["doi"], str):
             ev["doi"] = normalize_doi(ev["doi"])
-        final_evs.append(strip_file_only_ev_fields(ev))
+        ensure_default_access_type(ev)
+        final_evs.append(ev)
 
     # --- 5f. File Electronic Version (access + licence + manuscript type) ---
-    # This is the only EV type these fields should ever be set on, and only
-    # when the record is genuinely linked to DSpace -- otherwise leave any
-    # existing file version completely untouched. Access is embargo-aware:
-    # open unless an active embargo says otherwise (licence/version-type are
-    # not embargo-dependent).
+    # DSpace-linked record: the file is repository-sourced, so it gets the
+    # same treatment as the repository DOI above (rule 1) -- access is
+    # embargo-aware, licence and version type are always set. Not
+    # DSpace-linked: rule 3 -- only ensure accessType is present (Pure's
+    # existing value always wins, defaulted to "Unknown" only if missing);
+    # licence/version-type/embargo are left exactly as Pure already has them.
     if record_has_dspace_link(pure_record, dspace_row):
         for file_ev in existing_file_evs:
-            if embargo_active:
-                file_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
-                file_ev["embargoPeriod"] = embargo_period
-            else:
-                file_ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
-                file_ev.pop("embargoPeriod", None)
-            file_ev["licenseType"] = {"uri": "/dk/atira/pure/core/document/licenses/cc_by"}
-            file_ev["versionType"] = {
-                "uri": "/dk/atira/pure/researchoutput/electronicversion/versiontype/authorsversion"
-            }
+            apply_repository_access_license_version(file_ev, embargo_active, embargo_period)
+    else:
+        for file_ev in existing_file_evs:
+            ensure_default_access_type(file_ev)
     final_evs.extend(existing_file_evs)
 
     # Only update if changed
@@ -2628,16 +2668,21 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
     if uri_str:
         dois = extract_dois_from_uri(uri_str)
         
-        # Add repository DOI first
-        # NOTE: a brand-new Pure record has no deposited file yet, so there is
-        # no FileElectronicVersion to apply access/licence/version-type to --
-        # this DOI electronic version correctly gets none of that metadata.
+        # Add repository DOI first. Rule 1: this DOI only ever exists because
+        # the institutional repository minted it for a DSpace item, so it's
+        # always repository-sourced -- access (embargo-aware), licence, and
+        # version type are always set, the same treatment a DSpace-linked
+        # FileElectronicVersion gets in update_record_from_dspace. A brand-new
+        # record has no deposited file yet, so there's no FileElectronicVersion
+        # to handle here.
         for doi in dois:
             doi = normalize_doi(doi)
             if doi.startswith("https://doi.org/10.13025"):
                 ev = build_electronic_version(doi=doi)
                 if ev:
-                    electronic_versions.append(strip_file_only_ev_fields(ev))
+                    electronic_versions.append(
+                        apply_repository_access_license_version(ev, embargo_active, embargo_period)
+                    )
                     break  # only one repo DOI expected
     
     # Second, add publisher DOI
@@ -2650,11 +2695,18 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
             if not already_added:
                 ev = build_electronic_version(doi=publisher_doi)
                 if ev:
-                    electronic_versions.insert(0, strip_file_only_ev_fields(ev))
+                    electronic_versions.insert(
+                        0, apply_repository_access_license_version(ev, embargo_active, embargo_period)
+                    )
         else:
+            # Rule 2: not repository-sourced. Since this is a brand new
+            # record there's no pre-existing Pure metadata to preserve, so
+            # accessType defaults straight to "Unknown"; licence/version
+            # type are left unset (build_electronic_version never adds them,
+            # and there's nothing to strip on a freshly built dict).
             ev = build_electronic_version(publisher_doi)
             if ev:
-                electronic_versions.append(strip_file_only_ev_fields(ev))
+                electronic_versions.append(ensure_default_access_type(ev))
     
     # Set electronic versions on record (DOIs)
     if electronic_versions:
