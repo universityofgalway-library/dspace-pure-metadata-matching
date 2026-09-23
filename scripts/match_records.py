@@ -1284,6 +1284,8 @@ DEFAULT_UNKNOWN_ACCESS_TYPE = {
     "term": {"en_IE": "Unknown"}
 }
 
+EMBARGOED_ACCESS_TYPE_URI = "/dk/atira/pure/core/openaccesspermission/embargoed"
+
 
 def ensure_default_access_type(ev):
     """
@@ -1291,9 +1293,24 @@ def ensure_default_access_type(ev):
     anything not sourced from the DSpace repository (a publisher DOI, any
     other DOI/link electronic version, or a FileElectronicVersion on a
     record that isn't DSpace-linked), Pure's existing accessType always
-    takes precedence and is left untouched; a default of "Unknown" is only
-    filled in when accessType is missing entirely.
+    takes precedence and is left untouched -- with one exception forced by
+    Pure's own validation, not by us: if the EV already has an embargoPeriod
+    set, Pure requires accessType to be "Embargoed", full stop, even once
+    the embargo end date has passed (Pure's own error message: "Correct
+    this by changing 'Public access to file' to 'Embargoed' even if the
+    embargo end date has passed. The file will then be publicly available
+    and classified as Open Access."). A record with an embargoPeriod but a
+    missing or non-"Embargoed" accessType is rejected outright by Pure with
+    validation.accessextensionembargo.embargodateswhennotembargoed -- so
+    that combination is corrected here rather than left as Pure finds it.
+    embargoPeriod itself is never touched or cleared by this function.
+
+    A default of "Unknown" is filled in only when accessType is missing
+    and there's no embargoPeriod present to force "Embargoed" instead.
     """
+    if ev.get("embargoPeriod") and (ev.get("accessType") or {}).get("uri") != EMBARGOED_ACCESS_TYPE_URI:
+        ev["accessType"] = {"uri": EMBARGOED_ACCESS_TYPE_URI}
+        return ev
     if not ev.get("accessType"):
         ev["accessType"] = dict(DEFAULT_UNKNOWN_ACCESS_TYPE)
     return ev
@@ -1307,9 +1324,14 @@ def apply_repository_access_license_version(ev, embargo_active, embargo_period):
     the repository DoiElectronicVersion (10.13025) and any FileElectronicVersion
     on a DSpace-linked record -- both are, by definition, sourced from the
     institutional repository, so both get identical treatment.
+
+    accessType and embargoPeriod are always set together here (Embargoed +
+    a period, or Open + no period at all), so this can never itself produce
+    the accessType/embargoPeriod mismatch that ensure_default_access_type
+    guards against for everything else.
     """
     if embargo_active:
-        ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/embargoed"}
+        ev["accessType"] = {"uri": EMBARGOED_ACCESS_TYPE_URI}
         ev["embargoPeriod"] = embargo_period
     else:
         ev["accessType"] = {"uri": "/dk/atira/pure/core/openaccesspermission/open"}
