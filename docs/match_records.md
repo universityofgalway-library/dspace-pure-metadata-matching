@@ -51,6 +51,7 @@ PURE_JSON                 = "./pure_data/research-outputs.json"
 PERSON_MAPPING_JSON       = "./mappings/persons.json"
 ORGANIZATION_MAPPING_JSON = "./mappings/organizations.json"
 PUBLISHER_MAPPING_JSON    = "./pure_entities/pure_publishers.json"
+JOURNAL_MAPPING_JSON      = "./pure_entities/pure_journals.json"
 OUTPUT_DIR                = f"./record_matching/prod_all_output_{TODAY}"
 ```
 
@@ -79,6 +80,7 @@ The org config file is required and must be a JSON object with the following key
 | `PERSON_MAPPING_JSON` | JSON array | Author name → Pure person UUID mappings |
 | `ORGANIZATION_MAPPING_JSON` | JSON array | Org name → Pure org UUID mappings |
 | `PUBLISHER_MAPPING_JSON` | JSON array | Publisher name → Pure publisher UUID mappings |
+| `JOURNAL_MAPPING_JSON` | JSON array | Pure's full journal dump (each entry has a `uuid`) — used to validate `journal_uuid` from the DSpace CSV, not to look one up by name |
 
 ### Required DSpace CSV Columns
 
@@ -102,7 +104,7 @@ The org config file is required and must be a JSON object with the following key
 | `dc.language.iso` | ISO 639-3 language code (e.g. `eng`, `gle`) |
 | `dc.publisher` | Publisher name — matched against `PUBLISHER_MAPPING_JSON` for applicable record types |
 | `dc.type` | Resource type (e.g. `journal article`, `book`) |
-| `journal_uuid` | Pure journal UUID (required for journal contributions) |
+| `journal_uuid` | Pure journal UUID (required for journal contributions) — validated against `JOURNAL_MAPPING_JSON`; see [Journal Matching](#journal-matching) |
 | `dc.subject` | Semicolon-separated free-text keywords (optional) — added as a free-keywords group; see [Subject Keywords](#subject-keywords) |
 | `pdf_handle_paths` | Semicolon-separated PDF paths (optional). Only used to clean up HTML-entity-encoded filenames for logging — see [Filename Cleaning](#filename-cleaning); does not otherwise affect matching or field updates. |
 
@@ -152,7 +154,7 @@ When multiple Pure records match, the best is selected by: visibility (FREE/CAMP
 | `dc.date.embargo` | `accessType` / `embargoPeriod` on the repository electronic version | Always overwrite — see [Electronic Versions & Links](#electronic-versions--links) |
 | `dc.subject` | `keywordGroups` (free keywords) | Add new keywords; existing ones are preserved, not overwritten — see below |
 | `dc.publisher` | `publisher` | Fill if blank (BookAnthology, ContributionToBookAnthology, OtherContribution, WorkingPaper, NonTextual types only) |
-| `journal_uuid` | `journalAssociation.journal.uuid` | Fill if blank; if missing on journal/periodical types, record is downgraded to `OtherContribution` |
+| `journal_uuid` | `journalAssociation.journal.uuid` | Fill if blank and the UUID is found in `JOURNAL_MAPPING_JSON` — see [Journal Matching](#journal-matching) for exactly what happens when it isn't |
 | _(always)_ | `workflow.step` | Always set to `validated` on every output record |
 | _(always)_ | `accessType` on every electronic version | Mandatory field in Pure — always ensured to be present; see [Electronic Versions & Links](#electronic-versions--links) for exactly how per EV type |
 
@@ -338,6 +340,22 @@ DSpace-exported filenames in `pdf_handle_paths` can be HTML-entity-encoded (e.g.
 ## Publisher Matching
 
 `dc.publisher` is looked up against `PUBLISHER_MAPPING_JSON` and set on the `publisher` field for records of type `BookAnthology`, `ContributionToBookAnthology`, `OtherContribution`, `WorkingPaper`, and `NonTextual`. Unmatched publisher names are written to `unmatched_publishers_YYYY-MM-DD.csv`.
+
+---
+
+## Journal Matching
+
+`journal_uuid` (from the DSpace CSV) is checked against `JOURNAL_MAPPING_JSON` — Pure's own journal dump — before being trusted, rather than being submitted as-is. A UUID that doesn't actually correspond to one of Pure's existing journals (stale, mistyped, or from a since-merged/deleted journal) would otherwise be sent to Pure and rejected outright with a "Referenced content ... not found" error, the same class of failure as a dangling `ExternalPerson` reference.
+
+- **UUID found in `JOURNAL_MAPPING_JSON`** → used as-is.
+- **UUID present but not found** → treated exactly the same as no UUID at all.
+- **No UUID at all** → unchanged from before.
+
+What "treated as no UUID" means differs by whether the record is being created or updated:
+- **New record** (`ContributionToJournal`/`ContributionToPeriodical` with no usable `journal_uuid`): downgraded to `OtherContribution`.
+- **Existing matched record**: if it already has a `journalAssociation`, it's left as-is; if it doesn't, only a warning is printed — the record's type is not changed.
+
+`JOURNAL_MAPPING_JSON` is loaded the same way as `PUBLISHER_MAPPING_JSON` — with no fallback if it's missing or invalid, so the file must exist and be readable, or the script stops at startup. (The validation itself is written to degrade gracefully — passing no mapping trusts any `journal_uuid` as-is, the pre-existing behaviour — but `main()` always loads the file, so in practice it's required for a normal run.)
 
 ---
 

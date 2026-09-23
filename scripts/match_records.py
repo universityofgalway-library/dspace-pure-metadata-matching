@@ -36,6 +36,7 @@ PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-22.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_authors_temp_2026-09-17.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/temp_organizations_mapping_2026-09-16.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_temp_publishers_2026-09-16.json"
+JOURNAL_MAPPING_JSON = "./pure_entities/pure_journals_2026-04-23.json"
 OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -621,7 +622,7 @@ def get_default_peer_review_status(type_discriminator):
     return type_discriminator in typically_peer_reviewed
 
 
-def add_type_specific_fields(record, dspace_row):
+def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None):
     """Add type-specific required fields based on typeDiscriminator"""
     type_disc = record["typeDiscriminator"]
     
@@ -632,7 +633,15 @@ def add_type_specific_fields(record, dspace_row):
     if type_disc == "ContributionToJournal" or type_disc == "ContributionToPeriodical":
         # Try to get journal UUID from DSpace row
         journal_uuid = dspace_row.get("journal_uuid", "").strip()
-        
+
+        # If we have a journal mapping to check against, a UUID that isn't
+        # one of Pure's actual journals is treated the same as no UUID at
+        # all -- it falls through to the type-change logic below rather
+        # than being submitted as-is and rejected by Pure.
+        if journal_uuid and valid_journal_uuids is not None and journal_uuid not in valid_journal_uuids:
+            print(f"    ⚠️ journal_uuid {journal_uuid} not found in JOURNAL_MAPPING_JSON for {type_disc} - treating as missing")
+            journal_uuid = ""
+
         if journal_uuid:
             record["journalAssociation"] = {
                 "journal": {
@@ -1764,6 +1773,19 @@ def build_publisher_name_index(publisher_mapping):
     return pub_index
 
 
+def build_journal_uuid_index(journal_mapping):
+    """
+    Build a set of valid Pure journal UUIDs for O(1) membership checks.
+    Used to validate a DSpace-supplied journal_uuid before trusting it --
+    a UUID that isn't actually one of Pure's existing journals (stale,
+    typo'd, or from a since-merged/deleted journal) would otherwise be
+    submitted as-is and rejected by Pure with a "Referenced content ...
+    not found" error, the same class of failure as a dangling ExternalPerson
+    reference.
+    """
+    return {j.get("uuid") for j in journal_mapping if j.get("uuid")}
+
+
 def find_publisher_match(publisher_name, pub_index):
     """Find matching publisher using pre-built index"""
     if not publisher_name:
@@ -1820,7 +1842,7 @@ def append_record_to_file(filepath, new_record):
 
 # --- UPDATING RECORDS ---
 
-def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, pub_index=None, override_mode=False):
+def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, pub_index=None, journal_index=None, override_mode=False):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -2342,7 +2364,14 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     if type_disc in ["ContributionToJournal", "ContributionToPeriodical"]:
         journal_uuid = dspace_row.get("journal_uuid", "").strip()
         existing_journal = pure_record.get("journalAssociation", {}).get("journal", {}).get("uuid")
-        
+
+        # A UUID that isn't one of Pure's actual journals is treated the
+        # same as no UUID at all -- see add_type_specific_fields for the
+        # equivalent check on newly created records.
+        if journal_uuid and journal_index is not None and journal_uuid not in journal_index:
+            print(f"    ⚠️ journal_uuid {journal_uuid} not found in JOURNAL_MAPPING_JSON for {type_disc} - treating as missing")
+            journal_uuid = ""
+
         # Add journal if we have a UUID and (no existing journal)
         if journal_uuid and (not existing_journal):
             updated_record["journalAssociation"] = {
@@ -2433,7 +2462,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
 # --- CREATING RECORDS ---
 
-def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index=None):
+def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index=None, journal_index=None):
     """Create new Pure record from DSpace row"""
     
     record = {
@@ -2485,7 +2514,7 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
     record["typeDiscriminator"] = pure_type_map.get(pure_type_key, "OtherContribution")
 
     # Add type-specific required fields
-    record = add_type_specific_fields(record, dspace_row)
+    record = add_type_specific_fields(record, dspace_row, journal_index)
 
     # Re-derive pure_type_key AFTER add_type_specific_fields, in case type was downgraded
     pure_type_key = get_pure_type_key(record["type"]["uri"])
@@ -2820,6 +2849,11 @@ def main():
         publisher_mapping = json.load(f)
     print(f"✅ Loaded {len(publisher_mapping)} publisher records from {PUBLISHER_MAPPING_JSON}")
 
+    print("Loading Journal Mapping...")
+    with open(JOURNAL_MAPPING_JSON, 'r', encoding='utf-8') as f:
+        journal_mapping = json.load(f)
+    print(f"✅ Loaded {len(journal_mapping)} journal records from {JOURNAL_MAPPING_JSON}")
+
     # Build indices
     print("\n🔨 Building lookup indices...")
     person_index = build_person_name_index(person_mapping)
@@ -2834,6 +2868,9 @@ def main():
 
     pub_index = build_publisher_name_index(publisher_mapping)
     print(f"✅ Built publisher name index with {len(pub_index)} entries")
+
+    journal_index = build_journal_uuid_index(journal_mapping)
+    print(f"✅ Built journal UUID index with {len(journal_index)} entries")
 
 
     # Prepare logs
@@ -3033,7 +3070,7 @@ def main():
             try:
                 updated_record, success = update_record_from_dspace(
                     record, row, person_index, org_index, log_entry,
-                    before_update_records, pub_index, override_mode=OVERRIDE_MODE
+                    before_update_records, pub_index, journal_index=journal_index, override_mode=OVERRIDE_MODE
                 )
                 log_entry["success"] = success
                 if success:
@@ -3050,7 +3087,7 @@ def main():
         else:
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
-                new_record = create_new_record_from_dspace(row, person_index, org_index, pub_index)
+                new_record = create_new_record_from_dspace(row, person_index, org_index, pub_index, journal_index=journal_index)
                 
                 # Skip record if no contributors were matched
                 if new_record is None:
