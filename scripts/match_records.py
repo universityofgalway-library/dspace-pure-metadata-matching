@@ -126,13 +126,12 @@ SYSTEM_FIELDS = {
     "createdDate",
     "modifiedBy",
     "modifiedDate",
+    "portalUrl",
     "prettyUrlIdentifiers",
     "version",
     "pureId",
-    "portalUrl",
 	"systemName",
 	"uuid", 
-	"version", 
 	"previousUuids"
 }
 
@@ -241,6 +240,7 @@ _org_validation_cache = {}
 _unmatched_contributors = []
 _unmatched_funders = []
 _unmatched_publishers = []
+_unmatched_journals = []
 
 # --- LOGGER SETUP --- #
 
@@ -744,7 +744,7 @@ def get_default_peer_review_status(type_discriminator):
     return type_discriminator in typically_peer_reviewed
 
 
-def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None):
+def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None, journal_lookup=None, log_entry=None, journal_diagnostics=None):
     """Add type-specific required fields based on typeDiscriminator"""
     type_disc = record["typeDiscriminator"]
     
@@ -753,16 +753,15 @@ def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None):
         record["peerReview"] = get_default_peer_review_status(type_disc)
         
     if type_disc == "ContributionToJournal" or type_disc == "ContributionToPeriodical":
-        # Try to get journal UUID from DSpace row
-        journal_uuid = dspace_row.get("journal_uuid", "").strip()
-
-        # If we have a journal mapping to check against, a UUID that isn't
-        # one of Pure's actual journals is treated the same as no UUID at
-        # all -- it falls through to the type-change logic below rather
-        # than being submitted as-is and rejected by Pure.
-        if journal_uuid and valid_journal_uuids is not None and journal_uuid not in valid_journal_uuids:
-            print(f"    ⚠️ journal_uuid {journal_uuid} not found in JOURNAL_MAPPING_JSON for {type_disc} - treating as missing")
-            journal_uuid = ""
+        # Journal: journal_uuid -> ISSN -> title (see resolve_journal_uuid);
+        # if none is found the record is downgraded to OtherContribution below.
+        journal_uuid, journal_source, journal_candidates = resolve_journal_uuid(
+            dspace_row, type_disc, valid_journal_uuids, journal_lookup, journal_diagnostics
+        )
+        if journal_source in ("ISSN", "title") and log_entry is not None:
+            log_entry["journalMatchedBy"] = journal_source
+            if journal_candidates:
+                log_entry["journalCandidates"] = journal_candidates
 
         if journal_uuid:
             record["journalAssociation"] = {
@@ -781,6 +780,8 @@ def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None):
                  
             # No journal UUID found - change to OtherContribution
             print(f"    ⚠️ No journal UUID found for {type_disc} - changing to OtherContribution")
+            if log_entry is not None:
+                log_entry["typeChangedToOther"] = f"No journal found for {type_disc}"
             record["typeDiscriminator"] = "OtherContribution"
             record["type"]["uri"] = "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other"
             record["peerReview"] = False
@@ -1927,6 +1928,307 @@ def build_journal_uuid_index(journal_mapping):
     return {j.get("uuid") for j in journal_mapping if j.get("uuid")}
 
 
+# An ISSN: 4 digits, optional hyphen, 3 digits + check character (digit or X),
+# not part of a longer run of digits.
+_ISSN_PATTERN = re.compile(r"(?<![0-9Xx])(\d{4})-?(\d{3}[\dXx])(?![0-9Xx])")
+
+
+def _issn_check_digit_ok(eight_chars):
+    """ISSN mod-11 check digit. Filters out ISSN-shaped noise such as page ranges ("1690-1697")."""
+    digits = eight_chars.upper()
+    total = sum(int(c) * w for c, w in zip(digits[:7], range(8, 1, -1)))
+    check = (11 - total % 11) % 11
+    return digits[7] == ("X" if check == 10 else str(check))
+
+
+def extract_issns(value, require_valid_check_digit=True):
+    """
+    Return the unique ISSNs in a free-text field, normalised to "NNNN-NNNC"
+    (upper-case X), in their original order. Handles "a,b", "a ; b",
+    "a; b" and ISSNs written without a hyphen.
+    """
+    result = []
+    for first, second in _ISSN_PATTERN.findall(value or ""):
+        if require_valid_check_digit and not _issn_check_digit_ok(first + second):
+            continue
+        issn = f"{first}-{second.upper()}"
+        if issn not in result:
+            result.append(issn)
+    return result
+
+
+def normalize_journal_title(title):
+    """
+    Comparison key for a journal title: Unicode-normalised, lowercased, "&"
+    counted as "and", every punctuation character replaced by a space,
+    whitespace collapsed. Accents are kept as they are.
+    E.g. "Stem Cell Research & Therapy" -> "stem cell research and therapy".
+    """
+    if not isinstance(title, str):
+        return ""
+    title = unicodedata.normalize("NFKC", title).lower().replace("&", " and ")
+    title = "".join(" " if unicodedata.category(ch).startswith("P") else ch for ch in title)
+    return " ".join(title.split())
+
+
+# Small words ignored when comparing an abbreviated title with a full one.
+_TITLE_STOPWORDS = {"of", "and", "the", "a", "an", "for", "in", "on", "de", "la", "le", "du"}
+
+
+def _is_abbreviation_of(title_a, title_b):
+    """
+    True if one title is an abbreviation of the other, word by word
+    ("J. Civ. Struct. Health Monit." / "Journal of Civil Structural Health
+    Monitoring"): at least one title contains a ".", both have the same number
+    of words once small words are dropped, and each word is the start of the
+    corresponding word in the other title.
+    """
+    if "." not in title_a and "." not in title_b:
+        return False
+    words_a = [w for w in normalize_journal_title(title_a).split() if w not in _TITLE_STOPWORDS]
+    words_b = [w for w in normalize_journal_title(title_b).split() if w not in _TITLE_STOPWORDS]
+    return (
+        len(words_a) == len(words_b) > 0
+        and all(a.startswith(b) or b.startswith(a) for a, b in zip(words_a, words_b))
+    )
+
+
+def are_title_spelling_variants(title_a, title_b):
+    """
+    True if two journal titles are spelling variants of one title: after
+    lowercasing, "&" -> "and", dropping "(...)" qualifiers such as
+    "(Switzerland)" and removing punctuation and spaces, they contain the same
+    numbers and are at least 95% similar -- or one is a word-by-word
+    abbreviation of the other. Numbers must match, so "Ethnomusicology
+    Ireland 9" and "... 10" are NOT variants.
+    """
+    key_a = normalize_journal_title(re.sub(r"\([^)]*\)", " ", title_a or "")).replace(" ", "")
+    key_b = normalize_journal_title(re.sub(r"\([^)]*\)", " ", title_b or "")).replace(" ", "")
+    if not key_a or not key_b:
+        return False
+    if re.findall(r"\d+", key_a) != re.findall(r"\d+", key_b):
+        return False
+    return fuzz.ratio(key_a, key_b) >= 95 or _is_abbreviation_of(title_a, title_b)
+
+
+def _pure_journal_titles(journal):
+    """
+    All title strings of a Pure journal, from "titles" and
+    "additionalSearchableTitles". Accepted entry shapes: "text",
+    {"title": "text"}, {"title": {"value": "text"}},
+    {"title": {"<locale>": "text", ...}} and {"value": "text"}.
+    Anything else is ignored.
+    """
+    titles = []
+    for field in ("titles", "additionalSearchableTitles"):
+        for entry in journal.get(field) or []:
+            if isinstance(entry, str):
+                candidates = [entry]
+            elif isinstance(entry, dict):
+                value = entry.get("title", entry.get("value"))
+                if isinstance(value, str):
+                    candidates = [value]
+                elif isinstance(value, dict):
+                    if isinstance(value.get("value"), str):
+                        candidates = [value["value"]]
+                    else:
+                        candidates = [v for v in value.values() if isinstance(v, str)]
+                else:
+                    candidates = []
+            else:
+                candidates = []
+            for title in candidates:
+                if title.strip() and title not in titles:
+                    titles.append(title)
+    return titles
+
+
+def _pure_journal_issns(journal):
+    """All ISSNs of a Pure journal, from both "issns" and "additionalSearchableIssns"."""
+    issns = []
+    for field in ("issns", "additionalSearchableIssns"):
+        for entry in journal.get(field) or []:
+            value = entry.get("issn") if isinstance(entry, dict) else entry
+            if isinstance(value, dict):
+                value = value.get("value")
+            for issn in extract_issns(value if isinstance(value, str) else "", require_valid_check_digit=False):
+                if issn not in issns:
+                    issns.append(issn)
+    return issns
+
+
+def _journal_metadata_richness(journal):
+    """Number of non-empty top-level fields, excluding system fields (SYSTEM_FIELDS)."""
+    return sum(
+        1 for key, value in journal.items()
+        if key not in SYSTEM_FIELDS and value not in (None, "", [], {})
+    )
+
+
+def build_journal_lookup(journal_mapping):
+    """
+    Build ISSN and title lookups from the Pure journals JSON.
+
+    Returns a dict:
+      "by_issn":   ISSN (NNNN-NNNC) -> [journal UUIDs]  (issns + additionalSearchableIssns)
+      "by_title":  normalised title  -> [journal UUIDs]  (titles + additionalSearchableTitles)
+      "titles":    journal UUID -> its title strings
+      "richness":  journal UUID -> number of non-empty non-system fields
+      "order":     journal UUID -> position in the JSON (final tie-break)
+    """
+    lookup = {"by_issn": defaultdict(list), "by_title": defaultdict(list), "titles": {}, "richness": {}, "order": {}}
+    for position, journal in enumerate(journal_mapping or []):
+        if not isinstance(journal, dict):
+            continue
+        uuid = journal.get("uuid")
+        if not uuid or uuid in lookup["order"]:
+            continue
+        lookup["order"][uuid] = position
+        lookup["richness"][uuid] = _journal_metadata_richness(journal)
+        for issn in _pure_journal_issns(journal):
+            lookup["by_issn"][issn].append(uuid)
+        lookup["titles"][uuid] = _pure_journal_titles(journal)
+        for title in lookup["titles"][uuid]:
+            key = normalize_journal_title(title)
+            if key and uuid not in lookup["by_title"][key]:
+                lookup["by_title"][key].append(uuid)
+    return lookup
+
+
+def _pick_richest_journal(candidates, journal_lookup):
+    """Journal with the most filled metadata fields (system fields excluded); ties -> first in the JSON."""
+    return sorted(
+        candidates,
+        key=lambda u: (-journal_lookup["richness"].get(u, 0), journal_lookup["order"].get(u, 0)),
+    )[0]
+
+
+def _group_journals_by_title_variant(candidates, journal_lookup):
+    """
+    Group journals whose titles are spelling variants of each other (any
+    title of one is a variant of any title of the other; grouping is
+    transitive). One group = all candidates are the same journal.
+    """
+    groups = []
+    for uuid in candidates:
+        own_titles = journal_lookup["titles"].get(uuid, [])
+        linked = [
+            group for group in groups
+            if any(
+                are_title_spelling_variants(a, b)
+                for other in group for a in journal_lookup["titles"].get(other, []) for b in own_titles
+            )
+        ]
+        merged = [uuid] + [u for group in linked for u in group]
+        groups = [group for group in groups if group not in linked] + [merged]
+    return groups
+
+
+def resolve_journal_uuid(dspace_row, type_disc, valid_journal_uuids=None, journal_lookup=None, diagnostics=None):
+    """
+    Find the Pure journal for a DSpace row. Returns (journal_uuid, source, candidates):
+    source is "journal_uuid", "ISSN", "title" or None; candidates lists every
+    journal that qualified when there was more than one (else []).
+
+    1. journal_uuid column -- used if (when the journals JSON is loaded) it is
+       one of Pure's journals.
+    2. ISSNs from journal_issn and dc.identifier.issn (both multi-valued;
+       dc.identifier.issn values must pass the ISSN check digit) against every
+       ISSN of every Pure journal (issns + additionalSearchableIssns). All
+       matching journals must be the same journal (titles are spelling
+       variants of each other -- duplicate records); the one with most
+       metadata is used. If they have genuinely different titles, the ISSN
+       result is not used and step 3 decides.
+    3. Titles from dc.identifier.journal and journal_title against every Pure
+       journal title (titles + additionalSearchableTitles; lowercased,
+       punctuation stripped, "&" = "and"). If several journals match, the one
+       with most metadata wins.
+    4. Nothing found -> ("", None, []); the caller decides what to do.
+
+    If a dict is passed as diagnostics, diagnostics["reason"] explains why
+    nothing was found.
+    """
+    journal_uuid = (dspace_row.get("journal_uuid") or "").strip()
+
+    # A UUID that isn't one of Pure's actual journals is treated the same as
+    # no UUID at all, rather than being submitted and rejected by Pure.
+    if journal_uuid and valid_journal_uuids is not None and journal_uuid not in valid_journal_uuids:
+        print(f"    ⚠️ journal_uuid {journal_uuid} not found in JOURNAL_MAPPING_JSON for {type_disc} - treating as missing")
+        journal_uuid = ""
+
+    if journal_uuid:
+        return journal_uuid, "journal_uuid", []
+
+    if not journal_lookup:
+        return "", None, []
+
+    def usable(uuid):
+        return valid_journal_uuids is None or uuid in valid_journal_uuids
+
+    # 2. ISSN
+    issns = extract_issns(dspace_row.get("journal_issn", ""), require_valid_check_digit=False)
+    for issn in extract_issns(dspace_row.get("dc.identifier.issn", "")):
+        if issn not in issns:
+            issns.append(issn)
+    issn_candidates = []
+    for issn in issns:
+        for uuid in journal_lookup["by_issn"].get(issn, []):
+            if usable(uuid) and uuid not in issn_candidates:
+                issn_candidates.append(uuid)
+    if not issns:
+        issn_status = "no valid ISSN in DSpace"
+    elif not issn_candidates:
+        issn_status = "ISSN not found in Pure"
+    else:
+        groups = _group_journals_by_title_variant(issn_candidates, journal_lookup)
+        if len(groups) == 1:
+            chosen = _pick_richest_journal(issn_candidates, journal_lookup)
+            print(f"    ✅ Journal found by ISSN {issns}: {chosen}"
+                  + (f" (chosen from {len(issn_candidates)} records of the same journal)" if len(issn_candidates) > 1 else ""))
+            return chosen, "ISSN", (issn_candidates if len(issn_candidates) > 1 else [])
+        issn_status = "ISSN matches journals with different titles"
+        print(f"    ⚠️ ISSNs {issns} match {len(groups)} journals with different titles "
+              f"{[journal_lookup['titles'].get(g[0], [''])[0] for g in groups]} - trying title matching")
+
+    # 3. Title
+    titles = []
+    for field in ("dc.identifier.journal", "journal_title"):
+        for piece in _MULTI_VALUE_SEPARATOR.split(dspace_row.get(field, "") or ""):
+            key = normalize_journal_title(piece)
+            if key and key not in titles:
+                titles.append(key)
+    candidates = []
+    for key in titles:
+        for uuid in journal_lookup["by_title"].get(key, []):
+            if usable(uuid) and uuid not in candidates:
+                candidates.append(uuid)
+    if candidates:
+        chosen = _pick_richest_journal(candidates, journal_lookup)
+        print(f"    ✅ Journal found by title {titles}: {chosen}"
+              + (f" (chosen from {len(candidates)} candidates)" if len(candidates) > 1 else ""))
+        return chosen, "title", (candidates if len(candidates) > 1 else [])
+
+    if diagnostics is not None:
+        title_status = "no journal title in DSpace" if not titles else "title not found in Pure"
+        diagnostics["reason"] = f"{issn_status}; {title_status}"
+    return "", None, []
+
+
+def _unmatched_journal_entry(dspace_row, pure_uuid, reason):
+    """Row for unmatched_journals_<date>.csv."""
+    handles = extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))
+    return {
+        "handle": handles[0] if handles else None,
+        "title": dspace_row.get("dc.title", ""),
+        "dc.identifier.issn": dspace_row.get("dc.identifier.issn", ""),
+        "journal_issn": dspace_row.get("journal_issn", ""),
+        "dc.identifier.journal": dspace_row.get("dc.identifier.journal", ""),
+        "journal_title": dspace_row.get("journal_title", ""),
+        "reason": reason,
+        "pure_uuid": pure_uuid,
+    }
+
+
 def find_publisher_match(publisher_name, pub_index):
     """Find matching publisher using pre-built index"""
     if not publisher_name:
@@ -1983,7 +2285,7 @@ def append_record_to_file(filepath, new_record):
 
 # --- UPDATING RECORDS ---
 
-def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, pub_index=None, journal_index=None, override_mode=False):
+def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, log_entry, before_update_records, pub_index=None, journal_index=None, override_mode=False, journal_lookup=None):
     """
     Update pure_record with DSpace data according to precedence rules.
     Returns updated record and success flag.
@@ -2560,18 +2862,23 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     type_disc = pure_record.get("typeDiscriminator", "")
     
     if type_disc in ["ContributionToJournal", "ContributionToPeriodical"]:
-        journal_uuid = dspace_row.get("journal_uuid", "").strip()
         existing_journal = pure_record.get("journalAssociation", {}).get("journal", {}).get("uuid")
 
-        # A UUID that isn't one of Pure's actual journals is treated the
-        # same as no UUID at all -- see add_type_specific_fields for the
-        # equivalent check on newly created records.
-        if journal_uuid and journal_index is not None and journal_uuid not in journal_index:
-            print(f"    ⚠️ journal_uuid {journal_uuid} not found in JOURNAL_MAPPING_JSON for {type_disc} - treating as missing")
-            journal_uuid = ""
+        # Journal: journal_uuid -> ISSN -> title (see resolve_journal_uuid).
+        # Only looked up when Pure has no journal, since an existing one is kept.
+        journal_uuid, journal_source, journal_candidates = ("", None, [])
+        journal_diagnostics = {}
+        if not existing_journal:
+            journal_uuid, journal_source, journal_candidates = resolve_journal_uuid(
+                dspace_row, type_disc, journal_index, journal_lookup, journal_diagnostics
+            )
 
         # Add journal if we have a UUID and (no existing journal)
         if journal_uuid and (not existing_journal):
+            if journal_source in ("ISSN", "title"):
+                log_entry["journalMatchedBy"] = journal_source
+                if journal_candidates:
+                    log_entry["journalCandidates"] = journal_candidates
             updated_record["journalAssociation"] = {
                 "journal": {
                     "systemName": "Journal",
@@ -2583,6 +2890,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         elif not journal_uuid and not existing_journal:
             # No journal UUID in DSpace and no existing journal - this shouldn't be a journal contribution
             print(f"    ⚠️ No journal UUID found for {type_disc} - record may need type change")
+            _unmatched_journals.append(_unmatched_journal_entry(
+                dspace_row, pure_record.get("uuid"), journal_diagnostics.get("reason", "journal not found")
+            ))
 
     
     # --- 10. Identifiers — set DSpace UUID as PrimaryId ---
@@ -2660,7 +2970,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
 # --- CREATING RECORDS ---
 
-def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index=None, journal_index=None):
+def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index=None, journal_index=None, journal_lookup=None, log_entry=None):
     """Create new Pure record from DSpace row"""
     
     record = {
@@ -2712,7 +3022,13 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
     record["typeDiscriminator"] = pure_type_map.get(pure_type_key, "OtherContribution")
 
     # Add type-specific required fields
-    record = add_type_specific_fields(record, dspace_row, journal_index)
+    requested_type_disc = record["typeDiscriminator"]
+    journal_diagnostics = {}
+    record = add_type_specific_fields(record, dspace_row, journal_index, journal_lookup, log_entry, journal_diagnostics)
+    journal_downgraded = (
+        requested_type_disc in ("ContributionToJournal", "ContributionToPeriodical")
+        and record["typeDiscriminator"] == "OtherContribution"
+    )
 
     # Re-derive pure_type_key AFTER add_type_specific_fields, in case type was downgraded
     pure_type_key = get_pure_type_key(record["type"]["uri"])
@@ -2844,6 +3160,11 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
     if not final_contributors:
         print(f"❌ No matched contributors found for record {dspace_row.get('dc.title', '')} - skipping")
         return None
+
+    if journal_downgraded:
+        _unmatched_journals.append(_unmatched_journal_entry(
+            dspace_row, None, journal_diagnostics.get("reason", "journal not found")
+        ))
 
     # Validate and fix organizations BEFORE assigning to record
     print("  🔍 Validating organization UUIDs...")
@@ -3075,6 +3396,9 @@ def main():
     journal_index = build_journal_uuid_index(journal_mapping)
     print(f"✅ Built journal UUID index with {len(journal_index)} entries")
 
+    journal_lookup = build_journal_lookup(journal_mapping)
+    print(f"✅ Built journal lookup: {len(journal_lookup['by_issn'])} ISSNs, {len(journal_lookup['by_title'])} titles")
+
 
     # Prepare logs
     log_entries = []
@@ -3287,7 +3611,8 @@ def main():
             try:
                 updated_record, success = update_record_from_dspace(
                     record, row, person_index, org_index, log_entry,
-                    before_update_records, pub_index, journal_index=journal_index, override_mode=OVERRIDE_MODE
+                    before_update_records, pub_index, journal_index=journal_index, override_mode=OVERRIDE_MODE,
+                    journal_lookup=journal_lookup,
                 )
                 log_entry["success"] = success
                 if success:
@@ -3304,7 +3629,10 @@ def main():
         else:
             # Create new record — this is an UNMATCHED RESEARCH OUTPUT
             try:
-                new_record = create_new_record_from_dspace(row, person_index, org_index, pub_index, journal_index=journal_index)
+                new_record = create_new_record_from_dspace(
+                    row, person_index, org_index, pub_index, journal_index=journal_index,
+                    journal_lookup=journal_lookup, log_entry=log_entry,
+                )
                 
                 # Skip record if no contributors were matched
                 if new_record is None:
@@ -3387,6 +3715,18 @@ def main():
             writer.writeheader()
             writer.writerows(_unmatched_publishers)
         print(f"✅ Unmatched publishers saved to: {unmatched_publishers_csv}")
+
+    # Unmatched journals CSV
+    if _unmatched_journals:
+        unmatched_journals_csv = os.path.join(OUTPUT_DIR, f"unmatched_journals_{TODAY}.csv")
+        print(f"\n📝 Writing {len(_unmatched_journals)} unmatched journals to CSV...")
+        with open(unmatched_journals_csv, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['handle', 'title', 'dc.identifier.issn', 'journal_issn', 'dc.identifier.journal',
+                          'journal_title', 'reason', 'pure_uuid']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_unmatched_journals)
+        print(f"✅ Unmatched journals saved to: {unmatched_journals_csv}")
 
  
     # Count results
