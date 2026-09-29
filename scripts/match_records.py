@@ -1736,6 +1736,24 @@ def validate_and_fix_organizations(contributors, api_key, base_url, collect_exte
     return updated_contributors
 
 
+def remove_orphan_organizations(organizations, attached_uuids):
+    """
+    Split a record-level organisation list into (kept, removed_uuids).
+
+    An organisation is kept only if its UUID is attached to at least one
+    contributor (attached_uuids). Entries without a UUID are left untouched.
+    Order is kept.
+    """
+    kept, removed = [], []
+    for org in organizations or []:
+        uuid = org.get("uuid") if isinstance(org, dict) else None
+        if not uuid or uuid in attached_uuids:
+            kept.append(org)
+        else:
+            removed.append(uuid)
+    return kept, removed
+
+
 def resolve_managing_organization(first_internal_org_uuid):
     """
     Return the UUID to use as managingOrganization.
@@ -2092,6 +2110,41 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             "systemName": "Organization"
         }
         print(f"  ✅ Precedence: Set managingOrganization to: {managing_org_uuid}")
+
+    # --- 1b2. Remove orphan record-level organisations (internal and external) ---
+    # A record-level organisation is an orphan if no contributor on the record
+    # -- as it will be after this update -- has it attached. Internal
+    # organisations ("organizations") are checked against contributors'
+    # "organizations"; external ones ("externalOrganizations") against
+    # contributors' "externalOrganizations". managingOrganization is neither
+    # read nor changed here. Applies in both normal and override mode.
+    if "contributors" in updated_record:
+        effective_contributors = updated_record["contributors"]
+    else:
+        effective_contributors = [c for c in (pure_record.get("contributors") or []) if c]
+
+    attached_internal_uuids = set()
+    attached_external_uuids = set()
+    for contributor in effective_contributors:
+        if not isinstance(contributor, dict):
+            continue
+        for org in contributor.get("organizations") or []:
+            if isinstance(org, dict) and org.get("uuid"):
+                attached_internal_uuids.add(org["uuid"])
+        for org in contributor.get("externalOrganizations") or []:
+            if isinstance(org, dict) and org.get("uuid"):
+                attached_external_uuids.add(org["uuid"])
+
+    for field, attached_uuids, label in (
+        ("organizations", attached_internal_uuids, "organisation"),
+        ("externalOrganizations", attached_external_uuids, "external organisation"),
+    ):
+        current = updated_record[field] if field in updated_record else (pure_record.get(field) or [])
+        kept, removed = remove_orphan_organizations(current, attached_uuids)
+        if removed:
+            updated_record[field] = kept
+            log_entry.setdefault("removedOrphanOrganizations", {})[field] = removed
+            print(f"  🧹 Removed {len(removed)} orphan record-level {label}(s) not attached to any contributor: {removed}")
 
     # --- 1c. Remove author keyword group if all DSpace authors are now matched ---
     if final_contributors:
