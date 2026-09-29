@@ -32,11 +32,11 @@ OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
 # DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
 DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_items_2026-09-16.csv"
-PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-22.json"
+PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-23.json"
 PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_authors_temp_2026-09-17.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/temp_organizations_mapping_2026-09-16.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_temp_publishers_2026-09-16.json"
-JOURNAL_MAPPING_JSON = "./pure_entities/pure_journals_2026-04-23.json"
+JOURNAL_MAPPING_JSON = "./pure_entities/pure_temp_journals_2026-09-23.json"
 OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
@@ -314,6 +314,34 @@ def strip_system_fields(record):
 def fix_apostrophe(s):
     """Replace curly/curved apostrophe with a straight one."""
     return s.replace("\u2019", "'") if s else s
+
+
+# Characters used as an apostrophe in person names across the three name
+# sources (DSpace, Pure, and the deduplicated authors JSON). All of them are
+# treated as equivalent to the straight apostrophe (U+0027) when matching
+# contributor names -- e.g. O'Malley / O’Malley / OʼMalley are the same name.
+APOSTROPHE_VARIANTS = (
+    "\u2019",  # ’ right single quotation mark
+    "\u2018",  # ‘ left single quotation mark
+    "\u02bc",  # ʼ modifier letter apostrophe
+    "\u2032",  # ′ prime
+    "\u00b4",  # ´ acute accent
+)
+_APOSTROPHE_TRANSLATION = str.maketrans({c: "'" for c in APOSTROPHE_VARIANTS})
+
+
+def normalize_person_name(s):
+    """
+    Comparison key for a person-name part (first or last name): every
+    apostrophe variant in APOSTROPHE_VARIANTS becomes a straight apostrophe,
+    then the usual normalize() (strip + lowercase) is applied.
+
+    Used ONLY to build/look up matching keys. Names written to Pure are never
+    changed by this function.
+    """
+    if not s:
+        return ""
+    return normalize(s.translate(_APOSTROPHE_TRANSLATION))
 
 
 def clean_dspace_filename(filename: str) -> str:
@@ -721,12 +749,12 @@ def build_person_name_index(person_mapping):
         
         for af in all_firsts:
             for al in all_lasts:
-                key1 = (normalize(af), normalize(al))
+                key1 = (normalize_person_name(af), normalize_person_name(al))
                 if key1 not in person_index:
                     person_index[key1] = []
                 person_index[key1].append(person)
                 
-                key2 = (normalize(al), normalize(af))
+                key2 = (normalize_person_name(al), normalize_person_name(af))
                 if key2 not in person_index:
                     person_index[key2] = []
                 person_index[key2].append(person)
@@ -750,7 +778,7 @@ def find_person_match(person_name, person_index):
             first = person_name
             last = ""
     
-    key = (normalize(first), normalize(last))
+    key = (normalize_person_name(first), normalize_person_name(last))
     return person_index.get(key, [])
 
 
@@ -918,21 +946,23 @@ def parse_contributors_by_role(dspace_row):
     illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
 
     # Resolve author/editor overlap for the same name
-    author_set = {normalize(n) for n in authors}
-    editor_set = {normalize(n) for n in editors}
+    # Apostrophe-insensitive, so e.g. author "O'Malley, Mary" and editor
+    # "O’Malley, Mary" are recognised as the same person.
+    author_set = {normalize_person_name(n) for n in authors}
+    editor_set = {normalize_person_name(n) for n in editors}
     overlap = author_set & editor_set
 
     if overlap:
         if prefer_editor:
             # Remove overlapping names from authors, keep in editors
-            authors = [n for n in authors if normalize(n) not in overlap]
+            authors = [n for n in authors if normalize_person_name(n) not in overlap]
             print(f"  ℹ️ Duplicate author/editor names — keeping as editor for type '{dspace_type}': "
-                  f"{[n for n in editors if normalize(n) in overlap]}")
+                  f"{[n for n in editors if normalize_person_name(n) in overlap]}")
         else:
             # Remove overlapping names from editors, keep in authors
-            editors = [n for n in editors if normalize(n) not in overlap]
+            editors = [n for n in editors if normalize_person_name(n) not in overlap]
             print(f"  ℹ️ Duplicate author/editor names — keeping as author for type '{dspace_type}': "
-                  f"{[n for n in authors if normalize(n) in overlap]}")
+                  f"{[n for n in authors if normalize_person_name(n) in overlap]}")
 
     # Metadata correction: non-book type with editors but no authors
     # → those editors are almost certainly authors mislabelled in DSpace
@@ -1113,7 +1143,7 @@ def process_contributors(
             if l := name_obj.get("lastName", ""):
                 all_last_names.append(l)
         for pair in list(product(all_first_names, all_last_names)) + list(product(all_last_names, all_first_names)):
-            key = (normalize(pair[0].strip()), normalize(pair[1].strip()))
+            key = (normalize_person_name(pair[0].strip()), normalize_person_name(pair[1].strip()))
             existing_by_name[key] = contrib
         for ref_key in ("person", "externalPerson"):
             ref = contrib.get(ref_key)
@@ -1201,7 +1231,7 @@ def process_contributors(
 
             first = matched_person.get("firstName", "")
             last = matched_person.get("lastName", "")
-            name_key = (normalize(first), normalize(last))
+            name_key = (normalize_person_name(first), normalize_person_name(last))
 
             # Reuse existing contributor if present (skip when existing_contributors is empty,
             # i.e. for new records or override mode)
