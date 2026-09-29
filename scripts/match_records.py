@@ -53,7 +53,7 @@ ORG_CONFIG_PATH = (
 )
 
 try:
-    with open(ORG_CONFIG_PATH, 'r', encoding='utf-8') as f:
+    with open(ORG_CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
         _org_config = json.load(f)
 except FileNotFoundError:
     print(f"❌ ERROR: Organisation config file not found: {ORG_CONFIG_PATH}")
@@ -76,7 +76,9 @@ BASE_URL = (
     "https://research.universityofgalway.ie/ws/api/"
 )
 
-DOI_REGEX = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
+# Accepts: bare "10.xxx/..", doi.org or dx.doi.org URLs (http/https, and the
+# "https:/" single-slash typo), and "doi:", "DOI:", "DOI " or ":" prefixes.
+DOI_REGEX = re.compile(r'^(?:https?:/{1,2})?(?:(?:dx\.)?doi\.org/|doi\s*:?\s*|:)?(10\.\S+)$', re.IGNORECASE)
 HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
 
 PUNC = set('''—!–¿()-[]{};:'"''""‐\,<>./?@#$%^&=+|£€*_~®™©0123456789''')
@@ -573,7 +575,9 @@ def normalize_doi(value: str) -> str:
     if not match:
         return value  # not a valid DOI → leave unchanged
 
-    return f"https://doi.org/{match.group(1)}"
+    # Trailing full stops are citation punctuation, not part of the DOI
+    # (e.g. "10.1080/09503153.2017.1339786." -> "...1339786").
+    return f"https://doi.org/{match.group(1).rstrip('.')}"
 
 
 def normalize_handle(value: str) -> str:
@@ -599,7 +603,7 @@ def extract_dois_from_uri(uri_str):
         # Match DOI pattern
         match = DOI_REGEX.match(u)
         if match:
-            doi = f"https://doi.org/{match.group(1)}"
+            doi = f"https://doi.org/{match.group(1).rstrip('.')}"
             dois.append(doi)
     return dois
 
@@ -616,6 +620,76 @@ def extract_handles_from_uri(uri_str):
             handle = f"http://hdl.handle.net/{match.group(1)}"
             handles.append(handle)
     return handles
+
+
+# Separator between multiple values in one DSpace CSV cell (" ; "). At least
+# one side must be whitespace so a DOI that itself contains a bare ";" (SICI
+# DOIs such as "...3.0.CO;2-E") is never split.
+_MULTI_VALUE_SEPARATOR = re.compile(r"\s+;\s*|\s*;\s+")
+
+
+def is_valid_doi(value):
+    """True if value is a DOI already normalised by normalize_doi()."""
+    return isinstance(value, str) and value.startswith("https://doi.org/10.")
+
+
+def parse_doi_field(raw):
+    """
+    Split a (possibly multi-valued) dc.identifier.doi cell into DOIs.
+
+    Returns (dois, unrecognised):
+      dois          unique normalised DOIs, in their original order
+                    (e.g. "10.1/x ; 10.1/X" -> ["https://doi.org/10.1/x"])
+      unrecognised  pieces that are not DOIs (URLs to other sites, ISBNs, ...)
+    """
+    dois, unrecognised, seen = [], [], set()
+    if not raw:
+        return dois, unrecognised
+    for piece in _MULTI_VALUE_SEPARATOR.split(raw.strip()):
+        piece = piece.strip()
+        if not piece:
+            continue
+        normalized = normalize_doi(piece)
+        if is_valid_doi(normalized):
+            if normalized not in seen:
+                seen.add(normalized)
+                dois.append(normalized)
+        else:
+            unrecognised.append(piece)
+    return dois, unrecognised
+
+
+def _metadata_richness(obj):
+    """Number of fields with a non-empty value -- used to pick among duplicates."""
+    return sum(1 for v in obj.values() if v not in (None, "", [], {}))
+
+
+def dedupe_by_key(items, key_func, label):
+    """
+    Remove duplicates from a list of dicts that share the same key_func(item).
+
+    For each duplicate group the entry with the most populated fields is kept
+    (so Pure metadata such as accessType / licenseType / versionType or a link
+    description is never lost to an emptier copy); ties keep the earliest one.
+    The kept entry takes the position of the group's first occurrence. Items
+    whose key is empty are never treated as duplicates and are kept as-is.
+    """
+    result = []
+    position_by_key = {}
+    for item in items:
+        key = key_func(item)
+        if not key:
+            result.append(item)
+            continue
+        if key not in position_by_key:
+            position_by_key[key] = len(result)
+            result.append(item)
+            continue
+        pos = position_by_key[key]
+        if _metadata_richness(item) > _metadata_richness(result[pos]):
+            result[pos] = item
+        print(f"  🧹 Removed duplicate {label}: {key}")
+    return result
 
 
 def get_pure_type_key(pure_type_uri):
@@ -1157,9 +1231,8 @@ def process_contributors(
     record_paper_handles = set()
     record_paper_title = normalize(dspace_row.get("dc.title", "").strip())
 
-    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
-    if publisher_doi_raw:
-        record_paper_dois.add(normalize_doi(publisher_doi_raw))
+    # dc.identifier.doi is a multi-entry field -- use every DOI in it
+    record_paper_dois.update(parse_doi_field(dspace_row.get("dc.identifier.doi", ""))[0])
     for doi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
         record_paper_dois.add(normalize_doi(doi))
     for handle in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
@@ -1827,7 +1900,7 @@ def find_publisher_match(publisher_name, pub_index):
 def append_record_to_file(filepath, new_record):
     existing = []
     if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
             try:
                 existing = json.load(f)
             except json.JSONDecodeError:
@@ -2161,7 +2234,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         if ev.get("typeDiscriminator") == "FileElectronicVersion":
             existing_file_evs.append(ev)
             continue
-        doi = normalize_doi(ev.get("doi", ""))
+        doi = normalize_doi(ev.get("doi") or "")
         if "hdl.handle.net" not in doi:
             if doi.startswith("https://doi.org/10.13025"):
                 existing_repo_evs.append(ev)
@@ -2170,6 +2243,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             else:
                 existing_other_evs.append(ev)
     
+    # Pure may already hold the same DOI more than once (e.g. with different
+    # case or URL prefix) -- keep a single electronic version per DOI.
+    existing_publisher_evs = dedupe_by_key(
+        existing_publisher_evs, lambda e: normalize_doi(e.get("doi") or ""), "publisher DOI electronic version"
+    )
+    existing_other_evs = dedupe_by_key(
+        existing_other_evs, lambda e: (e.get("doi") or "").strip().lower(), "DOI electronic version"
+    )
+
     existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
     existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
     repo_ev = existing_repo_evs[0] if existing_repo_evs else None
@@ -2179,20 +2261,24 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
 
     # --- 5b. Publisher DOI (dc.identifier.doi) > add if blank ---
   
-    publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
-    new_publisher_ev = None
-    if publisher_doi:
-        publisher_doi = normalize_doi(publisher_doi)
-        # Check if it's actually a repository DOI
-        if "10.13025" in publisher_doi:
-            if publisher_doi not in existing_repo_dois:
+    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
+    new_publisher_evs = []
+    if publisher_doi_raw:
+        dspace_dois, unrecognised = parse_doi_field(publisher_doi_raw)
+        for piece in unrecognised:
+            print(f"  ⚠️ dc.identifier.doi value is not a DOI — not added as an electronic version: '{piece}'")
+        for publisher_doi in dspace_dois:
+            # Check if it's actually a repository DOI
+            if "10.13025" in publisher_doi:
+                if publisher_doi not in existing_repo_dois:
+                    ev = build_electronic_version(doi=publisher_doi)
+                    if ev:
+                        repo_ev = ev
+            elif publisher_doi not in existing_publisher_dois:
                 ev = build_electronic_version(doi=publisher_doi)
                 if ev:
-                    repo_ev = ev
-        elif publisher_doi not in existing_publisher_dois:
-            ev = build_electronic_version(doi=publisher_doi)
-            if ev:
-                new_publisher_ev = ev
+                    new_publisher_evs.append(ev)
+                    existing_publisher_dois.append(publisher_doi)
 
     # NOTE: repo_ev (a DoiElectronicVersion) no longer gets accessType /
     # versionType / licenseType / embargoPeriod set here -- that metadata
@@ -2236,7 +2322,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         ensure_default_access_type(ev)
         final_evs.append(ev)
 
-    if new_publisher_ev:
+    for new_publisher_ev in new_publisher_evs:
         if "doi" in new_publisher_ev and isinstance(new_publisher_ev["doi"], str):
             new_publisher_ev["doi"] = normalize_doi(new_publisher_ev["doi"])
         ensure_default_access_type(new_publisher_ev)
@@ -2283,6 +2369,15 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             existing_handle_links.append(link)
         else:
             non_handle_non_doi_links.append(link)
+
+    # The same handle may already be in Pure more than once (e.g. http and
+    # https, or different case) -- keep one link per handle, preferring the
+    # copy with the most metadata (alias/description).
+    existing_handle_links = dedupe_by_key(
+        existing_handle_links,
+        lambda l: str(normalize_handle(l.get("url", "") or "")).strip().lower(),
+        "handle link",
+    )
 
     existing_handle_urls = [normalize_handle(l.get("url", "")) for l in existing_handle_links]
     dspace_handles = extract_handles_from_uri(uri_str) if uri_str else []
@@ -2766,28 +2861,33 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
                     )
                     break  # only one repo DOI expected
     
-    # Second, add publisher DOI
-    publisher_doi = dspace_row.get("dc.identifier.doi", "").strip()
-    if publisher_doi:
-        publisher_doi = normalize_doi(publisher_doi)
-        if "10.13025" in publisher_doi:
-            # Treat as repo DOI if not already added
-            already_added = any("10.13025" in ev.get("doi", "") for ev in electronic_versions)
-            if not already_added:
-                ev = build_electronic_version(doi=publisher_doi)
+    # Second, add publisher DOI(s) -- each distinct DOI only once
+    publisher_doi_raw = dspace_row.get("dc.identifier.doi", "").strip()
+    if publisher_doi_raw:
+        dspace_dois, unrecognised = parse_doi_field(publisher_doi_raw)
+        for piece in unrecognised:
+            print(f"  ⚠️ dc.identifier.doi value is not a DOI — not added as an electronic version: '{piece}'")
+        for publisher_doi in dspace_dois:
+            if "10.13025" in publisher_doi:
+                # Treat as repo DOI if not already added
+                already_added = any("10.13025" in ev.get("doi", "") for ev in electronic_versions)
+                if not already_added:
+                    ev = build_electronic_version(doi=publisher_doi)
+                    if ev:
+                        electronic_versions.insert(
+                            0, apply_repository_access_license_version(ev, embargo_active, embargo_period)
+                        )
+            else:
+                # Rule 2: not repository-sourced. Since this is a brand new
+                # record there's no pre-existing Pure metadata to preserve, so
+                # accessType defaults straight to "Unknown"; licence/version
+                # type are left unset (build_electronic_version never adds them,
+                # and there's nothing to strip on a freshly built dict).
+                if any(ev.get("doi") == publisher_doi for ev in electronic_versions):
+                    continue
+                ev = build_electronic_version(publisher_doi)
                 if ev:
-                    electronic_versions.insert(
-                        0, apply_repository_access_license_version(ev, embargo_active, embargo_period)
-                    )
-        else:
-            # Rule 2: not repository-sourced. Since this is a brand new
-            # record there's no pre-existing Pure metadata to preserve, so
-            # accessType defaults straight to "Unknown"; licence/version
-            # type are left unset (build_electronic_version never adds them,
-            # and there's nothing to strip on a freshly built dict).
-            ev = build_electronic_version(publisher_doi)
-            if ev:
-                electronic_versions.append(ensure_default_access_type(ev))
+                    electronic_versions.append(ensure_default_access_type(ev))
     
     # Set electronic versions on record (DOIs)
     if electronic_versions:
@@ -2851,7 +2951,7 @@ def main():
     # Load data
     print("Loading DSpace CSV...")
     dspace_rows = []
-    with open(DSPACE_CSV, 'r', encoding='utf-8') as f:
+    with open(DSPACE_CSV, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row.get("pdf_handle_paths"):
@@ -2860,27 +2960,27 @@ def main():
     print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
 
     print("Loading Pure JSON...")
-    with open(PURE_JSON, 'r', encoding='utf-8') as f:
+    with open(PURE_JSON, 'r', encoding='utf-8-sig') as f:
         pure_items = json.load(f)
     print(f"✅ Loaded {len(pure_items)} records from {PURE_JSON}")
 
     print("Loading Person Mapping...")
-    with open(PERSON_MAPPING_JSON, 'r', encoding='utf-8') as f:
+    with open(PERSON_MAPPING_JSON, 'r', encoding='utf-8-sig') as f:
         person_mapping = json.load(f)
     print(f"✅ Loaded {len(person_mapping)} person records from {PERSON_MAPPING_JSON}")
 
     print("Loading Organization Mapping...")
-    with open(ORGANIZATION_MAPPING_JSON, 'r', encoding='utf-8') as f:
+    with open(ORGANIZATION_MAPPING_JSON, 'r', encoding='utf-8-sig') as f:
         organization_mapping = json.load(f)
     print(f"✅ Loaded {len(organization_mapping)} organization records from {ORGANIZATION_MAPPING_JSON}")
 
     print("Loading Publisher Mapping...")
-    with open(PUBLISHER_MAPPING_JSON, 'r', encoding='utf-8') as f:
+    with open(PUBLISHER_MAPPING_JSON, 'r', encoding='utf-8-sig') as f:
         publisher_mapping = json.load(f)
     print(f"✅ Loaded {len(publisher_mapping)} publisher records from {PUBLISHER_MAPPING_JSON}")
 
     print("Loading Journal Mapping...")
-    with open(JOURNAL_MAPPING_JSON, 'r', encoding='utf-8') as f:
+    with open(JOURNAL_MAPPING_JSON, 'r', encoding='utf-8-sig') as f:
         journal_mapping = json.load(f)
     print(f"✅ Loaded {len(journal_mapping)} journal records from {JOURNAL_MAPPING_JSON}")
 
@@ -3001,16 +3101,30 @@ def main():
         # Extract repository DOI from dc.identifier.uri
         repo_dois = extract_dois_from_uri(row.get("dc.identifier.uri", ""))
 
+        # dc.identifier.doi is a multi-entry field (" ; "-separated). Publisher
+        # DOIs in it are used in step 1; any repository (10.13025) DOI in it is
+        # added to the repository-DOI candidates for step 2, after the ones
+        # from dc.identifier.uri.
+        field_dois, _ = parse_doi_field(row.get("dc.identifier.doi", ""))
+        field_publisher_dois = [d for d in field_dois if "10.13025" not in d]
+        for d in field_dois:
+            if "10.13025" in d and d not in repo_dois:
+                repo_dois.append(d)
+
         matched_records = []
         match_type = None  # Track which match method was used
 
-        # 1. Try to match by Publisher DOI
-        publisher_doi = row.get("dc.identifier.doi", "").strip()
-        if publisher_doi:
-            normalized_doi = normalize_doi(publisher_doi)
-            if normalized_doi in pure_by_doi:
-                matched_records.extend(pure_by_doi[normalized_doi])
-                match_type = "Publisher DOI"
+        # 1. Try to match by Publisher DOI -- every DOI in the field. A Pure
+        # record reached through several DOIs (or indexed twice, e.g. via an
+        # electronic version and a DOI link) is only counted once.
+        seen_record_ids = set()
+        for normalized_doi in field_publisher_dois:
+            for pure_item in pure_by_doi.get(normalized_doi, []):
+                if id(pure_item) not in seen_record_ids:
+                    seen_record_ids.add(id(pure_item))
+                    matched_records.append(pure_item)
+        if matched_records:
+            match_type = "Publisher DOI"
 
         # 2. Try to match by Repository DOI
         if not matched_records and repo_dois:
