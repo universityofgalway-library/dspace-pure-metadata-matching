@@ -79,7 +79,9 @@ BASE_URL = (
 # Accepts: bare "10.xxx/..", doi.org or dx.doi.org URLs (http/https, and the
 # "https:/" single-slash typo), and "doi:", "DOI:", "DOI " or ":" prefixes.
 DOI_REGEX = re.compile(r'^(?:https?:/{1,2})?(?:(?:dx\.)?doi\.org/|doi\s*:?\s*|:)?(10\.\S+)$', re.IGNORECASE)
-HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+# Accepts hdl.handle.net, handle.net and www.handle.net hosts, with or without
+# an http(s):// scheme, in any case, and ignores trailing slashes.
+HANDLE_REGEX = re.compile(r'^(?:(?:https?://)?(?:www\.|hdl\.)?handle\.net/)?(10379/\S+?)/*$', re.IGNORECASE)
 
 PUNC = set('''—!–¿()-[]{};:'"''""‐\,<>./?@#$%^&=+|£€*_~®™©0123456789''')
 
@@ -591,6 +593,24 @@ def normalize_handle(value: str) -> str:
         return value  # not a valid handle → leave unchanged
 
     return f"http://hdl.handle.net/{match.group(1)}"
+
+
+def is_handle_url(value) -> bool:
+    """
+    True if value is a Handle URL:
+      - any hdl.handle.net URL, in any case (as before, now case-insensitive);
+      - handle.net / www.handle.net URLs that normalize_handle recognises.
+    A bare "10379/..." without a handle.net host is not treated as a URL here,
+    exactly as before.
+    """
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    if "hdl.handle.net" in lowered:
+        return True
+    if "handle.net" not in lowered:
+        return False
+    return str(normalize_handle(value)).startswith("http://hdl.handle.net/")
 
 
 def extract_dois_from_uri(uri_str):
@@ -2235,7 +2255,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             existing_file_evs.append(ev)
             continue
         doi = normalize_doi(ev.get("doi") or "")
-        if "hdl.handle.net" not in doi:
+        if not is_handle_url(doi):
             if doi.startswith("https://doi.org/10.13025"):
                 existing_repo_evs.append(ev)
             elif doi and doi.startswith("https://doi.org/"):
@@ -2365,7 +2385,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         url = link.get("url", "")
         if "doi.org" in url:
             pass  # drop DOI links entirely
-        elif "hdl.handle.net" in url:
+        elif is_handle_url(url):
             existing_handle_links.append(link)
         else:
             non_handle_non_doi_links.append(link)
@@ -3023,7 +3043,7 @@ def main():
                 if "10.13025" in doi:
                     pure_by_repo_doi[normalize_doi(doi)].append(item)
                 # Index handles found in electronic versions (DOIs that look like handles)
-                elif "hdl.handle.net" in doi:
+                elif is_handle_url(doi):
                     pure_by_handle[normalize_handle(doi)].append(item)
                 else:
                     pure_by_doi[normalize_doi(doi)].append(item)
@@ -3033,7 +3053,7 @@ def main():
             url = link.get("url", "")
             if not url:
                 continue
-            if "hdl.handle.net" in url:
+            if is_handle_url(url):
                 pure_by_handle[normalize_handle(url)].append(item)
             elif "10.13025" in url:
                 pure_by_repo_doi[normalize_doi(url)].append(item)
