@@ -126,12 +126,13 @@ SYSTEM_FIELDS = {
     "createdDate",
     "modifiedBy",
     "modifiedDate",
-    "portalUrl",
     "prettyUrlIdentifiers",
     "version",
     "pureId",
+    "portalUrl",
 	"systemName",
 	"uuid", 
+	"version", 
 	"previousUuids"
 }
 
@@ -304,6 +305,15 @@ def parse_date(date_string, dayfirst=True):
         return (int(year_match.group(1)), 1, 1)
 
     return (1970, 1, 1)
+
+
+def strip_nested_pure_ids(obj):
+    """Recursively remove every "pureId" key, at any nesting level."""
+    if isinstance(obj, dict):
+        return {k: strip_nested_pure_ids(v) for k, v in obj.items() if k != "pureId"}
+    if isinstance(obj, list):
+        return [strip_nested_pure_ids(item) for item in obj]
+    return obj
 
 
 def strip_system_fields(record):
@@ -1823,7 +1833,13 @@ def merge_keywords(existing_keywords, new_keywords):
 
 
 def build_free_keywords_group(keywords):
-    """Build a FreeKeywordsKeywordGroup dict (dc.subject -> Pure keywordGroups)."""
+    """
+    Build a FreeKeywordsKeywordGroup dict (dc.subject -> Pure keywordGroups),
+    in the shape Pure itself uses for a user-entered free-keywords group: the
+    same en_IE keyword list in "keywords" and in a single ACCEPTED /
+    USER_SUPPLIED keyword container (as on valid records exported from Pure;
+    a group with only "keywords" is not picked up by Pure).
+    """
     return {
         "typeDiscriminator": "FreeKeywordsKeywordGroup",
         "logicalName": "keywordContainers",
@@ -1833,10 +1849,43 @@ def build_free_keywords_group(keywords):
         "keywords": [
             {
                 "locale": "en_IE",
-                "freeKeywords": keywords
+                "freeKeywords": list(keywords)
+            }
+        ],
+        "keywordContainers": [
+            {
+                "state": "ACCEPTED",
+                "origin": "USER_SUPPLIED",
+                "freeKeywords": [
+                    {
+                        "locale": "en_IE",
+                        "freeKeywords": list(keywords)
+                    }
+                ]
             }
         ]
     }
+
+
+def existing_free_keywords_in_group(group):
+    """
+    Every keyword string in a free-keywords group, from both places Pure
+    stores them: "keywords" (locale entries) and "keywordContainers"
+    (containers -> locale entries). Duplicates are removed by merge_keywords.
+    """
+    locale_entries = list(group.get("keywords") or [])
+    for container in group.get("keywordContainers") or []:
+        if isinstance(container, dict):
+            locale_entries.extend(container.get("freeKeywords") or [])
+    found = []
+    for locale_entry in locale_entries:
+        if not isinstance(locale_entry, dict):
+            continue
+        found.extend(
+            kw for kw in (locale_entry.get("freeKeywords") or [])
+            if isinstance(kw, str) and kw.strip()
+        )
+    return found
 
 
 def parse_funders(funder_str):
@@ -2944,8 +2993,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             # (logicalName "/dk/atira/pure/authors") and any classification/
             # discipline keyword groups — those are passed through untouched.
             if kg.get("typeDiscriminator") == "FreeKeywordsKeywordGroup" and kg.get("logicalName") == "keywordContainers":
-                for locale_entry in kg.get("keywords", []):
-                    existing_free_keywords.extend(locale_entry.get("freeKeywords", []))
+                # Existing keywords from both "keywords" and "keywordContainers".
+                existing_free_keywords.extend(existing_free_keywords_in_group(kg))
             else:
                 other_keyword_groups.append(kg)
 
@@ -2964,6 +3013,19 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         log_entry["error"] = "; ".join(errors)
 
     before_update_records.append(strip_system_fields(pure_record))
+
+    # pureId is a system field: only the record-level pureId is supplied, to
+    # identify the record (next to "uuid"). Every nested pureId -- carried over
+    # from Pure in contributors, electronic versions and their files,
+    # identifiers, keyword groups, ... -- is removed.
+    record_pure_id = pure_record.get("pureId")
+    finalised = {"uuid": updated_record.get("uuid")}
+    if record_pure_id is not None:
+        finalised["pureId"] = record_pure_id
+    finalised.update(strip_nested_pure_ids(
+        {k: v for k, v in updated_record.items() if k not in ("uuid", "pureId")}
+    ))
+    updated_record = finalised
 
     return updated_record, success
 
