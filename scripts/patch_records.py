@@ -7,15 +7,17 @@ Patch modes (one or more may be combined):
   --patch-nulls          Remove null items from lists across the record
   --patch-titles         Strip subtitle from title when title ends with subtitle
   --patch-workflow       Set workflow step to "validated" for successful records
-  --patch-external-orgs  Clear externalOrganizations at record and contributor level
+  --patch-external-orgs  Clear externalOrganizations at record and contributor level;
+                         the record's internal organizations are sent unchanged
+                         alongside (Pure requires them)
   --patch-author-keywords  Remove the /dk/atira/pure/authors keyword group
   --patch-publishers     Inject publisher from DSpace dc.publisher into Pure records
                          that lack one. Requires --publisher-mapping and --dspace-csv.
   --patch-file-versions  Set a default versionType on file electronic versions
                          that don't have one assigned.
-  --patch-urls            Clean links[]: drop DOI/portal links, remove only exact
-                           duplicate links (same URL), keep every distinct Handle
-                           (desc "Repository Handle") for manual review.
+  --patch-urls            Clean links[]: remove only duplicate links (same URL),
+                           keeping one copy; every other link is kept, including
+                           every distinct Handle (desc "Repository Handle").
   --patch-duplicate-files Remove duplicate FileElectronicVersion entries (same
                            normalized fileName + size), keeping the most
                            complete one.
@@ -484,11 +486,19 @@ def patch_external_orgs(
     output_dir: str,
     modified_after: date = date.fromisoformat("1970-01-01"),
 ) -> dict:
+    """
+    Clear externalOrganizations at record level and on every contributor
+    (internal and external). Each patch also carries the record's existing
+    internal "organizations", unchanged: Pure rejects an update that sends
+    externalOrganizations without them ("Organisations is required").
+    """
     patches = []
     skipped = 0
     skipped_date = 0
     record_cleared = 0
     contributor_cleared = 0
+    no_internal_orgs_used_managing = 0
+    skipped_no_organizations = 0
 
     for record in tqdm(records, desc="[ext-orgs] Processing", unit="rec"):
         uuid = record.get("uuid", "")
@@ -498,7 +508,30 @@ def patch_external_orgs(
             skipped_date += 1
             continue
 
-        patch = {"uuid": uuid, "externalOrganizations": []}
+        # Pure keeps a record's internal and external organisations together:
+        # sending "externalOrganizations" without "organizations" empties the
+        # record's organisations, which Pure rejects ("Organisations is
+        # required", value=[]). So the record's existing internal
+        # organisations are always sent alongside, unchanged. "organizations"
+        # can't be empty: if the record has none, its managing organisation is
+        # used; with neither, the record can't be patched safely and is skipped.
+        internal_orgs = [
+            org for org in (record.get("organizations") or [])
+            if isinstance(org, dict) and org.get("uuid")
+        ]
+        used_managing_org = False
+        if not internal_orgs:
+            managing_uuid = (record.get("managingOrganization") or {}).get("uuid")
+            if managing_uuid:
+                internal_orgs = [{"systemName": "Organization", "uuid": managing_uuid}]
+                used_managing_org = True
+            elif record.get("externalOrganizations") or _clean_contributor_ext_orgs(record.get("contributors", []))[1]:
+                tqdm.write(f"  ⚠️ [{uuid}] no internal organisations and no managing organisation — skipped "
+                           f"(Pure requires organisations)")
+                skipped_no_organizations += 1
+                continue
+
+        patch = {"uuid": uuid, "organizations": internal_orgs, "externalOrganizations": []}
         changed = bool(record.get("externalOrganizations"))
         if changed:
             record_cleared += 1
@@ -515,6 +548,9 @@ def patch_external_orgs(
 
         if changed:
             patches.append(patch)
+            if used_managing_org:
+                no_internal_orgs_used_managing += 1
+                tqdm.write(f"  ℹ️ [{uuid}] record has no internal organisations — sending its managing organisation as organizations")
             tqdm.write(
                 f"  🧹 [{uuid}] — "
                 f"record ext orgs: {'cleared' if record.get('externalOrganizations') else 'already empty'}, "
@@ -534,6 +570,8 @@ def patch_external_orgs(
         "patched":              len(patches),
         "record_ext_orgs_cleared":      record_cleared,
         "contributor_ext_orgs_cleared": contributor_cleared,
+        "organizations_from_managing_org": no_internal_orgs_used_managing,
+        "skipped_no_organizations":     skipped_no_organizations,
         "files":                [output_path],
     }
 
@@ -1383,51 +1421,44 @@ def _is_portal_url(link: dict, record: dict) -> bool:
 
 def _clean_links(links: list, record: dict):
     """
-    Clean a record's `links` list:
-      - drop DOI links and Pure portal links
-      - remove only EXACT duplicates: links with the identical URL (surrounding
-        whitespace ignored), preferring whichever copy has a description.
-        Links whose URLs differ in any way -- including two different Handles
-        -- are all kept, for manual review.
-      - every Handle link's description is normalised to "Repository Handle"
-    Order of first occurrence is kept.
+    Clean a record's `links` list -- the ONLY links removed are duplicates:
+      - links with the identical URL (surrounding whitespace ignored) are
+        collapsed into ONE copy, preferring whichever copy has a description;
+        the kept copy takes the position of the first occurrence;
+      - every other link is kept as it is: links whose URLs differ in any way
+        (including two different Handles, kept for manual review), DOI links,
+        portal links, and entries without a URL;
+      - every Handle link's description is normalised to "Repository Handle".
+    A non-empty list therefore never becomes empty.
     Returns (cleaned_links, changed).
     """
     if not links:
         return links, False
 
-    link_by_url = {}
-    order = []
+    # Position in `cleaned` of the copy kept for each URL.
+    position_by_url = {}
+    cleaned = []
 
     for link in links:
-        if not isinstance(link, dict):
-            continue
-        url = (link.get("url") or "").strip()
+        url = (link.get("url") or "").strip() if isinstance(link, dict) else ""
         if not url:
+            cleaned.append(link)          # nothing to compare -- keep as it is
             continue
-        if _is_doi_url(url):
+        if url not in position_by_url:
+            position_by_url[url] = len(cleaned)
+            cleaned.append(link)
             continue
-        if _is_portal_url(link, record):
-            continue
+        kept = cleaned[position_by_url[url]]
+        kept_has_desc = bool(((kept.get("description") or {}).get("en_IE") or "").strip())
+        new_has_desc = bool(((link.get("description") or {}).get("en_IE") or "").strip())
+        if new_has_desc and not kept_has_desc:
+            cleaned[position_by_url[url]] = link
 
-        key = url  # exact URL only
-        existing = link_by_url.get(key)
-        if existing is None:
-            link_by_url[key] = link
-            order.append(key)
-        else:
-            existing_has_desc = bool(((existing.get("description") or {}).get("en_IE") or "").strip())
-            new_has_desc = bool(((link.get("description") or {}).get("en_IE") or "").strip())
-            if new_has_desc and not existing_has_desc:
-                link_by_url[key] = link
-
-    cleaned = []
-    for key in order:
-        link = link_by_url[key]
-        if _is_handle_url(key):
+    for i, link in enumerate(cleaned):
+        if isinstance(link, dict) and _is_handle_url((link.get("url") or "").strip()):
             link = dict(link)
             link["description"] = {"en_IE": "Repository Handle"}
-        cleaned.append(link)
+            cleaned[i] = link
 
     return cleaned, cleaned != links
 
@@ -1438,10 +1469,10 @@ def patch_urls(
     modified_after: date = date.fromisoformat("1970-01-01"),
 ) -> dict:
     """
-    Clean up each record's `links` list: drop all DOI links and Pure portal
-    links, remove only exact duplicate links (identical URL; the copy with a
-    description is kept), and normalise every Handle link's description to
-    "Repository Handle". Different Handles are all kept for manual review.
+    Clean up each record's `links` list: remove only duplicate links (identical
+    URL), keeping one copy (the one with a description, if any), and normalise
+    every Handle link's description to "Repository Handle". Nothing else is
+    removed -- different Handles, DOI links and portal links are all kept.
     Produces a PATCH-compatible JSON (uuid + cleaned links list) for every
     record whose links actually changed.
     """
@@ -1469,6 +1500,11 @@ def patch_urls(
             skipped += 1
             continue
 
+        if links and not cleaned_links:
+            # Safety net: never send a patch that would delete every link.
+            tqdm.write(f"  ⚠️ [{uuid}] cleaning would leave no links — record skipped")
+            skipped += 1
+            continue
         patches.append({"uuid": uuid, "links": cleaned_links})
         patched += 1
         tqdm.write(f"  🔗 [{uuid}] links: {len(links)} → {len(cleaned_links)}")
@@ -1963,7 +1999,12 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument(
         "--patch-external-orgs",
         action="store_true",
-        help="Clear externalOrganizations at record and contributor level.",
+        help=(
+            "Clear externalOrganizations at record and contributor level. The "
+            "record's internal organizations are sent unchanged alongside (Pure "
+            "rejects the update otherwise); if it has none, its managing "
+            "organisation is used."
+        ),
     )
     modes.add_argument(
         "--patch-author-keywords",
@@ -1993,10 +2034,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--patch-urls",
         action="store_true",
         help=(
-            "Clean links[]: drop DOI links and Pure portal links, remove "
-            "only exact duplicate links (identical URL), and normalise "
-            "Handle descriptions to 'Repository Handle'. Different Handles "
-            "are all kept for manual review."
+            "Clean links[]: remove only duplicate links (identical URL), "
+            "keeping one copy, and normalise Handle descriptions to "
+            "'Repository Handle'. Every other link is kept, including "
+            "different Handles, DOI links and portal links."
         ),
     )
     modes.add_argument(

@@ -1217,16 +1217,26 @@ def process_contributors(
         person_index:         Pre-built person name index.
         dspace_row:           The current DSpace CSV row.
         pure_type_key:        Lower-cased Pure type key for role URI construction.
-        existing_contributors: List of existing Pure contributor dicts. When provided,
-                               contributors already present (by UUID or name) are reused
-                               rather than rebuilt. Pass None or [] to skip this check
-                               (i.e. for new records or override mode).
+        existing_contributors: List of existing Pure contributor dicts. When provided
+                               (updating a record in precedence mode):
+                               - DSpace contributors already present in Pure (by person
+                                 UUID, then by name) reuse the linked Pure contributor
+                                 rather than being rebuilt;
+                               - every Pure contributor NOT used that way is kept, after
+                                 the DSpace ones, in its original order and unchanged --
+                                 nothing already in Pure is discarded.
+                               Pass None or [] for new records or override mode (only the
+                               DSpace contributors are returned).
+                               In every mode the same person is never added twice.
         pure_uuid:            UUID of the matched Pure record, used in unmatched contributor
                               log entries. Pass None for new records.
 
     Returns:
         (final_contributors, unmatched_contributors)
-        final_contributors:    List of resolved contributor dicts ready for Pure.
+        final_contributors:    List of resolved contributor dicts ready for Pure: the DSpace
+                               contributors in DSpace order, followed by any unused Pure
+                               contributors. Empty if no DSpace contributor could be
+                               resolved (the caller then leaves Pure's contributors as they are).
         unmatched_contributors: List of dicts describing contributors that could not be resolved.
     """
     existing_contributors = existing_contributors or []
@@ -1272,6 +1282,15 @@ def process_contributors(
 
     final_contributors = []
     unmatched_contributors = []
+
+    # Never add the same person twice: person/externalPerson UUIDs already in
+    # final_contributors, and the Pure contributors already reused (by id()).
+    added_person_uuids = set()
+    used_existing_ids = set()
+
+    def person_uuid_of(contrib):
+        ref = contrib.get("person") or contrib.get("externalPerson") or {}
+        return ref.get("uuid")
 
     # Helper to build an unmatched entry
     handles = extract_handles_from_uri(dspace_row.get("dc.identifier.uri", ""))
@@ -1341,22 +1360,29 @@ def process_contributors(
             # Reuse existing contributor if present (skip when existing_contributors is empty,
             # i.e. for new records or override mode)
             if existing_contributors:
+                existing_match, matched_by = None, None
                 if uuid_value in existing_by_uuid:
-                    print(f"        ℹ️ Contributor already exists (by UUID), using existing: {first} {last}")
-                    existing_contrib = dict(existing_by_uuid[uuid_value])
+                    existing_match, matched_by = existing_by_uuid[uuid_value], "UUID"
+                elif name_key in existing_by_name:
+                    existing_match, matched_by = existing_by_name[name_key], "name"
+                if existing_match is not None:
+                    existing_uuid = person_uuid_of(existing_match)
+                    if id(existing_match) in used_existing_ids or existing_uuid in added_person_uuids:
+                        print(f"        ℹ️ {first} {last} is already on the record — not added twice")
+                        continue
+                    print(f"        ℹ️ Contributor already exists (by {matched_by}), using existing: {first} {last}")
+                    existing_contrib = dict(existing_match)
                     if existing_contrib.get("name", {}).get("firstName") != first or existing_contrib.get("name", {}).get("lastName") != last:
                         print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {first} {last}")
                     existing_contrib["name"] = {"firstName": first, "lastName": last}
                     final_contributors.append(existing_contrib)
+                    used_existing_ids.add(id(existing_match))
+                    added_person_uuids.update(u for u in (existing_uuid, uuid_value) if u)
                     continue
-                if name_key in existing_by_name:
-                    print(f"        ℹ️ Contributor already exists (by name), using existing: {first} {last}")
-                    existing_contrib = dict(existing_by_name[name_key])
-                    if existing_contrib.get("name", {}).get("firstName") != first or existing_contrib.get("name", {}).get("lastName") != last:
-                        print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {first} {last}")
-                    existing_contrib["name"] = {"firstName": first, "lastName": last}
-                    final_contributors.append(existing_contrib)
-                    continue
+
+            if uuid_value in added_person_uuids:
+                print(f"        ℹ️ {first} {last} is already on the record — not added twice")
+                continue
 
             contributor = build_contributor(
                 matched_person, role, pure_type_key,
@@ -1364,7 +1390,22 @@ def process_contributors(
             )
             if contributor:
                 final_contributors.append(contributor)
+                added_person_uuids.add(uuid_value)
                 print(f"        ✅ Added {role}: {first} {last}")
+
+    # Build on what Pure already has: keep every existing Pure contributor that
+    # wasn't reused above, after the DSpace contributors, in its original order
+    # and unchanged. Only done when at least one DSpace contributor was resolved;
+    # otherwise final_contributors stays empty and the caller leaves Pure's
+    # contributors exactly as they are.
+    if existing_contributors and final_contributors:
+        kept = 0
+        for contrib in existing_contributors:
+            if isinstance(contrib, dict) and id(contrib) not in used_existing_ids:
+                final_contributors.append(dict(contrib))
+                kept += 1
+        if kept:
+            print(f"  ℹ️ Kept {kept} existing Pure contributor(s) not listed in DSpace")
 
     return final_contributors, unmatched_contributors
 
@@ -2405,7 +2446,10 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     contributors_by_role = parse_contributors_by_role(dspace_row)
 
     # Get existing contributors from Pure record (if any).
-    # In override mode, pass an empty list so process_contributors skips deduplication entirely.
+    # Precedence mode: DSpace contributors reuse the Pure contributors already
+    # linked to them, and all other Pure contributors are kept (nothing in Pure
+    # is discarded). Override mode: pass an empty list so only DSpace
+    # contributors are used.
     existing_contributors = [] if override_mode else [c for c in pure_record.get("contributors", []) if c is not None]
 
     final_contributors, record_unmatched_contributors = process_contributors(
@@ -2517,7 +2561,8 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     # organisations ("organizations") are checked against contributors'
     # "organizations"; external ones ("externalOrganizations") against
     # contributors' "externalOrganizations". managingOrganization is neither
-    # read nor changed here. Applies in both normal and override mode.
+    # read nor changed here; step 1b3 below adds it to "organizations".
+    # Applies in both normal and override mode.
     if "contributors" in updated_record:
         effective_contributors = updated_record["contributors"]
     else:
@@ -2545,6 +2590,28 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
             updated_record[field] = kept
             log_entry.setdefault("removedOrphanOrganizations", {})[field] = removed
             print(f"  🧹 Removed {len(removed)} orphan record-level {label}(s) not attached to any contributor: {removed}")
+
+    # --- 1b3. Managing organisation in the record-level organisations ---
+    # "organizations" can't be empty: it always includes the managing
+    # organisation. A record that has only external contributors (after this
+    # update) is managed by the Library Repository.
+    has_internal_contributor = any(
+        isinstance(c, dict) and c.get("typeDiscriminator") == "InternalContributorAssociation"
+        for c in effective_contributors
+    )
+    managing_uuid = (updated_record.get("managingOrganization") or pure_record.get("managingOrganization") or {}).get("uuid")
+    if effective_contributors and not has_internal_contributor and managing_uuid != LIBRARY_REPOSITORY_UUID:
+        print(f"  ✅ Only external contributors: managingOrganization {managing_uuid} → Library Repository {LIBRARY_REPOSITORY_UUID}")
+        updated_record["managingOrganization"] = {
+            "uuid": LIBRARY_REPOSITORY_UUID,
+            "systemName": "Organization"
+        }
+        managing_uuid = LIBRARY_REPOSITORY_UUID
+    if managing_uuid:
+        current_orgs = updated_record["organizations"] if "organizations" in updated_record else (pure_record.get("organizations") or [])
+        if managing_uuid not in {o.get("uuid") for o in current_orgs if isinstance(o, dict)}:
+            updated_record["organizations"] = list(current_orgs) + [{"systemName": "Organization", "uuid": managing_uuid}]
+            print(f"  ✅ Added managing organisation {managing_uuid} to record-level organizations")
 
     # --- 1c. Remove author keyword group if all DSpace authors are now matched ---
     if final_contributors:
@@ -3339,6 +3406,14 @@ def create_new_record_from_dspace(dspace_row, person_index, org_index, pub_index
         "systemName": "Organization"
     }
     print(f"✅ Set managingOrganization to: {managing_org_uuid}")
+
+    # The record-level "organizations" list always includes the managing
+    # organisation, so it is never empty. For a record with only external
+    # contributors the managing organisation is the Library Repository
+    # (see resolve_managing_organization).
+    record_orgs = record.setdefault("organizations", [])
+    if managing_org_uuid not in {o.get("uuid") for o in record_orgs if isinstance(o, dict)}:
+        record_orgs.append({"systemName": "Organization", "uuid": managing_org_uuid})
     
     # Set DOIs and Handles - Repository DOI first, then Publisher DOI
     electronic_versions = []

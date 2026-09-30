@@ -12,6 +12,16 @@ The script performs three main tasks:
 2. **Update existing Pure records** with DSpace metadata (precedence-based or override)
 3. **Create new Pure records** for unmatched DSpace items
 
+### Script versions
+
+This document describes **`match_records_v2.py`**. **`match_records.py`** behaves the same except for three things it does not do:
+
+- check "same person" against the person mapping's IDs and name variants (it compares person UUIDs only);
+- merge duplicate contributors already in Pure;
+- reduce internal contributors to their primary organisation.
+
+These are covered in [Same person — checked against the person mapping](#same-person--checked-against-the-person-mapping) and [Primary organisation only](#primary-organisation-only-match_records_v2py).
+
 ---
 
 ## Usage
@@ -165,12 +175,12 @@ Records whose DSpace UUID is the processed item's own are never reported.
 
 - Uses precedence rules to update data in Pure
 - Adds new funders without removing existing ones
-- Contributors: the contributor list is rebuilt from the DSpace contributors that could be matched (existing Pure contributors are reused for those names, keeping their Pure person reference). **Pure contributors not listed in DSpace, or whose DSpace name cannot be matched, are not kept.** If no DSpace contributor can be matched, the Pure contributors are left unchanged.
+- Contributors: built on what Pure already has — see [Contributors in Updates](#contributors-in-updates). Nothing already in Pure is discarded.
 
 | DSpace Field | Pure Field | Rule |
 |---|---|---|
 | `uuid` | `identifiers` (PrimaryId, idSource: DSpace) | Always set; demotes existing PrimaryId to Id |
-| `dc.contributor.*` | `contributors` | Rebuilt from matched DSpace contributors (existing Pure contributors reused by UUID or name) — see Precedence Mode above |
+| `dc.contributor.*` | `contributors` | DSpace contributors in DSpace order (reusing the linked Pure contributors), then all other Pure contributors kept; no person added twice, Pure duplicates merged — see [Contributors in Updates](#contributors-in-updates) |
 | `dc.contributor.funder` | `fundingDetails` | Add new funders |
 | `dc.date.issued` | `publicationStatuses[0].publicationDate` | Fill if blank |
 | `dc.identifier.doi` | `electronicVersions` (publisher version) | Each distinct DOI added once, if not already present in any form; values that aren't DOIs are skipped with a warning |
@@ -186,6 +196,33 @@ Records whose DSpace UUID is the processed item's own are never reported.
 | `journal_uuid` / ISSNs / journal titles | `journalAssociation.journal.uuid` | Fill if blank — `journal_uuid`, then ISSN, then title; see [Journal Matching](#journal-matching) |
 | _(always)_ | `workflow.step` | Always set to `validated` on every output record |
 | _(always)_ | `accessType` on every electronic version | Mandatory field in Pure — always ensured to be present; see [Electronic Versions & Links](#electronic-versions--links) for exactly how per EV type |
+
+### Contributors in Updates
+
+In precedence mode, the contributor list of an existing record is built on the Pure record, never replacing it:
+
+1. **DSpace contributors first, in DSpace order** (grouped by role: authors, editors, translators, illustrators). For each one matched to a person, the Pure contributor already linked to that person is **reused**, keeping everything Pure has on it (role, organisations, corresponding-author flag, …); only the name spelling is aligned with the person mapping. A person not yet on the record is added as a new contributor.
+2. **Every other Pure contributor is kept**, after the DSpace ones, in its original Pure order — including contributors not listed in DSpace and those whose DSpace name couldn't be matched.
+3. **No person is added twice**, and **duplicates already in Pure are merged** (see below).
+
+If no DSpace contributor can be matched at all, the Pure contributors are left exactly as they are and not sent. New records and **override mode** use only the DSpace contributors (in DSpace order); the "no person added twice" rule applies to them too.
+
+#### Same person — checked against the person mapping
+
+The person mapping sometimes describes one person in several entries (e.g. with first and last name swapped, or as separate internal and external profiles). Entries that share any UUID are treated as **one person**, with all of their UUIDs and all of their name variants (names and alternative names, in both orders). Everywhere below, "same person" means the same person in this sense.
+
+**Reusing a Pure contributor** for a DSpace contributor:
+1. **By ID first** — a Pure contributor linked to **any** of the person's UUIDs (not only the first one) is reused; the exact UUID is preferred, then an internal contributor.
+2. **By name only as a fallback** — a Pure contributor with the same name is reused only if its UUID is **not** in the person mapping. If the mapping says its UUID belongs to a **different** person, it is not reused: the DSpace person is added, the Pure contributor is kept, and a warning is printed.
+
+**No person added twice** — a DSpace contributor who is the same person as one already on the list is skipped: the same name repeated in DSpace, two spellings (`Lang, Mark` / `Lang, M. J.`), apostrophe variants, the same person as author and editor, or two mapping entries of one person.
+
+**Merging duplicates already in Pure** — a Pure contributor that is the same person as one already on the list is merged into it rather than kept twice:
+- **same UUID** → merged;
+- **different UUIDs of the same person in the mapping** → merged only if **both** contributors' names are among that person's name variants; otherwise both are kept and a warning is printed for review;
+- **the same name alone never merges** two contributors (they may be different people).
+
+When two entries are merged, the earlier one is kept — except that an **internal** contributor always wins over an external one. The kept entry keeps all its own data, takes the **corresponding-author** flag if either entry had it, and — if both are the same type (internal/internal or external/external) — the **union of their organisations** (`organizations`, `externalOrganizations`). Each merge is logged in the processing log (`🔗 Merged duplicate Pure contributor …`), with a note if the two entries had different roles.
 
 ### Subtitle Stripping
 
@@ -276,6 +313,7 @@ Authors are matched via a pre-built name index supporting primary names, alterna
 All four DSpace contributor fields are processed: `author`, `editor`, `translator`, `illustrator`. Special cases:
 
 - **Author/editor overlap:** If the same name appears in both fields, one role is kept based on `dc.type` (editor preferred for `book`, `interactive resource`, `conference proceedings`; author preferred otherwise).
+- **Same person twice:** each person is added to a record only once, checked against the person mapping's IDs and name variants — see [Contributors in Updates](#contributors-in-updates).
 - **Editors-only non-book records:** If `dc.type` is not a book-like type and there are editors but no authors, editors are treated as authors (metadata correction).
 
 ---
@@ -315,7 +353,8 @@ The following fields are hardcoded on all newly created records (unmatched DSpac
 | `visibility` | `FREE` |
 | `category` | `/dk/atira/pure/researchoutput/category/research` |
 | `workflow.step` | `validated` |
-| `managingOrganization` | First internal contributor's org (unless it is a Central University org — see below), or Library Repository UUID from org config |
+| `managingOrganization` | First internal contributor's org (unless it is a Central University org — see below), or Library Repository UUID from org config (always for records with only external contributors) |
+| `organizations` | Internal contributors' organisations, plus the managing organisation — never empty |
 | `language` | `en_IE` (overridden if `dc.language.iso` is present) |
 
 ---
@@ -330,14 +369,30 @@ The following fields are hardcoded on all newly created records (unmatched DSpac
 **External organizations:** UUIDs listed in `EXTERNAL_ORGS_TO_IGNORE` (loaded from the org config file) are always filtered out.
 
 **Managing organization:** Set to the first internal contributor's primary organization. If that organization is one of the Central University orgs defined in the org config (`CENTRAL_UNIVERSITY`), the Library Repository UUID is used instead. Also falls back to Library Repository UUID if no internal contributors exist.
+- **New records** and **override mode**: set as above.
+- **Updates in precedence mode**: Pure's managing organisation is kept (it is only set when Pure has none) — **except** when the record, after the update, has **only external contributors**: then the managing organisation is set to the Library Repository.
 
 **Record-level organizations** are collected from all resolved contributors and written to the top-level `organizations` (internal) and `externalOrganizations` (external, only if `COLLECT_EXTERNAL_ORGS = True`) arrays.
+
+**The managing organisation is always in `organizations`.** Unlike `externalOrganizations`, the `organizations` list can't be empty: the managing organisation is added to it (at the end) whenever it isn't already there — in new records and in updates, in both modes. For a record with only external contributors, `organizations` is therefore `[Library Repository]`.
 
 **Orphan record-level organisations are removed** (updates of existing records, in both precedence and override mode). The contributors the record will have after the update are checked — the new list if contributors are updated, otherwise Pure's existing contributors:
 - a record-level `organizations` entry is kept only if at least one contributor has that organisation in its `organizations`;
 - a record-level `externalOrganizations` entry is kept only if at least one contributor has it in its `externalOrganizations`.
 
-Everything else is removed, and the removed UUIDs are recorded in the status log as `removedOrphanOrganizations`. Entries without a UUID are left untouched. `managingOrganization` is neither read nor changed by this step. If every organisation is orphaned, an empty list is sent. New records need no such step — their lists are built only from their contributors.
+Everything else is removed, and the removed UUIDs are recorded in the status log as `removedOrphanOrganizations`. Entries without a UUID are left untouched. This step doesn't read or change `managingOrganization`; afterwards, the managing organisation is added back to `organizations` if it isn't there (see above), so the list is never empty. New records need no such step — their lists are built only from their contributors.
+
+### Primary organisation only (`match_records_v2.py`)
+
+Every **internal** contributor lists **only its primary organisation** in `organizations` — whether it was newly built, reused from Pure, kept from Pure, or merged. The primary organisation comes from the person mapping, across all entries of the same person:
+- its `primaryInternalOrganization`, if set;
+- otherwise its **only** internal organisation, if it has exactly one.
+
+If neither applies — the person has several organisations and no primary, or isn't in the person mapping — the contributor's organisations are **left as they are** and a warning is written to the processing log (`⚠️ Primary organisation of … is not known in the person mapping`). For newly built contributors in that situation the first organisation listed in the mapping is used, as before.
+
+The contributor's `externalOrganizations` and all external contributors are not touched. Record-level organisations that are no longer attached to any contributor are then removed as orphans (see above).
+
+If no DSpace contributor could be matched, Pure's contributors are still sent when this rule (or merging duplicates) changes them; if nothing needs changing, they are left untouched.
 
 ---
 

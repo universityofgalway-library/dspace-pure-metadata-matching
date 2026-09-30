@@ -51,11 +51,11 @@ python patch_records.py <input> [--output-dir DIR] [OPTIONS]
 | `--patch-nulls` | Remove `null` items from lists. Produces a **delete + create** file pair. |
 | `--patch-titles` | Strip the subtitle from the title when the title ends with the subtitle text. |
 | `--patch-workflow` | Set `workflow.step = "validated"`. By default operates on standard research output records; use `--workflow-from-log` to switch to upload-log input format. |
-| `--patch-external-orgs` | Clear `externalOrganizations` at the record level and within every contributor, internal and external. |
+| `--patch-external-orgs` | Clear `externalOrganizations` at the record level and within every contributor, internal and external. The record's internal `organizations` are sent unchanged alongside. |
 | `--patch-author-keywords` | Remove the `/dk/atira/pure/authors` keyword group from `keywordGroups`. |
 | `--patch-publishers` | Inject publisher UUIDs into eligible Pure records that have no publisher set, sourced from DSpace `dc.publisher`. Requires `--publisher-mapping` and `--dspace-csv`. |
 | `--patch-file-versions` | Set a default `versionType` ("Accepted author manuscript") on `FileElectronicVersion` entries in `electronicVersions` that have no `versionType` assigned. |
-| `--patch-urls` | Clean `links[]`: drop DOI links and Pure portal links, remove only **exact** duplicate links (identical URL), and normalise every Handle link's description to "Repository Handle". Different Handles are all kept for manual review. |
+| `--patch-urls` | Clean `links[]`: remove only duplicate links (identical URL), keeping one copy, and normalise every Handle link's description to "Repository Handle". Every other link is kept — including different Handles, DOI links and portal links. |
 | `--patch-duplicate-files` | Remove duplicate `FileElectronicVersion` entries left behind by repeated upload attempts on the same file. |
 | `--patch-duplicate-dois` | Remove duplicate DOI electronic versions — the same DOI in any written form — keeping the metadata (access type, embargo, version, licence) of the removed copies on the remaining one. |
 | `--patch-subjects` | Add DSpace `dc.subject` values as free keywords (`FreeKeywordsKeywordGroup`) to Pure records, merged with existing free keywords without duplication. Other keyword groups are left untouched. Requires `--dspace-csv`. |
@@ -142,7 +142,11 @@ Clears `externalOrganizations` to an empty list at two levels:
 1. The record itself (`record.externalOrganizations`)
 2. Each entry in `record.contributors[*].externalOrganizations` — **internal and external contributors alike**
 
-Internal organisations (`organizations`) are not touched, at either level. Only records where at least one of the two levels is non-empty are included in the output. The `--modified-after` date filter applies.
+Internal organisations (`organizations`) are not changed, at either level. Only records where at least one of the two levels is non-empty are included in the output. The `--modified-after` date filter applies.
+
+**The record's internal `organizations` are always sent too, unchanged.** Pure rejects an update that sends `externalOrganizations` without them: the record's organisations end up empty and the upload fails with `400 Validation failed — organisations: Organisations is required (value=[])`. `organizations` can't be empty, so:
+- if the record has no internal organisations, its `managingOrganization` is sent as `organizations`;
+- if it has neither, the record is **skipped** (counted as `Skipped no organizations`) rather than sent to fail.
 
 - `contributors` is only included in the patch when at least one contributor actually changed, so contributors are never resent needlessly.
 - A `null` entry in `contributors` is passed through unchanged instead of stopping the run (use `--patch-nulls` to remove it).
@@ -152,6 +156,7 @@ Patch shape:
 ```json
 {
   "uuid": "…",
+  "organizations": [ /* the record's own internal organisations, unchanged */ ],
   "externalOrganizations": [],
   "contributors": [ { "…": "…", "externalOrganizations": [] } ]
 }
@@ -227,18 +232,16 @@ Patch shape: `{ "uuid": "…", "electronicVersions": [ /* full list, with the fi
 
 ### `--patch-urls`
 
-Cleans up each record's `links` array:
+Cleans up each record's `links` array. **The only links removed are duplicates**, and one copy of each is always kept:
 
-1. Drops any DOI link (`doi.org` URL or bare `10.xxxx/…` DOI).
-2. Drops the Pure portal link (matched against the record's `portalUrl`, or an `alias`/`description` containing "portal").
-3. Removes only **exact** duplicates — links with the identical URL (surrounding whitespace ignored), keeping whichever copy has a `description` set. Links whose URLs differ in any way are all kept for manual review, including:
-   - two **different** Handles,
-   - the same Handle as `http` and `https`, or with different letter case.
-4. Normalises every Handle link's (`hdl.handle.net` URL) `description` to `{"en_IE": "Repository Handle"}`.
+1. Links with the identical URL (surrounding whitespace ignored) are collapsed into **one** copy — whichever has a `description` set, otherwise the first. The kept copy takes the position of the first occurrence.
+2. **Every other link is kept as it is**, including:
+   - links whose URLs differ in any way — two **different** Handles, or the same Handle as `http` and `https` / in different letter case (kept for manual review);
+   - DOI links and Pure portal links;
+   - entries without a URL (and `null` entries — use `--patch-nulls` to remove those).
+3. Every Handle link's (`hdl.handle.net` URL) `description` is normalised to `{"en_IE": "Repository Handle"}`.
 
-Link order (first occurrence) is kept.
-
-Records whose `links` list is empty, or whose cleaned result is identical to the original, are skipped. The `--modified-after` date filter applies.
+A record with links never ends up with an empty list (a safety check skips any record where that would happen). Records whose `links` list is empty, or whose cleaned result is identical to the original, are skipped. The `--modified-after` date filter applies.
 
 Output file: `url_patch_YYYY-MM-DD.json`
 Patch shape: `{ "uuid": "…", "links": [ /* cleaned links */ ] }`
