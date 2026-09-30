@@ -59,6 +59,8 @@ OUTPUT_DIR                = f"./record_matching/prod_all_output_{TODAY}"
 - `True` → `./scripts/test_orgs_config.json`
 - `False` → `./scripts/prod_orgs_config.json`
 
+All input files (CSV and JSON, including the org config) are read as UTF-8 **with or without a byte-order mark (BOM)** — DSpace CSV exports start with a BOM, which is handled automatically. Output files are written as plain UTF-8.
+
 The org config file is required and must be a JSON object with the following keys:
 
 ```json
@@ -80,7 +82,7 @@ The org config file is required and must be a JSON object with the following key
 | `PERSON_MAPPING_JSON` | JSON array | Author name → Pure person UUID mappings |
 | `ORGANIZATION_MAPPING_JSON` | JSON array | Org name → Pure org UUID mappings |
 | `PUBLISHER_MAPPING_JSON` | JSON array | Publisher name → Pure publisher UUID mappings |
-| `JOURNAL_MAPPING_JSON` | JSON array | Pure's full journal dump (each entry has a `uuid`) — used to validate `journal_uuid` from the DSpace CSV, not to look one up by name |
+| `JOURNAL_MAPPING_JSON` | JSON array | Pure's full journal dump — used to validate `journal_uuid` from the DSpace CSV, and to look journals up by ISSN (`issns`, `additionalSearchableIssns`) and by title (`titles`, `additionalSearchableTitles`); see [Journal Matching](#journal-matching) |
 
 ### Required DSpace CSV Columns
 
@@ -97,14 +99,18 @@ The org config file is required and must be a JSON object with the following key
 | `dc.contributor.funder` | Semicolon-separated funder names |
 | `dc.date.issued` | Publication date |
 | `dc.date.embargo` | Embargo end date |
-| `dc.identifier.doi` | Publisher DOI |
+| `dc.identifier.doi` | Publisher DOI(s). **Multi-entry field** (values separated by ` ; `); every DOI in it is used. A repository DOI (`10.13025/*`) in this field is treated as a repository DOI. See [DOI & Handle Normalisation](#doi--handle-normalisation) |
 | `dc.identifier.uri` | Handle and/or repository DOI (semicolon-separated) |
 | `dc.description.abstract` | Abstract text |
 | `dc.description.sponsorship` | Funding acknowledgement text |
 | `dc.language.iso` | ISO 639-3 language code (e.g. `eng`, `gle`) |
 | `dc.publisher` | Publisher name — matched against `PUBLISHER_MAPPING_JSON` for applicable record types |
 | `dc.type` | Resource type (e.g. `journal article`, `book`) |
-| `journal_uuid` | Pure journal UUID (required for journal contributions) — validated against `JOURNAL_MAPPING_JSON`; see [Journal Matching](#journal-matching) |
+| `journal_uuid` | Pure journal UUID from the enrichment step (optional) — validated against `JOURNAL_MAPPING_JSON`; see [Journal Matching](#journal-matching) |
+| `journal_issn` | ISSN(s) of the journal found by the enrichment step (optional, multi-entry) — used for ISSN matching |
+| `journal_title` | Title of the journal found by the enrichment step (optional) — used for title matching |
+| `dc.identifier.issn` | ISSN(s) from DSpace (optional, multi-entry: `,`, `;` or ` ; ` separated) — used for ISSN matching |
+| `dc.identifier.journal` | Journal title from DSpace (optional, multi-entry) — used for title matching |
 | `dc.subject` | Semicolon-separated free-text keywords (optional) — added as a free-keywords group; see [Subject Keywords](#subject-keywords) |
 | `pdf_handle_paths` | Semicolon-separated PDF paths (optional). Only used to clean up HTML-entity-encoded filenames for logging — see [Filename Cleaning](#filename-cleaning); does not otherwise affect matching or field updates. |
 
@@ -114,14 +120,36 @@ The org config file is required and must be a JSON object with the following key
 
 Records are matched in priority order:
 
-1. **Publisher DOI** — from `dc.identifier.doi`
-2. **Repository DOI** — from `dc.identifier.uri`, pattern `10.13025/*`
+1. **Publisher DOI** — every publisher DOI in `dc.identifier.doi` (multi-entry field) is looked up. A Pure record reached through several DOIs, or indexed twice (e.g. via an electronic version and a DOI link), is counted only once.
+2. **Repository DOI** — from `dc.identifier.uri`, pattern `10.13025/*`, followed by any repository DOI found in `dc.identifier.doi`
 3. **Handle** — from `dc.identifier.uri`, pattern `10379/*`
 4. **Title** — two sub-strategies applied in order:
    - **Exact** — normalised title string match against index
    - **Fuzzy** — token-based candidate retrieval + fuzzy scoring, 90% threshold
 
-When multiple Pure records match, the best is selected by: visibility (FREE/CAMPUS) → number of internal contributors → field completeness → whether last modified by a real user.
+DOIs and handles are compared in normalised form on both sides — see [DOI & Handle Normalisation](#doi--handle-normalisation).
+
+### Choosing among duplicates
+
+When several Pure records match one DSpace row, the record to update is chosen as follows:
+
+1. **DSpace UUID first.** A record "has a DSpace UUID" if one of its `identifiers` has `idSource: "DSpace"` and a non-empty value (as `Id` or `PrimaryId`).
+   - **Exactly one** duplicate has a DSpace UUID → that record is updated; no further comparison.
+   - **Several** have one → duplicates without a DSpace UUID are discarded, and the standard comparison below runs on the rest only.
+   - **None** has one → the standard comparison runs on all of them.
+2. **Standard comparison:** visibility (FREE/CAMPUS) → number of internal contributors → field completeness → whether last modified by a real user.
+
+Which case applied is recorded in the status log as `duplicateResolution`.
+
+### DSpace UUID mismatches
+
+Any DSpace UUID counts in step 1, not only the UUID of the DSpace item being processed. Whenever the Pure record about to be updated — whether it was the **only match** or was **chosen among duplicates** — already carries DSpace UUID(s) and none of them equals the processed item's `uuid` (compared case-insensitively), the record is still updated, but the case is reported:
+
+- a warning line in the processing log: `⚠️ DSpace UUID mismatch (single match | chosen among duplicates): DSpace item … is updating Pure record …, which already has DSpace UUID(s) […]`
+- a row in `dspace_uuid_mismatches_YYYY-MM-DD.csv` with: `dspace_uuid`, `pure_record_dspace_uuids`, `handle`, `pure_uuid`, `dspace_title`, `pure_title`, `portal_url`, `case`
+- the `DSpace UUID mismatches` line in the final counts
+
+Records whose DSpace UUID is the processed item's own are never reported.
 
 ---
 
@@ -136,15 +164,16 @@ When multiple Pure records match, the best is selected by: visibility (FREE/CAMP
 ### Precedence Mode (`OVERRIDE_MODE = False`)
 
 - Uses precedence rules to update data in Pure
-- Adds new contributors/funders without removing existing ones
+- Adds new funders without removing existing ones
+- Contributors: the contributor list is rebuilt from the DSpace contributors that could be matched (existing Pure contributors are reused for those names, keeping their Pure person reference). **Pure contributors not listed in DSpace, or whose DSpace name cannot be matched, are not kept.** If no DSpace contributor can be matched, the Pure contributors are left unchanged.
 
 | DSpace Field | Pure Field | Rule |
 |---|---|---|
 | `uuid` | `identifiers` (PrimaryId, idSource: DSpace) | Always set; demotes existing PrimaryId to Id |
-| `dc.contributor.*` | `contributors` | Add new; preserve existing (precedence) |
+| `dc.contributor.*` | `contributors` | Rebuilt from matched DSpace contributors (existing Pure contributors reused by UUID or name) — see Precedence Mode above |
 | `dc.contributor.funder` | `fundingDetails` | Add new funders |
 | `dc.date.issued` | `publicationStatuses[0].publicationDate` | Fill if blank |
-| `dc.identifier.doi` | `electronicVersions` (publisher version) | Add if missing |
+| `dc.identifier.doi` | `electronicVersions` (publisher version) | Each distinct DOI added once, if not already present in any form; values that aren't DOIs are skipped with a warning |
 | `dc.identifier.uri` (DOI `10.13025/*`) | `electronicVersions` (repository version) | Add if missing; access/licence/version-type always set — see [Electronic Versions & Links](#electronic-versions--links) |
 | `dc.identifier.uri` (handle) | `links` | Set as repository handle link |
 | `dc.description.abstract` | `abstract` | Fill if blank |
@@ -152,9 +181,9 @@ When multiple Pure records match, the best is selected by: visibility (FREE/CAMP
 | `dc.title` + `dc.title.subtitle` | `title` + `subTitle` | Fill if blank; subtitle stripped from title if embedded (see below) |
 | `dc.language.iso` | `language` | Fill if blank |
 | `dc.date.embargo` | `accessType` / `embargoPeriod` on the repository electronic version | Always overwrite — see [Electronic Versions & Links](#electronic-versions--links) |
-| `dc.subject` | `keywordGroups` (free keywords) | Add new keywords; existing ones are preserved, not overwritten — see below |
+| `dc.subject` | `keywordGroups` (free keywords) | Add new keywords; existing ones are preserved, not overwritten — see [Subject Keywords](#subject-keywords) |
 | `dc.publisher` | `publisher` | Fill if blank (BookAnthology, ContributionToBookAnthology, OtherContribution, WorkingPaper, NonTextual types only) |
-| `journal_uuid` | `journalAssociation.journal.uuid` | Fill if blank and the UUID is found in `JOURNAL_MAPPING_JSON` — see [Journal Matching](#journal-matching) for exactly what happens when it isn't |
+| `journal_uuid` / ISSNs / journal titles | `journalAssociation.journal.uuid` | Fill if blank — `journal_uuid`, then ISSN, then title; see [Journal Matching](#journal-matching) |
 | _(always)_ | `workflow.step` | Always set to `validated` on every output record |
 | _(always)_ | `accessType` on every electronic version | Mandatory field in Pure — always ensured to be present; see [Electronic Versions & Links](#electronic-versions--links) for exactly how per EV type |
 
@@ -234,6 +263,8 @@ DSpace `dc.type` values are mapped to Pure output subtypes:
 
 Authors are matched via a pre-built name index supporting primary names, alternative names, and both name orders ("First Last" and "Last, First").
 
+**Apostrophes are equivalent.** When names are compared, these characters are all treated as a straight apostrophe (`'`): right curly `’`, left curly `‘`, modifier letter `ʼ`, prime `′` and acute accent `´`. So `O'Malley`, `O’Malley` and `OʼMalley` — or `D'Arcy` and `D’Arcy` — are the same name. This applies wherever person names are compared, across all three name sources (DSpace contributor fields, existing Pure contributors, and the person mapping file), including the author/editor overlap check. It affects comparison only: names written to Pure are not rewritten by it.
+
 **Duplicate resolution priority:**
 1. Paper evidence match (DOI or handle > title)
 2. Internal Person > External Person
@@ -302,6 +333,12 @@ The following fields are hardcoded on all newly created records (unmatched DSpac
 
 **Record-level organizations** are collected from all resolved contributors and written to the top-level `organizations` (internal) and `externalOrganizations` (external, only if `COLLECT_EXTERNAL_ORGS = True`) arrays.
 
+**Orphan record-level organisations are removed** (updates of existing records, in both precedence and override mode). The contributors the record will have after the update are checked — the new list if contributors are updated, otherwise Pure's existing contributors:
+- a record-level `organizations` entry is kept only if at least one contributor has that organisation in its `organizations`;
+- a record-level `externalOrganizations` entry is kept only if at least one contributor has it in its `externalOrganizations`.
+
+Everything else is removed, and the removed UUIDs are recorded in the status log as `removedOrphanOrganizations`. Entries without a UUID are left untouched. `managingOrganization` is neither read nor changed by this step. If every organisation is orphaned, an empty list is sent. New records need no such step — their lists are built only from their contributors.
+
 ---
 
 ## Electronic Versions & Links
@@ -323,11 +360,48 @@ Version order in the output: repository DOI → publisher DOIs → other → fil
 
 DOI links are removed from `links`; handles are kept. If DSpace and Pure have conflicting handles, a warning is printed and manual review is flagged.
 
+### No duplicate DOIs or handles
+
+- **Publisher DOIs:** each distinct DOI appears once. If Pure already holds the same DOI more than once (in any form), a single electronic version is kept — the copy with the most filled fields, so no access/licence/version metadata is lost; ties keep the first. A DOI from DSpace that already exists in Pure in any form is not added again.
+- **Repository DOI:** at most one.
+- **Handle links:** one link per handle. Pure copies that differ only in form (`http`/`https`, letter case, trailing slash, `handle.net` host) count as the same handle; the copy with the most metadata is kept.
+- `dc.identifier.doi` values that aren't DOIs (ISBNs, article numbers, web pages, `NA`, …) are **not** added as DOI electronic versions; a warning is printed instead.
+
+### DOI & Handle Normalisation
+
+**DOIs** are recognised and compared in one normalised form, `https://doi.org/10.…` (lower case), from any of: a bare `10.…` DOI, `doi.org` or `dx.doi.org` URLs (`http`/`https`, including the `https:/` typo), and `doi:`, `DOI:`, `DOI: `, `DOI ` or `:` prefixes. Trailing full stops are removed (`10.1080/…1339786.` → `…1339786`). `dc.identifier.doi` is split on ` ; ` (a semicolon with a space on at least one side), so DOIs that themselves contain a bare `;` — e.g. SICI DOIs such as `…3.0.CO;2-E` — are not split.
+
+**Handles** are recognised and compared as `http://hdl.handle.net/10379/…` from any of: `hdl.handle.net`, `handle.net` or `www.handle.net` hosts, with or without `http(s)://`, in any letter case, with or without trailing slashes. Any `hdl.handle.net` URL — including another institution's handle — is still recognised as a handle link.
+
 ---
 
 ## Subject Keywords
 
-`dc.subject` (semicolon-separated) is parsed and added to the record's `keywordGroups` as a free-keywords group. Existing keyword groups — including any pre-existing free-keywords group — are preserved; new subjects are added alongside them rather than replacing them. Applies to both updated and newly created records.
+`dc.subject` (semicolon-separated) is parsed and added to the record's `keywordGroups` as a free-keywords group. Applies to both updated and newly created records.
+
+- **Existing free keywords are kept.** They are read from both places Pure stores them — the group's `keywords` list and its `keywordContainers` — and merged with the DSpace subjects. Duplicates are detected case-insensitively (the existing spelling wins), and the merged list is sorted alphabetically.
+- **All other keyword groups are passed through unchanged** — e.g. ASJC subject areas and Sustainable Development Goals (`ClassificationsKeywordGroup`, including their own `keywordContainers` with `structuredKeyword` entries) and Pure's authors group. The free-keywords group is placed after them.
+- **Shape written** — the same as a user-entered group on a valid Pure record: the merged list appears both in `keywords` and in one `ACCEPTED` / `USER_SUPPLIED` keyword container. (A group with only `keywords` is not picked up by Pure.)
+
+```json
+{
+  "typeDiscriminator": "FreeKeywordsKeywordGroup",
+  "logicalName": "keywordContainers",
+  "name": { "en_IE": "Keywords" },
+  "keywords": [
+    { "locale": "en_IE", "freeKeywords": [ /* merged keywords */ ] }
+  ],
+  "keywordContainers": [
+    {
+      "state": "ACCEPTED",
+      "origin": "USER_SUPPLIED",
+      "freeKeywords": [
+        { "locale": "en_IE", "freeKeywords": [ /* same merged keywords */ ] }
+      ]
+    }
+  ]
+}
+```
 
 ---
 
@@ -345,17 +419,34 @@ DSpace-exported filenames in `pdf_handle_paths` can be HTML-entity-encoded (e.g.
 
 ## Journal Matching
 
-`journal_uuid` (from the DSpace CSV) is checked against `JOURNAL_MAPPING_JSON` — Pure's own journal dump — before being trusted, rather than being submitted as-is. A UUID that doesn't actually correspond to one of Pure's existing journals (stale, mistyped, or from a since-merged/deleted journal) would otherwise be sent to Pure and rejected outright with a "Referenced content ... not found" error, the same class of failure as a dangling `ExternalPerson` reference.
+For `ContributionToJournal` **and** `ContributionToPeriodical` records (treated identically — no journal type in Pure is excluded), the journal is found in four steps, stopping at the first that succeeds:
 
-- **UUID found in `JOURNAL_MAPPING_JSON`** → used as-is.
-- **UUID present but not found** → treated exactly the same as no UUID at all.
-- **No UUID at all** → unchanged from before.
+1. **`journal_uuid`** from the DSpace CSV — used if it is one of the journals in `JOURNAL_MAPPING_JSON`. A UUID that isn't (stale, mistyped, merged/deleted journal) is treated as missing, rather than being sent to Pure and rejected.
+2. **ISSN** — all ISSNs in `journal_issn` and `dc.identifier.issn` (both multi-entry) are checked against **every** ISSN of every Pure journal, in both `issns` and `additionalSearchableIssns`.
+   - ISSNs are normalised to `NNNN-NNNC` (hyphen optional, `x` → `X`). Values from `dc.identifier.issn` must pass the ISSN check digit, so page ranges such as `1690-1697` are ignored.
+   - If all matching journals are **the same journal** — their titles are spelling variants of each other (duplicate Pure records) — the one with the most complete metadata is used.
+   - If the matching journals have **genuinely different titles** (one ISSN matching several titles, or several ISSNs belonging to different journals), the ISSN result is not used and step 3 decides.
+3. **Title** — titles in `dc.identifier.journal` and `journal_title` are compared with every Pure journal title in `titles` and `additionalSearchableTitles` (e.g. "J Cell Sci"): lowercased, `&` counted as "and", punctuation removed (accents are kept). If several journals match, the one with the most complete metadata is used.
+4. **Nothing found** — a new record is **downgraded to `OtherContribution`**; an existing Pure record is left as it is (its type is never changed; only a warning is printed).
 
-What "treated as no UUID" means differs by whether the record is being created or updated:
-- **New record** (`ContributionToJournal`/`ContributionToPeriodical` with no usable `journal_uuid`): downgraded to `OtherContribution`.
-- **Existing matched record**: if it already has a `journalAssociation`, it's left as-is; if it doesn't, only a warning is printed — the record's type is not changed.
+**Most complete metadata** = most filled top-level fields, excluding system fields (`uuid`, `pureId`, `version`, `created…`/`modified…`, `portalUrl`, …); remaining ties go to the journal listed first in `JOURNAL_MAPPING_JSON`.
 
-`JOURNAL_MAPPING_JSON` is loaded the same way as `PUBLISHER_MAPPING_JSON` — with no fallback if it's missing or invalid, so the file must exist and be readable, or the script stops at startup. (The validation itself is written to degrade gracefully — passing no mapping trusts any `journal_uuid` as-is, the pre-existing behaviour — but `main()` always loads the file, so in practice it's required for a normal run.)
+**Spelling variants** — two journal titles are variants when, after lowercasing, `&` → `and`, dropping `(…)` qualifiers such as "(Switzerland)" and removing punctuation and spaces, they contain **the same numbers** and are **at least 95% similar**, or one is a word-by-word abbreviation of the other (e.g. "J. Civ. Struct. Health Monit." / "Journal of Civil Structural Health Monitoring"). Because numbers must match, "Ethnomusicology Ireland 9" and "… 10" are different journals.
+
+**Existing Pure records** only get a journal when they have none; an existing `journalAssociation` is never replaced.
+
+**Logging:**
+- status log: `journalMatchedBy` (`ISSN` or `title`), `journalCandidates` (all journals that qualified, when there were several), `typeChangedToOther` (for downgraded new records);
+- `unmatched_journals_YYYY-MM-DD.csv` — one row per downgraded new record, and per existing journal-type record that has no journal and none could be found, with: `handle`, `title`, `dc.identifier.issn`, `journal_issn`, `dc.identifier.journal`, `journal_title`, `reason` (e.g. `ISSN not found in Pure; no journal title in DSpace`), `pure_uuid` (existing records only). New records skipped for having no matched contributors are not listed.
+- the `Unmatched journals` line in the final counts.
+
+`JOURNAL_MAPPING_JSON` must exist and be readable — the script stops at startup otherwise.
+
+---
+
+## Pure IDs (`pureId`) in the Output
+
+`pureId` is a Pure system field. In **updates** of existing records, only the **record-level** `pureId` is supplied, right after `uuid`, to identify the record. Every nested `pureId` — carried over from Pure in contributors, electronic versions and their files, identifiers, keyword groups, etc. — is removed. Nested objects stay linked to their Pure entities through their UUID references (e.g. `person.uuid` / `externalPerson.uuid` on every contributor, `fileId` on files). **New records** contain no `pureId` at all.
 
 ---
 
@@ -378,7 +469,9 @@ What "treated as no UUID" means differs by whether the record is being created o
 ├── no_author_records_YYYY-MM-DD.csv
 ├── unmatched_contributors_YYYY-MM-DD.csv
 ├── unmatched_funders_YYYY-MM-DD.csv
-└── unmatched_publishers_YYYY-MM-DD.csv
+├── unmatched_publishers_YYYY-MM-DD.csv
+├── unmatched_journals_YYYY-MM-DD.csv
+└── dspace_uuid_mismatches_YYYY-MM-DD.csv
 ```
 
 | Path | Contents |
@@ -393,6 +486,32 @@ What "treated as no UUID" means differs by whether the record is being created o
 | `unmatched_contributors.csv` | Contributors not found in person mapping |
 | `unmatched_funders.csv` | Funders not found in organization mapping |
 | `unmatched_publishers.csv` | Publishers not found in publisher mapping |
+| `unmatched_journals.csv` | Journal-type records for which no journal was found — see [Journal Matching](#journal-matching) |
+| `dspace_uuid_mismatches.csv` | Records updated although they carry a different DSpace item's UUID — see [DSpace UUID mismatches](#dspace-uuid-mismatches) |
+
+The CSV files are only written when they have at least one row.
+
+### Final Counts
+
+At the end of a run, the processing log shows:
+
+```
+   Skipped (out of scope): …
+     ↳ Not in Publications collection: …
+     ↳ No contributors in any field: …
+   Matched to existing Pure record: …
+   Unmatched (new records created): …
+   Successfully processed: …
+   Failed (total): …
+     ↳ No contributors matched to Pure persons: …
+     ↳ Other errors: …
+   Unmatched contributors: …
+   Unmatched funders: …
+   Unmatched publishers: …
+   Unmatched journals: …
+   DSpace UUID mismatches: …
+   Logs saved to: …
+```
 
 ### Status Log Entry
 
@@ -416,6 +535,17 @@ What "treated as no UUID" means differs by whether the record is being created o
 }
 ```
 
+Additional fields appear only when relevant:
+
+| Field | When |
+|---|---|
+| `duplicateResolution` | Several Pure records matched — how the one to update was chosen |
+| `journalMatchedBy` | Journal found by `ISSN` or `title` (not needed for `journal_uuid`) |
+| `journalCandidates` | Several journals qualified — all of their UUIDs |
+| `typeChangedToOther` | New record downgraded to `OtherContribution` (no journal found) |
+| `removedOrphanOrganizations` | Orphan record-level organisations removed — per list, the removed UUIDs |
+| `unmatchedContributors` / `unmatchedFunders` | Contributors / funders that could not be matched |
+
 ---
 
 ## Common Issues
@@ -431,7 +561,10 @@ What "treated as no UUID" means differs by whether the record is being created o
 | Some/all funders unmatched | ✅ (partial/no funders) | ❌ | ❌ | `processing_log` + `unmatched_funders.csv` |
 | Publisher not matched | ✅ (no publisher set) | ❌ | ❌ | `processing_log` + `unmatched_publishers.csv` |
 | Invalid internal org UUID | ✅ | ❌ | ❌ | `processing_log` warning; UUID checked against external orgs endpoint, moved or discarded |
-| No journal UUID | ✅ (as OtherContribution) | ❌ | ❌ | `processing_log` warning; type changed |
+| No journal found (new record) | ✅ (as OtherContribution) | ❌ | ❌ | `processing_log` warning; `unmatched_journals.csv`; `typeChangedToOther` in `status_log` |
+| No journal found (existing record) | ✅ (type unchanged) | ❌ | ❌ | `processing_log` warning; `unmatched_journals.csv` |
+| Updated record carries another DSpace item's UUID | ✅ | ❌ | ❌ | `processing_log` warning; `dspace_uuid_mismatches.csv` |
+| Orphan organisations removed | ✅ | ❌ | ❌ | `processing_log`; `removedOrphanOrganizations` in `status_log` |
 | Missing DSpace UUID | ✅ | ❌ | ❌ | `processing_log` warning; `identifiers` field omitted |
 | Python exception | ❌ | ✅ | ✅ | `error_log` with traceback |
 
@@ -452,13 +585,13 @@ DSpace authors: "Smith, John", "Doe, Jane", "Unknown, Person"
 Result: record created with 2 contributors; "Unknown, Person" written to unmatched_contributors.csv
 ```
 
-### No Journal UUID
+### No Journal Found
 
 ```
 ⚠️ No journal UUID found for ContributionToJournal - changing to OtherContribution
 ```
 
-The record is still created/updated but saved under `othercontribution_YYYY-MM-DD.json`.
+Printed for a new record when neither `journal_uuid`, ISSN nor title matching found a journal. The record is still created, but saved under `othercontribution_YYYY-MM-DD.json`, and listed in `unmatched_journals.csv` with the reason.
 
 ---
 

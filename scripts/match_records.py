@@ -242,6 +242,7 @@ _unmatched_contributors = []
 _unmatched_funders = []
 _unmatched_publishers = []
 _unmatched_journals = []
+_dspace_uuid_mismatches = []
 
 # --- LOGGER SETUP --- #
 
@@ -1368,10 +1369,58 @@ def process_contributors(
     return final_contributors, unmatched_contributors
 
 
-def resolve_record_duplicate(records):
-    """Choose record with most metadata or updated by real user"""
+def has_dspace_uuid(record):
+    """True if a Pure record has a DSpace identifier (idSource "DSpace") with a non-empty value."""
+    return any(
+        isinstance(identifier, dict)
+        and identifier.get("idSource") == "DSpace"
+        and str(identifier.get("value") or "").strip()
+        for identifier in (record.get("identifiers") or [])
+    )
+
+
+def dspace_uuids_of(record):
+    """All non-empty DSpace identifier values (idSource "DSpace") of a Pure record."""
+    return [
+        str(identifier.get("value")).strip()
+        for identifier in (record.get("identifiers") or [])
+        if isinstance(identifier, dict)
+        and identifier.get("idSource") == "DSpace"
+        and str(identifier.get("value") or "").strip()
+    ]
+
+
+def resolve_record_duplicate(records, log_entry=None):
+    """
+    Choose which of several matching Pure records to update.
+
+    DSpace identifier first:
+      - exactly one duplicate has a DSpace UUID among its identifiers -> that
+        record is chosen, with no further comparison;
+      - several have one -> duplicates without a DSpace UUID are discarded
+        and the standard comparison below runs on the rest only;
+      - none has one -> the standard comparison runs on all of them.
+    Standard comparison: record with most metadata or updated by real user.
+
+    If a dict is passed as log_entry, log_entry["duplicateResolution"]
+    records which of the three cases applied.
+    """
     if not records:
         return None
+
+    with_dspace_uuid = [r for r in records if has_dspace_uuid(r)]
+    if len(with_dspace_uuid) == 1:
+        print(f"  ✅ Duplicates: only {with_dspace_uuid[0].get('uuid')} has a DSpace UUID — updating it")
+        if log_entry is not None:
+            log_entry["duplicateResolution"] = "only record with a DSpace UUID"
+        return with_dspace_uuid[0]
+    if len(with_dspace_uuid) > 1:
+        print(f"  ℹ️ Duplicates: {len(with_dspace_uuid)} of {len(records)} have a DSpace UUID — comparing only those")
+        if log_entry is not None:
+            log_entry["duplicateResolution"] = f"standard comparison among {len(with_dspace_uuid)} of {len(records)} records with a DSpace UUID"
+        records = with_dspace_uuid
+    elif log_entry is not None:
+        log_entry["duplicateResolution"] = "standard comparison (no record has a DSpace UUID)"
 
     def score(record):
         # 1. Prefer visibility FREE or CAMPUS
@@ -3657,11 +3706,36 @@ def main():
             })
 
         # Resolve duplicate records
+        resolved_from_duplicates = len(matched_records) > 1
         if len(matched_records) > 1:
             log_entry["duplicates"] = True
-            chosen_record = resolve_record_duplicate(matched_records)
+            chosen_record = resolve_record_duplicate(matched_records, log_entry)
             if chosen_record:
                 matched_records = [chosen_record]
+
+        # The Pure record about to be updated may already be linked to a
+        # DIFFERENT DSpace item -- whether it was the only match or was chosen
+        # among duplicates (e.g. by the DSpace UUID rule). It is still updated,
+        # but every such case is reported (processing log + CSV).
+        if matched_records:
+            target_record = matched_records[0]
+            record_dspace_uuids = dspace_uuids_of(target_record)
+            row_dspace_uuid = (row.get("uuid") or "").strip()
+            if record_dspace_uuids and row_dspace_uuid.lower() not in {u.lower() for u in record_dspace_uuids}:
+                row_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+                mismatch_case = "chosen among duplicates" if resolved_from_duplicates else "single match"
+                print(f"  ⚠️ DSpace UUID mismatch ({mismatch_case}): DSpace item {row_dspace_uuid or '(no uuid)'} is updating "
+                      f"Pure record {target_record.get('uuid')}, which already has DSpace UUID(s) {record_dspace_uuids}")
+                _dspace_uuid_mismatches.append({
+                    "dspace_uuid": row_dspace_uuid,
+                    "pure_record_dspace_uuids": " ; ".join(record_dspace_uuids),
+                    "handle": row_handles[0] if row_handles else None,
+                    "pure_uuid": target_record.get("uuid"),
+                    "dspace_title": row.get("dc.title", ""),
+                    "pure_title": (target_record.get("title") or {}).get("value", ""),
+                    "portal_url": target_record.get("portalUrl", ""),
+                    "case": mismatch_case,
+                })
 
         if matched_records:
             log_entry["matched"] = True
@@ -3790,6 +3864,19 @@ def main():
             writer.writerows(_unmatched_journals)
         print(f"✅ Unmatched journals saved to: {unmatched_journals_csv}")
 
+    # DSpace UUID mismatches CSV (the Pure record updated -- single match or
+    # chosen among duplicates -- carries a different DSpace item's UUID)
+    if _dspace_uuid_mismatches:
+        mismatches_csv = os.path.join(OUTPUT_DIR, f"dspace_uuid_mismatches_{TODAY}.csv")
+        print(f"\n📝 Writing {len(_dspace_uuid_mismatches)} DSpace UUID mismatches to CSV...")
+        with open(mismatches_csv, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['dspace_uuid', 'pure_record_dspace_uuids', 'handle', 'pure_uuid',
+                          'dspace_title', 'pure_title', 'portal_url', 'case']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_dspace_uuid_mismatches)
+        print(f"✅ DSpace UUID mismatches saved to: {mismatches_csv}")
+
  
     # Count results
     # Every record lands in exactly one of these buckets per breakdown, so
@@ -3819,6 +3906,8 @@ def main():
     print(f"   Unmatched contributors: {len(_unmatched_contributors)}")
     print(f"   Unmatched funders: {len(_unmatched_funders)}")
     print(f"   Unmatched publishers: {len(_unmatched_publishers)}")
+    print(f"   Unmatched journals: {len(_unmatched_journals)}")
+    print(f"   DSpace UUID mismatches: {len(_dspace_uuid_mismatches)}")
     print(f"   Logs saved to: {LOG_DIR}")
 
     # Calculate elapsed time
