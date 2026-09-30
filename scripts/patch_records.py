@@ -13,11 +13,20 @@ Patch modes (one or more may be combined):
                          that lack one. Requires --publisher-mapping and --dspace-csv.
   --patch-file-versions  Set a default versionType on file electronic versions
                          that don't have one assigned.
-  --patch-urls            Clean links[]: keep one Handle link (desc "Repository
-                           Handle"), drop DOIs/portal links, dedupe the rest.
+  --patch-urls            Clean links[]: drop DOI/portal links, remove only exact
+                           duplicate links (same URL), keep every distinct Handle
+                           (desc "Repository Handle") for manual review.
   --patch-duplicate-files Remove duplicate FileElectronicVersion entries (same
                            normalized fileName + size), keeping the most
                            complete one.
+  --patch-duplicate-dois  Remove duplicate DOI electronic versions (same DOI in any
+                           form: case, URL/prefix, trailing full stop), keeping
+                           their metadata (access, version, licence) on the
+                           remaining one.
+  --patch-subjects        Add DSpace dc.subject values as free keywords
+                           (FreeKeywordsKeywordGroup) to Pure records, merged
+                           with existing keywords without duplication.
+                           Requires --dspace-csv.
 
 See README.md for full usage examples.
 """
@@ -94,9 +103,21 @@ def load_records(path: str) -> list:
     return records
 
 
-def write_json(path: str, data) -> None:
+# Output files actually written during this run (see write_json / print_summary).
+_WRITTEN_FILES = set()
+
+
+def write_json(path: str, data) -> bool:
+    """
+    Write data as JSON. If there is nothing to write (empty list/dict), no
+    file is created. Returns True if the file was written.
+    """
+    if not data:
+        return False
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    _WRITTEN_FILES.add(path)
+    return True
 
 
 def ensure_dir(path: str) -> None:
@@ -133,6 +154,21 @@ def _strip_pure_id(obj):
     if isinstance(obj, list):
         return [_strip_pure_id(item) for item in obj]
     return obj
+
+
+def _finalise_update_patches(patches: list, records: list) -> list:
+    """
+    Final shape of an update patch: "uuid" first, then the patched fields
+    with every pureId removed at any nesting level -- pureId is a system
+    field and is not supplied in patches (the record is identified by uuid).
+    `records` is accepted for a uniform call signature and is not used.
+    """
+    finalised = []
+    for patch in patches:
+        entry = {"uuid": patch.get("uuid")}
+        entry.update(_strip_pure_id({k: v for k, v in patch.items() if k not in ("uuid", "pureId")}))
+        finalised.append(entry)
+    return finalised
 
 
 def _remove_null_list_items(obj):
@@ -316,6 +352,7 @@ def patch_titles(
             tqdm.write(f"       Subtitle: {subtitle}")
 
     output_path = os.path.join(output_dir, f"title_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -396,6 +433,7 @@ def patch_workflow(
             result.append({"uuid": record["uuid"], "workflow": {"step": "validated"}})
 
     output_path = os.path.join(output_dir, f"workflow_patch_{TODAY}.json")
+    result = _finalise_update_patches(result, records)
     write_json(output_path, result)
 
     stats = {
@@ -426,6 +464,11 @@ def _clean_contributor_ext_orgs(contributors: list):
     cleaned = []
     changed = False
     for contrib in contributors:
+        # Anything that isn't a contributor object (e.g. a null list item --
+        # see --patch-nulls) is passed through unchanged rather than crashing.
+        if not isinstance(contrib, dict):
+            cleaned.append(contrib)
+            continue
         if contrib.get("externalOrganizations"):
             changed = True
             new_contrib = {k: v for k, v in contrib.items() if k != "externalOrganizations"}
@@ -460,10 +503,13 @@ def patch_external_orgs(
         if changed:
             record_cleared += 1
 
+        # Internal and external contributors alike lose their external
+        # organisations. The contributors list is only sent when a contributor
+        # actually changed, so contributors are never overwritten needlessly.
         contributors = record.get("contributors", [])
         cleaned_contribs, contribs_changed = _clean_contributor_ext_orgs(contributors)
-        patch["contributors"] = cleaned_contribs if contributors else []
         if contribs_changed:
+            patch["contributors"] = cleaned_contribs
             changed = True
             contributor_cleared += 1
 
@@ -478,6 +524,7 @@ def patch_external_orgs(
             skipped += 1
 
     output_path = os.path.join(output_dir, f"external_org_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -548,6 +595,7 @@ def patch_author_keywords(
         )
 
     output_path = os.path.join(output_dir, f"author_keyword_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -625,6 +673,7 @@ def patch_file_versions(
         patched += 1
 
     output_path = os.path.join(output_dir, f"file_version_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -1061,6 +1110,7 @@ def patch_duplicate_files(
         files_removed += len(removed)
 
     output_path = os.path.join(output_dir, f"duplicate_file_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -1087,7 +1137,10 @@ def _normalize_for_comparison(s: str) -> str:
 
 
 def _load_dspace_rows(csv_path: str) -> list[dict]:
-    with open(csv_path, newline="", encoding="utf-8") as f:
+    # utf-8-sig strips a leading BOM if present (DSpace exports include one);
+    # without it the first header is read as '\ufeff"uuid"' and DSpace UUID
+    # matching silently never succeeds. Plain UTF-8 files read identically.
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
 
@@ -1282,6 +1335,7 @@ def patch_publishers(
         tqdm.write(f"  ✅ [{uuid}] '{publisher_name}' → {matched_pub['uuid']}")
 
     output_path = os.path.join(output_dir, f"publisher_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -1331,17 +1385,18 @@ def _clean_links(links: list, record: dict):
     """
     Clean a record's `links` list:
       - drop DOI links and Pure portal links
-      - keep exactly one Handle link, with its description normalised to
-        "Repository Handle"
-      - de-duplicate the remaining (non-Handle) links by URL, preferring
-        whichever copy has a description when duplicates are found
+      - remove only EXACT duplicates: links with the identical URL (surrounding
+        whitespace ignored), preferring whichever copy has a description.
+        Links whose URLs differ in any way -- including two different Handles
+        -- are all kept, for manual review.
+      - every Handle link's description is normalised to "Repository Handle"
+    Order of first occurrence is kept.
     Returns (cleaned_links, changed).
     """
     if not links:
         return links, False
 
-    handle_link = None
-    other_by_url = {}
+    link_by_url = {}
     order = []
 
     for link in links:
@@ -1355,28 +1410,24 @@ def _clean_links(links: list, record: dict):
         if _is_portal_url(link, record):
             continue
 
-        if _is_handle_url(url):
-            if handle_link is None:
-                handle_link = link
-            continue
-
-        key = url.lower()
-        existing = other_by_url.get(key)
+        key = url  # exact URL only
+        existing = link_by_url.get(key)
         if existing is None:
-            other_by_url[key] = link
+            link_by_url[key] = link
             order.append(key)
         else:
-            existing_has_desc = bool((existing.get("description") or {}).get("en_IE", "").strip())
-            new_has_desc = bool((link.get("description") or {}).get("en_IE", "").strip())
+            existing_has_desc = bool(((existing.get("description") or {}).get("en_IE") or "").strip())
+            new_has_desc = bool(((link.get("description") or {}).get("en_IE") or "").strip())
             if new_has_desc and not existing_has_desc:
-                other_by_url[key] = link
+                link_by_url[key] = link
 
     cleaned = []
-    if handle_link is not None:
-        normalized_handle = dict(handle_link)
-        normalized_handle["description"] = {"en_IE": "Repository Handle"}
-        cleaned.append(normalized_handle)
-    cleaned.extend(other_by_url[key] for key in order)
+    for key in order:
+        link = link_by_url[key]
+        if _is_handle_url(key):
+            link = dict(link)
+            link["description"] = {"en_IE": "Repository Handle"}
+        cleaned.append(link)
 
     return cleaned, cleaned != links
 
@@ -1387,11 +1438,12 @@ def patch_urls(
     modified_after: date = date.fromisoformat("1970-01-01"),
 ) -> dict:
     """
-    Clean up each record's `links` list: keep exactly one Handle link
-    (description normalised to "Repository Handle"), drop all DOI links
-    and Pure portal links, and de-duplicate what's left by URL (preferring
-    the copy that has a description). Produces a PATCH-compatible JSON
-    (uuid + cleaned links list) for every record whose links actually changed.
+    Clean up each record's `links` list: drop all DOI links and Pure portal
+    links, remove only exact duplicate links (identical URL; the copy with a
+    description is kept), and normalise every Handle link's description to
+    "Repository Handle". Different Handles are all kept for manual review.
+    Produces a PATCH-compatible JSON (uuid + cleaned links list) for every
+    record whose links actually changed.
     """
     patches = []
     skipped = 0
@@ -1422,6 +1474,7 @@ def patch_urls(
         tqdm.write(f"  🔗 [{uuid}] links: {len(links)} → {len(cleaned_links)}")
 
     output_path = os.path.join(output_dir, f"url_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
     write_json(output_path, patches)
 
     return {
@@ -1434,6 +1487,413 @@ def patch_urls(
     }
 
 # ---------------------------------------------------------------------------
+# Patch: duplicate DOIs
+# ---------------------------------------------------------------------------
+
+# DOI recognition, identical to match_records.py: bare "10.xxx/..", doi.org or
+# dx.doi.org URLs (http/https, and the "https:/" typo), and "doi:", "DOI:",
+# "DOI " or ":" prefixes.
+_DOI_REGEX = re.compile(r'^(?:https?:/{1,2})?(?:(?:dx\.)?doi\.org/|doi\s*:?\s*|:)?(10\.\S+)$', re.IGNORECASE)
+
+
+def _doi_comparison_key(value: str) -> str:
+    """
+    Key used to decide whether two DOI electronic versions are duplicates.
+    Same normalisation as match_records.normalize_doi: case-insensitive,
+    any URL/prefix form of the same DOI gives the same key, and trailing full
+    stops are ignored ("10.1/A", "https://doi.org/10.1/a" and
+    "DOI: 10.1/a." are duplicates). A value that isn't recognisable as a
+    DOI only matches an identical value (surrounding whitespace ignored).
+    Used for comparison only -- the DOI text stored in Pure is not changed.
+    """
+    match = _DOI_REGEX.match(value.strip().lower())
+    if not match:
+        return value.strip()
+    return f"https://doi.org/{match.group(1).rstrip('.')}"
+
+
+# Fields never copied from a removed duplicate onto the kept one: the DOI
+# itself (identical by definition), the type, and Pure's internal id.
+_DOI_MERGE_EXCLUDED_FIELDS = {"doi", "typeDiscriminator", "pureId"}
+
+
+def _is_filled(value) -> bool:
+    return value not in (None, "", [], {})
+
+
+def _merge_duplicate_doi_versions(duplicates: list):
+    """
+    Merge electronic versions that share the same DOI into one.
+
+    The kept entry is the one with the most filled fields (ties -> first).
+    Any field it lacks is then filled from the other copies, in their
+    original order, so no metadata (access type, version, licence, ...) is
+    lost. accessType and embargoPeriod are taken together from one copy, so
+    an embargo period is never combined with another copy's access type.
+    Where copies disagree on a field, the kept entry's value stays and the
+    conflict is reported.
+
+    Returns (merged_entry, conflicting_field_names).
+    """
+    def richness(ev):
+        return sum(1 for k, v in ev.items() if k not in _DOI_MERGE_EXCLUDED_FIELDS and _is_filled(v))
+
+    kept_index = max(range(len(duplicates)), key=lambda i: (richness(duplicates[i]), -i))
+    merged = dict(duplicates[kept_index])
+    others = [ev for i, ev in enumerate(duplicates) if i != kept_index]
+    conflicts = []
+
+    if not _is_filled(merged.get("accessType")):
+        for ev in others:
+            if _is_filled(ev.get("accessType")):
+                merged["accessType"] = ev["accessType"]
+                if _is_filled(ev.get("embargoPeriod")):
+                    merged["embargoPeriod"] = ev["embargoPeriod"]
+                else:
+                    merged.pop("embargoPeriod", None)
+                break
+
+    for ev in others:
+        for key, value in ev.items():
+            if key in _DOI_MERGE_EXCLUDED_FIELDS or key in ("accessType", "embargoPeriod") or not _is_filled(value):
+                continue
+            if not _is_filled(merged.get(key)):
+                merged[key] = value
+            elif merged[key] != value and key not in conflicts:
+                conflicts.append(key)
+        for key in ("accessType", "embargoPeriod"):
+            if _is_filled(ev.get(key)) and _is_filled(merged.get(key)) and ev[key] != merged[key] and key not in conflicts:
+                conflicts.append(key)
+
+    return merged, conflicts
+
+
+def _dedupe_doi_electronic_versions(electronic_versions: list):
+    """
+    Collapse DoiElectronicVersion entries with the same DOI (compared with
+    _doi_comparison_key, so different spellings of one DOI count as the same)
+    into one, merged as described in _merge_duplicate_doi_versions. The merged
+    entry takes the position of the first copy and keeps its own DOI text;
+    every other electronic version is left untouched.
+
+    Returns (new_list, removed_count, [(doi, conflicting_fields), ...]).
+    """
+    groups = defaultdict(list)
+    for idx, ev in enumerate(electronic_versions):
+        if (
+            isinstance(ev, dict)
+            and ev.get("typeDiscriminator") == "DoiElectronicVersion"
+            and isinstance(ev.get("doi"), str)
+            and ev["doi"].strip()
+        ):
+            groups[_doi_comparison_key(ev["doi"])].append(idx)
+
+    duplicate_groups = {doi: idxs for doi, idxs in groups.items() if len(idxs) > 1}
+    if not duplicate_groups:
+        return electronic_versions, 0, []
+
+    replacement = {}
+    drop = set()
+    conflict_report = []
+    for doi, idxs in duplicate_groups.items():
+        merged, conflicts = _merge_duplicate_doi_versions([electronic_versions[i] for i in idxs])
+        replacement[idxs[0]] = merged
+        drop.update(idxs[1:])
+        if conflicts:
+            conflict_report.append((doi, conflicts))
+
+    new_list = [
+        replacement.get(idx, ev)
+        for idx, ev in enumerate(electronic_versions)
+        if idx not in drop
+    ]
+    return new_list, len(drop), conflict_report
+
+
+def patch_duplicate_dois(
+    records: list,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    Remove duplicate DOI electronic versions: DoiElectronicVersion entries
+    with the same DOI, whatever form it is written in (case, doi.org /
+    dx.doi.org / "doi:" prefix, trailing full stop -- see
+    _doi_comparison_key). Only the DOI is compared. The
+    metadata of the removed copies (access type, embargo, version, licence,
+    ...) is kept on the remaining entry -- see _merge_duplicate_doi_versions.
+    Produces a standard PATCH-compatible JSON (uuid + full electronicVersions
+    list) for every record that had at least one duplicate.
+    """
+    patches = []
+    skipped = 0
+    skipped_date = 0
+    dois_removed = 0
+    records_with_conflicts = 0
+
+    for record in tqdm(records, desc="[duplicate-dois] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        uuid = record.get("uuid", "")
+        electronic_versions = record.get("electronicVersions") or []
+
+        new_versions, removed, conflicts = _dedupe_doi_electronic_versions(electronic_versions)
+        if not removed:
+            skipped += 1
+            continue
+
+        patches.append({"uuid": uuid, "electronicVersions": new_versions})
+        dois_removed += removed
+        tqdm.write(f"  🧹 [{uuid}] removed {removed} duplicate DOI electronic version(s)")
+        if conflicts:
+            records_with_conflicts += 1
+            for doi, fields in conflicts:
+                tqdm.write(f"     ⚠️ copies of {doi} disagree on {fields} — kept the most complete copy's values")
+
+    output_path = os.path.join(output_dir, f"duplicate_doi_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
+    write_json(output_path, patches)
+
+    return {
+        "total":                   len(records),
+        "skipped_date_filter":     skipped_date,
+        "skipped_no_change":       skipped,
+        "patched":                 len(patches),
+        "duplicate_dois_removed":  dois_removed,
+        "records_with_conflicts":  records_with_conflicts,
+        "files":                   [output_path],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Patch: subjects (dc.subject -> free keywords)
+# ---------------------------------------------------------------------------
+#
+# parse_subjects and merge_keywords are taken unchanged from match_records.py.
+# build_free_keywords_group writes the keywords in the shape Pure itself uses
+# for a user-entered free-keywords group: both the "keywords" list and the
+# "keywordContainers" list (state ACCEPTED, origin USER_SUPPLIED), as seen on
+# valid records exported from Pure. The earlier template with only "keywords"
+# was not picked up by Pure.
+
+FREE_KEYWORDS_TYPE_DISCRIMINATOR = "FreeKeywordsKeywordGroup"
+FREE_KEYWORDS_LOGICAL_NAME       = "keywordContainers"
+
+
+def parse_subjects(subject_str):
+    """Parse dc.subject field: semicolon-separated keywords."""
+    if not subject_str:
+        return []
+    return [s.strip() for s in subject_str.split(";") if s.strip()]
+
+
+def merge_keywords(existing_keywords, new_keywords):
+    """
+    Merge two lists of keyword strings into one, alphabetically sorted list
+    with no duplicates. Comparison for duplicates is case-insensitive, but
+    the original capitalisation of the first occurrence encountered is kept
+    (existing keywords take precedence over new ones with the same value).
+    """
+    seen = {}
+    for kw in existing_keywords + new_keywords:
+        key = kw.lower()
+        if key not in seen:
+            seen[key] = kw
+    return sorted(seen.values(), key=lambda k: k.lower())
+
+
+def build_free_keywords_group(keywords):
+    """
+    Build a FreeKeywordsKeywordGroup dict (dc.subject -> Pure keywordGroups),
+    mirroring a valid Pure record: the same en_IE keyword list appears in
+    "keywords" and in a single ACCEPTED / USER_SUPPLIED keyword container.
+    """
+    return {
+        "typeDiscriminator": "FreeKeywordsKeywordGroup",
+        "logicalName": "keywordContainers",
+        "name": {
+            "en_IE": "Keywords"
+        },
+        "keywords": [
+            {
+                "locale": "en_IE",
+                "freeKeywords": list(keywords)
+            }
+        ],
+        "keywordContainers": [
+            {
+                "state": "ACCEPTED",
+                "origin": "USER_SUPPLIED",
+                "freeKeywords": [
+                    {
+                        "locale": "en_IE",
+                        "freeKeywords": list(keywords)
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _existing_free_keywords(group: dict) -> list:
+    """
+    Every keyword string in a free-keywords group, from both places Pure
+    stores them: "keywords" (locale entries) and "keywordContainers"
+    (containers -> locale entries). Duplicates are removed later by
+    merge_keywords.
+    """
+    locale_entries = list(group.get("keywords") or [])
+    for container in group.get("keywordContainers") or []:
+        if isinstance(container, dict):
+            locale_entries.extend(container.get("freeKeywords") or [])
+    found = []
+    for locale_entry in locale_entries:
+        if not isinstance(locale_entry, dict):
+            continue
+        found.extend(
+            kw for kw in (locale_entry.get("freeKeywords") or [])
+            if isinstance(kw, str) and kw.strip()
+        )
+    return found
+
+
+def _is_general_free_keywords_group(kg: dict) -> bool:
+    """
+    True only for the general free-keywords group (typeDiscriminator AND
+    logicalName both required, as in match_records.py). Pure's own "authors"
+    free-keywords group (logicalName /dk/atira/pure/authors) and any
+    classification/discipline keyword groups do not match and are passed
+    through untouched.
+    """
+    return (
+        kg.get("typeDiscriminator") == FREE_KEYWORDS_TYPE_DISCRIMINATOR
+        and kg.get("logicalName") == FREE_KEYWORDS_LOGICAL_NAME
+    )
+
+
+def patch_subjects(
+    records: list,
+    dspace_csv_path: str,
+    output_dir: str,
+    modified_after: date = date.fromisoformat("1970-01-01"),
+) -> dict:
+    """
+    For each Pure record, find the matching DSpace row (by DOI, handle, or
+    DSpace UUID — same matching as --patch-publishers), parse its dc.subject
+    values and add them to the record's general free-keywords group.
+
+    Existing keywords are never removed:
+      - every keyword already in the general FreeKeywordsKeywordGroup
+        (all locale entries, in both "keywords" and "keywordContainers") is
+        kept and merged with the DSpace subjects;
+      - all other keyword groups are passed through unchanged.
+    Duplicates are removed case-insensitively; an existing keyword's
+    capitalisation wins over a DSpace subject with the same value.
+
+    Records where every DSpace subject is already present are skipped.
+    Produces a standard PATCH-compatible JSON (uuid + full keywordGroups).
+    """
+    dspace_rows  = _load_dspace_rows(dspace_csv_path)
+    dspace_index = _build_dspace_lookup(dspace_rows)
+
+    patches = []
+    skipped_date            = 0
+    skipped_no_dspace_match = 0
+    skipped_no_subjects     = 0
+    skipped_no_change       = 0
+    patched                 = 0
+    keywords_added          = 0
+
+    for record in tqdm(records, desc="[subjects] Processing", unit="rec"):
+        mod_date = parse_modified_date(record.get("modifiedDate", ""))
+        if mod_date is None or mod_date <= modified_after:
+            skipped_date += 1
+            continue
+
+        uuid = record.get("uuid", "")
+
+        dspace_row = _find_dspace_row(record, dspace_index)
+        if dspace_row is None:
+            skipped_no_dspace_match += 1
+            tqdm.write(f"  ⚠️  [{uuid}] No matching DSpace row found")
+            continue
+
+        dspace_subjects = parse_subjects(dspace_row.get("dc.subject", ""))
+        if not dspace_subjects:
+            skipped_no_subjects += 1
+            continue
+
+        existing_groups = record.get("keywordGroups") or []
+
+        # Split existing groups into the general free-keywords group(s) and
+        # everything else, remembering where the free-keywords group sat so
+        # the rebuilt group goes back into the same position.
+        existing_free_keywords = []
+        other_keyword_groups   = []
+        free_group_position    = None
+        for kg in existing_groups:
+            if not isinstance(kg, dict):
+                continue
+            if _is_general_free_keywords_group(kg):
+                if free_group_position is None:
+                    free_group_position = len(other_keyword_groups)
+                existing_free_keywords.extend(_existing_free_keywords(kg))
+            else:
+                other_keyword_groups.append(kg)
+
+        existing_lower = {kw.lower() for kw in existing_free_keywords}
+        new_subjects = merge_keywords([], [
+            s for s in dspace_subjects if s.lower() not in existing_lower
+        ])
+        if not new_subjects:
+            skipped_no_change += 1
+            continue
+
+        merged_keywords = merge_keywords(existing_free_keywords, dspace_subjects)
+        free_group = build_free_keywords_group(merged_keywords)
+
+        if free_group_position is None:
+            updated_groups = other_keyword_groups + [free_group]
+        else:
+            updated_groups = (
+                other_keyword_groups[:free_group_position]
+                + [free_group]
+                + other_keyword_groups[free_group_position:]
+            )
+
+        # pureId fields (from the record's other keyword groups) are left out
+        # of the patch, at every nesting level.
+        patches.append({
+            "uuid":          uuid,
+            "keywordGroups": _strip_pure_id(updated_groups),
+        })
+        patched += 1
+        keywords_added += len(new_subjects)
+        tqdm.write(
+            f"  🏷️  [{uuid}] — added {len(new_subjects)} keyword(s), "
+            f"{len(merged_keywords)} total after merge: {'; '.join(new_subjects)}"
+        )
+
+    output_path = os.path.join(output_dir, f"subjects_patch_{TODAY}.json")
+    patches = _finalise_update_patches(patches, records)
+    write_json(output_path, patches)
+
+    return {
+        "total":                   len(records),
+        "skipped_date_filter":     skipped_date,
+        "skipped_no_dspace_match": skipped_no_dspace_match,
+        "skipped_no_subjects":     skipped_no_subjects,
+        "skipped_no_change":       skipped_no_change,
+        "patched":                 patched,
+        "keywords_added":          keywords_added,
+        "files":                   [output_path],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 
@@ -1444,7 +1904,12 @@ def print_summary(mode: str, stats: dict) -> None:
     for key, val in stats.items():
         if key == "files":
             for f in val:
-                print(f"   📄 Written  : {f}")
+                if f in _WRITTEN_FILES:
+                    print(f"   📄 Written  : {f}")
+                else:
+                    print(f"   📭 No records to patch — no file written: {os.path.basename(f)}")
+                    if os.path.exists(f):
+                        print(f"      ⚠️ A file with this name from an earlier run still exists: {f}")
         else:
             label = key.replace("_", " ").capitalize()
             print(f"   {label:<38}: {val}")
@@ -1528,9 +1993,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--patch-urls",
         action="store_true",
         help=(
-            "Clean links[]: keep one Handle link (description normalised "
-            "to 'Repository Handle'), drop DOI links and Pure portal "
-            "links, and de-duplicate remaining links by URL."
+            "Clean links[]: drop DOI links and Pure portal links, remove "
+            "only exact duplicate links (identical URL), and normalise "
+            "Handle descriptions to 'Repository Handle'. Different Handles "
+            "are all kept for manual review."
         ),
     )
     modes.add_argument(
@@ -1541,6 +2007,28 @@ def build_parser() -> argparse.ArgumentParser:
             "normalized fileName + size), keeping the most complete one. "
             "Useful after repeated failed upload attempts left several "
             "copies of the same file on a record."
+        ),
+    )
+    modes.add_argument(
+        "--patch-duplicate-dois",
+        action="store_true",
+        help=(
+            "Remove duplicate DOI electronic versions -- the same DOI in any "
+            "form (case, doi.org/dx.doi.org/'doi:' prefix, trailing full "
+            "stop) -- keeping the metadata of removed copies (access type, "
+            "embargo, version, licence) on the remaining one."
+        ),
+    )
+    modes.add_argument(
+        "--patch-subjects",
+        action="store_true",
+        help=(
+            "Add DSpace dc.subject values as free keywords "
+            "(FreeKeywordsKeywordGroup, logicalName 'keywordContainers') to "
+            "Pure records, merged with existing free keywords without "
+            "duplication. Other keyword groups are left untouched. Matches "
+            "Pure records to DSpace rows by DOI, handle, or DSpace UUID. "
+            "Requires --dspace-csv."
         ),
     )
 
@@ -1583,7 +2071,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "[--patch-publishers only] Path to the DSpace source CSV file."
+            "[--patch-publishers / --patch-subjects only] Path to the "
+            "DSpace source CSV file."
         ),
     )
 
@@ -1608,6 +2097,8 @@ def main() -> None:
         args.patch_file_versions,
         args.patch_urls,
         args.patch_duplicate_files,
+        args.patch_subjects,
+        args.patch_duplicate_dois,
     ]
     
     if not any(modes_selected):
@@ -1615,7 +2106,8 @@ def main() -> None:
             "No patch mode selected. Choose at least one of: "
             "--patch-nulls, --patch-titles, --patch-workflow, "
             "--patch-external-orgs, --patch-author-keywords, --patch-publishers, "
-            "--patch-file-versions, --patch-urls, --patch-duplicate-files"
+            "--patch-file-versions, --patch-urls, --patch-duplicate-files, "
+            "--patch-subjects, --patch-duplicate-dois"
         )
 
     if args.patch_publishers and not args.publisher_mapping:
@@ -1624,8 +2116,10 @@ def main() -> None:
         parser.error("--patch-publishers requires --dspace-csv.")
     if args.publisher_mapping and not args.patch_publishers:
         parser.error("--publisher-mapping requires --patch-publishers.")
-    if args.dspace_csv and not args.patch_publishers:
-        parser.error("--dspace-csv requires --patch-publishers.")
+    if args.patch_subjects and not args.dspace_csv:
+        parser.error("--patch-subjects requires --dspace-csv.")
+    if args.dspace_csv and not (args.patch_publishers or args.patch_subjects):
+        parser.error("--dspace-csv requires --patch-publishers or --patch-subjects.")
     if args.publisher_mapping and not os.path.isfile(args.publisher_mapping):
         print(f"❌ Publisher mapping file not found: {args.publisher_mapping}")
         return
@@ -1700,6 +2194,14 @@ def main() -> None:
     if args.patch_duplicate_files:
         stats = patch_duplicate_files(records, args.output_dir, modified_after)
         print_summary("Duplicate file versions", stats)
+
+    if args.patch_duplicate_dois:
+        stats = patch_duplicate_dois(records, args.output_dir, modified_after)
+        print_summary("Duplicate DOIs", stats)
+
+    if args.patch_subjects:
+        stats = patch_subjects(records, args.dspace_csv, args.output_dir, modified_after)
+        print_summary("Subjects → free keywords", stats)
 
     print(f"\n✅ All done. Output directory: {args.output_dir}\n")
 
