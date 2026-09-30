@@ -1935,7 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the input JSON file (list of Pure research output records).",
     )
     parser.add_argument(
-        "--output_dir",
+        "--output-dir",
         help="Directory where patch files will be written.",
         default = "./patches"
     )
