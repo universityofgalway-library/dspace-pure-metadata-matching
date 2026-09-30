@@ -18,12 +18,12 @@ Python ≥ 3.10.
 
 ```bash
 # Patch titles and remove author keywords in one pass
-python patch_records.py records.json --output_dir ./patches \
+python patch_records.py records.json --output-dir ./patches \
     --patch-titles \
     --patch-author-keywords
 
 # Run all applicable patches
-python patch_records.py records.json --output_dir ./patches \
+python patch_records.py records.json --output-dir ./patches \
     --patch-nulls \
     --patch-titles \
     --patch-external-orgs \
@@ -35,7 +35,7 @@ python patch_records.py records.json --output_dir ./patches \
 ## Usage
 
 ```
-python patch_records.py <input> [--output_dir DIR] [OPTIONS]
+python patch_records.py <input> [--output-dir DIR] [OPTIONS]
 ```
 
 ### Positional arguments
@@ -64,7 +64,7 @@ python patch_records.py <input> [--output_dir DIR] [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--output_dir DIR` | `./patches` | Directory where all patch files will be written. Created if it does not exist. |
+| `--output-dir DIR` | `./patches` | Directory where all patch files will be written. Created if it does not exist. |
 | `--modified-after YYYY-MM-DD` | `1970-01-01` | Skip records with a `modifiedDate` on or before this date. Applies to **all modes except `--patch-nulls`** and `--patch-workflow --workflow-from-log`. |
 | `--workflow-from-log` | `False` | `[--patch-workflow only]` Treat the input as a Pure upload-log file (records with `uuid`, `success`, and `data` fields) instead of standard research output records. Only entries where `success = true` and `data = "research-outputs"` are patched. The `--modified-after` date filter is **not** applied in this mode. |
 | `--publisher-mapping PATH` | *(none)* | `[--patch-publishers only]` Path to the publisher mapping JSON file (array of objects with `name` and `uuid` keys). |
@@ -357,7 +357,7 @@ Patch shape: `{ "uuid": "…", "keywordGroups": [ /* full list, with the merged 
 | `--patch-duplicate-dois` | `duplicate_doi_patch_YYYY-MM-DD.json` |
 | `--patch-subjects` | `subjects_patch_YYYY-MM-DD.json` |
 
-All files are written to the `--output_dir` directory (default `./patches/`). The date in each filename is the date the script is run. A file is only created when its mode has at least one record to patch.
+All files are written to the `--output-dir` directory (default `./patches/`). The date in each filename is the date the script is run. A file is only created when its mode has at least one record to patch.
 
 ---
 
@@ -365,34 +365,34 @@ All files are written to the `--output_dir` directory (default `./patches/`). Th
 
 ```bash
 # 1. Clean null list items only
-python patch_records.py data/records.json --output_dir patches/ --patch-nulls
+python patch_records.py data/records.json --output-dir patches/ --patch-nulls
 
 # 2. Fix overlapping titles
-python patch_records.py data/records.json --output_dir patches/ --patch-titles
+python patch_records.py data/records.json --output-dir patches/ --patch-titles
 
 # 3a. Advance all records to validated (standard research output input)
-python patch_records.py data/records.json --output_dir patches/ --patch-workflow --modified-after 2024-01-01
+python patch_records.py data/records.json --output-dir patches/ --patch-workflow --modified-after 2024-01-01
 
 # 3b. Advance records to validated using a Pure upload log
-python patch_records.py upload_log.json --output_dir patches/ --patch-workflow --workflow-from-log
+python patch_records.py upload_log.json --output-dir patches/ --patch-workflow --workflow-from-log
 
 # 4. Clear external organisations, but only records modified after 2024-01-01
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-external-orgs \
     --modified-after 2024-01-01
 
 # 5. Remove author keyword groups
-python patch_records.py data/records.json --output_dir patches/ --patch-author-keywords
+python patch_records.py data/records.json --output-dir patches/ --patch-author-keywords
 
 # 6. Inject publishers from DSpace into eligible Pure records
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-publishers \
     --publisher-mapping data/publishers.json \
     --dspace-csv data/dspace_export.csv \
     --modified-after 2024-01-01
 
 # 7. Run all standard patches in one pass
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-nulls \
     --patch-titles \
     --patch-external-orgs \
@@ -403,24 +403,24 @@ python patch_records.py data/records.json --output_dir patches/ \
     --modified-after 2023-06-01
 
 # 8. Clean up duplicate FileElectronicVersions left by repeated uploads
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-duplicate-files \
     --modified-after 2024-01-01
 
 # 9. Add DSpace dc.subject values as free keywords
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-subjects \
     --dspace-csv data/dspace_export.csv
 
 # 10. Publishers and subjects in one pass, sharing the same DSpace CSV
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-publishers \
     --patch-subjects \
     --publisher-mapping data/publishers.json \
     --dspace-csv data/dspace_export.csv
 
 # 11. Merge duplicate DOI electronic versions and remove exact duplicate links
-python patch_records.py data/records.json --output_dir patches/ \
+python patch_records.py data/records.json --output-dir patches/ \
     --patch-duplicate-dois \
     --patch-urls
 ```
