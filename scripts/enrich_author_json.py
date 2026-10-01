@@ -2,12 +2,32 @@ import json
 import argparse
 from pathlib import Path
 
+# Characters used as an apostrophe in person names. All of them are treated as
+# equivalent to the straight apostrophe (U+0027) when names are compared --
+# e.g. O'Malley / O’Malley / OʼMalley are the same name. Same set as in
+# match_records.py. Only comparison keys are affected; names written to the
+# output keep their original spelling.
+APOSTROPHE_VARIANTS = (
+    "\u2019",  # ’ right single quotation mark
+    "\u2018",  # ‘ left single quotation mark
+    "\u02bc",  # ʼ modifier letter apostrophe
+    "\u2032",  # ′ prime
+    "\u00b4",  # ´ acute accent
+)
+_APOSTROPHE_TRANSLATION = str.maketrans({c: "'" for c in APOSTROPHE_VARIANTS})
+
+
+def name_key(name: str) -> str:
+    """Comparison key for a name: apostrophe variants unified, lower case."""
+    return name.translate(_APOSTROPHE_TRANSLATION).lower()
+
 
 def build_log_lookup(log_data: list, entity_type: str) -> dict:
     """
     Build a lookup dict from log entries filtered by entity type.
 
-    Key  : "lastname, firstname" lowercased exactly as it appears in the log
+    Key  : "lastname, firstname" lowercased exactly as it appears in the log,
+           with apostrophe variants unified (see name_key)
     Value: uuid string
     """
     lookup = {}
@@ -18,7 +38,7 @@ def build_log_lookup(log_data: list, entity_type: str) -> dict:
             continue
         name = entry.get("name", "")
         if name:
-            lookup[name.lower()] = entry["uuid"]
+            lookup[name_key(name)] = entry["uuid"]
     return lookup
 
 
@@ -44,7 +64,7 @@ def enrich_authors(authors_file: str, log_file: str, entity_type: str) -> None:
             continue
 
         # Build "lastName, firstName" exactly as the log stores it
-        author_key = f"{author.get('lastName', '')}, {author.get('firstName', '')}".lower()
+        author_key = name_key(f"{author.get('lastName', '')}, {author.get('firstName', '')}")
 
         uuid = log_lookup.get(author_key)
         display = f"{author.get('firstName', '')} {author.get('lastName', '')}".strip()

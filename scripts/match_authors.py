@@ -9,9 +9,9 @@ from datetime import date
 # --- CONFIGURATION ---
 TODAY = date.today().isoformat()
 
-DSpace_Authors_JSON = "./author_matching/2026-04-22/missing_authors_2026-04-22.json"
-Pure_Internal_JSON = "./pure_entities/pure_persons_2026-04-22.json"
-Pure_External_JSON = "./pure_entities/pure_external-persons_2026-04-24.json"
+DSpace_Authors_JSON = "./author_matching/dspace_test_authors_2026-07-16.json"
+Pure_Internal_JSON = "./pure_entities/temp_2026-07-16/pure_persons_2026-07-16.json"
+Pure_External_JSON = "./pure_entities/temp_2026-07-16/pure_external-persons_2026-07-16.json"
 IRISH_SURNAMES_JSON = "./author_matching/irish_surnames.json"  # New file with canonical Irish surnames and their variants   
 OUTPUT_DIR = f"./author_matching/{TODAY}"
 HYPHEN_CAP_REGEX = re.compile(r'([-–])(\p{L})', re.UNICODE)
@@ -38,17 +38,31 @@ def print(*args, **kwargs):
 # --- HELPER FUNCTIONS ---
 
 def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         return json.load(f)
     
 
+# Characters used as an apostrophe in person names. All of them are treated as
+# equivalent to the straight apostrophe (U+0027) when names are compared --
+# e.g. O'Malley / O’Malley / OʼMalley are the same name. Same set as in
+# match_records.py. Only comparison keys are affected; names written to the
+# output keep their original spelling.
+APOSTROPHE_VARIANTS = (
+    "\u2019",  # ’ right single quotation mark
+    "\u2018",  # ‘ left single quotation mark
+    "\u02bc",  # ʼ modifier letter apostrophe
+    "\u2032",  # ′ prime
+    "\u00b4",  # ´ acute accent
+)
+_APOSTROPHE_TRANSLATION = str.maketrans({c: "'" for c in APOSTROPHE_VARIANTS})
+
+
 def normalize(s):
-    """Normalize string: replace curly apostrophes in Irish surnames, strip + lower case"""
+    """Normalize string: every apostrophe variant (APOSTROPHE_VARIANTS) becomes a
+    straight apostrophe, then strip + lower case"""
     if not s:
         return ""
-    # Replace curly apostrophes with straight ones
-    s = s.replace("’", "'")
-    s = s.replace("‘", "'")
+    s = s.translate(_APOSTROPHE_TRANSLATION)
     return s.strip().lower()
 
 
