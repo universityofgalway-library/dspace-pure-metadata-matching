@@ -469,7 +469,10 @@ DOI links are removed from `links`; handles are kept. If DSpace and Pure have co
 ### No duplicate DOIs or handles
 
 - **Publisher DOIs:** each distinct DOI appears once. If Pure already holds the same DOI more than once (in any form), a single electronic version is kept — the copy with the most filled fields, so no access/licence/version metadata is lost; ties keep the first. A DOI from DSpace that already exists in Pure in any form is not added again.
-- **Repository DOI:** at most one.
+- **Repository DOI:** exactly one per updated record (when one is known). Only `10.13025` DOIs are repository DOIs, whichever field they are in; any other DOI in `dc.identifier.doi` is a publisher DOI.
+  - The DSpace item's repository DOI is the first `10.13025` DOI in `dc.identifier.uri`, otherwise the first in `dc.identifier.doi`. Pure's electronic version with that DOI is reused; otherwise one is created. Any other repository DOI on the record is removed.
+  - If the DSpace item has no repository DOI, Pure's own is kept — unless the CSV shows it belongs to another DSpace item. If several remain, the first is kept and a manual-review warning is printed.
+  - The repository DOI always gets the repository metadata: access *Open* (or *Embargoed* with the period while a DSpace embargo is active), licence *CC BY*, version *Author accepted manuscript* — also when it is Pure's own.
 - **Handle links:** one link per handle. Pure copies that differ only in form (`http`/`https`, letter case, trailing slash, `handle.net` host) count as the same handle; the copy with the most metadata is kept.
 - `dc.identifier.doi` values that aren't DOIs (ISBNs, article numbers, web pages, `NA`, …) are **not** added as DOI electronic versions; a warning is printed instead.
 

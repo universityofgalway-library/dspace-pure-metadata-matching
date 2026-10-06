@@ -44,14 +44,14 @@ DSPACE_UUID_PREFERENCE = "pure"  # "dspace" or "pure"
 # DSpace item types that are never uploaded to Pure (dc.type, lower case).
 EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
 
-DSPACE_CSV = "./dspace_data/prod_samples/enriched_dspace_prod_items_2026-10-05_subset.csv"
-# DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
-PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-05.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
-ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-09-30.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/pure_prod_publishers_2026-09-30.json"
-JOURNAL_MAPPING_JSON = "./pure_entities/pure_prod_journals_2026-09-30.json"
-OUTPUT_DIR = f"./record_matching/prod_output_sample_{TODAY}"
+# DSPACE_CSV = "./dspace_data/prod_samples/enriched_dspace_prod_items_2026-10-05_subset.csv"
+DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
+PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-06.json"
+PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-05.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-10-06.json"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_prod_publishers_2026-10-06.json"
+JOURNAL_MAPPING_JSON = "./pure_entities/pure_prod_journals_2026-10-06.json"
+OUTPUT_DIR = f"./record_matching/prod_output_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -1666,6 +1666,58 @@ def dspace_item_repo_dois(row):
     return dois
 
 
+def is_repository_doi_ev(ev):
+    """True for a DOI electronic version whose DOI is a repository DOI (10.13025)."""
+    return (isinstance(ev, dict) and ev.get("typeDiscriminator") == "DoiElectronicVersion"
+            and "10.13025" in str(ev.get("doi") or ""))
+
+
+def choose_repository_doi_ev(existing_evs, dspace_item_row, dspace_item_uuid, record_uuid=None, quiet=False):
+    """
+    The ONE repository DOI electronic version a Pure record should carry for a
+    DSpace item -- used by both the electronic-version step and the
+    single-identity step of an update, so they always agree.
+
+    - The item's repository DOI: the first 10.13025 DOI in dc.identifier.uri,
+      then in dc.identifier.doi (only 10.13025 DOIs count, whichever field
+      they are in). Pure's electronic version with that DOI is reused (copy),
+      otherwise a new one is created.
+    - If the item has no repository DOI (or isn't in the CSV): Pure's own
+      repository DOI is kept, unless the CSV shows it belongs to another
+      DSpace item; if several remain, the first is kept and a manual-review
+      warning is printed.
+    The result always gets the repository metadata (Open / CC BY / Author
+    accepted manuscript, or Embargoed + period) from the item's embargo --
+    when the item isn't in the CSV, the metadata is left as Pure has it.
+    Returns the electronic version, or None.
+    """
+    repo_evs = [dict(ev) for ev in (existing_evs or []) if is_repository_doi_ev(ev)]
+    wanted_dois = dspace_item_repo_dois(dspace_item_row) if dspace_item_row else []
+    if wanted_dois:
+        wanted = wanted_dois[0]
+        chosen = next((ev for ev in repo_evs if normalize_doi(ev.get("doi") or "") == wanted), None)
+        if chosen is None:
+            chosen = build_electronic_version(doi=wanted)
+    else:
+        item_key = (dspace_item_uuid or "").strip().lower()
+        candidates = [
+            ev for ev in repo_evs
+            if _DSPACE_ITEMS["uuid_by_repo_doi"].get(normalize_doi(ev.get("doi") or "")) in (None, item_key)
+        ]
+        if len(candidates) > 1 and not quiet:
+            print(f"  ⚠️ MANUAL REVIEW REQUIRED: {len(candidates)} repository DOIs on record {record_uuid} and none "
+                  f"known for DSpace item {dspace_item_uuid} — keeping the first: {candidates[0].get('doi')}")
+        chosen = candidates[0] if candidates else None
+    if chosen is None:
+        return None
+    if isinstance(chosen.get("doi"), str):
+        chosen["doi"] = normalize_doi(chosen["doi"])
+    if dspace_item_row:
+        _, embargo_active, _, embargo_period = resolve_embargo_and_access(dspace_item_row)
+        apply_repository_access_license_version(chosen, embargo_active, embargo_period)
+    return chosen
+
+
 def build_dspace_item_lookups(dspace_rows):
     """Fill _DSPACE_ITEMS from the DSpace CSV rows."""
     _DSPACE_ITEMS["by_uuid"] = {}
@@ -1760,31 +1812,13 @@ def enforce_single_dspace_identity(pure_record, dspace_row, updated_record, log_
     if new_links != current_links:
         updated_record["links"] = new_links
 
-    # --- one repository DOI ---
+    # --- one repository DOI (same rule as step 5c: choose_repository_doi_ev) ---
     current_evs = updated_record["electronicVersions"] if "electronicVersions" in updated_record else (pure_record.get("electronicVersions") or [])
-    def is_repo_ev(ev):
-        return (isinstance(ev, dict) and ev.get("typeDiscriminator") == "DoiElectronicVersion"
-                and "10.13025" in str(ev.get("doi") or ""))
-    repo_evs = [ev for ev in current_evs if is_repo_ev(ev)]
-    other_evs = [ev for ev in current_evs if not is_repo_ev(ev)]
-    target_repo_dois = dspace_item_repo_dois(target_row) if target_row else []
-    if target_repo_dois:
-        wanted = target_repo_dois[0]
-        existing = next((ev for ev in repo_evs if normalize_doi(ev.get("doi") or "") == wanted), None)
-        if existing is None:
-            _, embargo_active, _, embargo_period = resolve_embargo_and_access(target_row)
-            existing = apply_repository_access_license_version(
-                build_electronic_version(doi=wanted), embargo_active, embargo_period
-            )
-        new_repo = [existing]
-    else:
-        # Target item's repository DOI unknown: start from Pure's ORIGINAL ones.
-        original_repo = [ev for ev in (pure_record.get("electronicVersions") or []) if is_repo_ev(ev)]
-        new_repo = [ev for ev in original_repo
-                    if not belongs_elsewhere(_DSPACE_ITEMS["uuid_by_repo_doi"].get(normalize_doi(ev.get("doi") or "")))]
-        if len(new_repo) > 1:
-            print(f"  ⚠️ MANUAL REVIEW REQUIRED: {len(new_repo)} repository DOIs on record {pure_record.get('uuid')} "
-                  f"and none known for DSpace item {target_uuid} — keeping them")
+    other_evs = [ev for ev in current_evs if not is_repository_doi_ev(ev)]
+    # quiet: step 5c has already reported any manual-review case for this record
+    chosen = choose_repository_doi_ev(pure_record.get("electronicVersions") or [], target_row, target_uuid,
+                                      pure_record.get("uuid"), quiet=(target_row is dspace_row))
+    new_repo = [chosen] if chosen is not None else []
     new_evs = new_repo + other_evs
     if new_evs != current_evs:
         updated_record["electronicVersions"] = new_evs
@@ -3481,9 +3515,7 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         existing_other_evs, lambda e: (e.get("doi") or "").strip().lower(), "DOI electronic version"
     )
 
-    existing_repo_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_repo_evs]
     existing_publisher_dois = [normalize_doi(ev.get("doi", "")) for ev in existing_publisher_evs]
-    repo_ev = existing_repo_evs[0] if existing_repo_evs else None
 
     # --- 5a. Embargo (dc.date.embargo / dc.description.embargo) > overwrite for repo version ---
     embargo_date, embargo_active, _, embargo_period = resolve_embargo_and_access(dspace_row)
@@ -3497,48 +3529,25 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
         for piece in unrecognised:
             print(f"  ⚠️ dc.identifier.doi value is not a DOI — not added as an electronic version: '{piece}'")
         for publisher_doi in dspace_dois:
-            # Check if it's actually a repository DOI
+            # A repository DOI (10.13025) in this field is handled in step 5c,
+            # together with those in dc.identifier.uri -- every other DOI here
+            # is a publisher DOI.
             if "10.13025" in publisher_doi:
-                if publisher_doi not in existing_repo_dois:
-                    ev = build_electronic_version(doi=publisher_doi)
-                    if ev:
-                        repo_ev = ev
-            elif publisher_doi not in existing_publisher_dois:
+                continue
+            if publisher_doi not in existing_publisher_dois:
                 ev = build_electronic_version(doi=publisher_doi)
                 if ev:
                     new_publisher_evs.append(ev)
                     existing_publisher_dois.append(publisher_doi)
 
-    # NOTE: repo_ev (a DoiElectronicVersion) no longer gets accessType /
-    # versionType / licenseType / embargoPeriod set here -- that metadata
-    # belongs on the FileElectronicVersion only (step 5f below).
-
-    # --- 5c. Repository DOI & Handle (dc.identifier.uri) > always add ---
-    if not repo_ev:
-        uri_str = dspace_row.get("dc.identifier.uri", "").strip()
-        if uri_str:
-            dois = extract_dois_from_uri(uri_str)
-
-            # Add repository DOI as electronic version (if starts with 10.13025)
-            for doi in dois:
-                if doi.startswith("https://doi.org/10.13025") and doi not in existing_repo_dois:
-                    ev = build_electronic_version(doi=doi)
-                    if ev:
-                        repo_ev = ev
-                        break  # only one repo DOI expected
+    # --- 5c. Repository DOI (10.13025, from dc.identifier.uri or dc.identifier.doi) ---
+    # Exactly one, chosen by choose_repository_doi_ev (shared with step 10b,
+    # so both always agree), with the repository metadata applied.
+    repo_ev = choose_repository_doi_ev(existing_evs, dspace_row, dspace_row.get("uuid", ""), pure_record.get("uuid"))
 
     # --- 5e. Build final electronic versions list: repository DOI first, then publisher DOIs, then others, then files ---
     final_evs = []
-
-    # Add repository DOI first (if exists). Rule 1: a 10.13025 DOI only ever
-    # exists because the institutional repository minted it for a DSpace
-    # item, so it's unconditionally repository-sourced -- access, licence,
-    # and version type are always set here, the same treatment a
-    # DSpace-linked FileElectronicVersion gets below (step 5f).
     if repo_ev:
-        if "doi" in repo_ev and isinstance(repo_ev["doi"], str):
-            repo_ev["doi"] = normalize_doi(repo_ev["doi"])
-        apply_repository_access_license_version(repo_ev, embargo_active, embargo_period)
         final_evs.append(repo_ev)
 
     # Add publisher DOIs second. Rule 2: not repository-sourced, so licence,
