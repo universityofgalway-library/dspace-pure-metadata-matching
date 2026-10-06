@@ -128,7 +128,13 @@ The org config file is required and must be a JSON object with the following key
 
 ## Matching Strategy
 
+**Which DSpace rows are processed.** Rows are skipped (counted as *out of scope* in the final summary) when they are not in the Publications collection, when their `dc.type` is **`dataset`** — datasets are not uploaded from DSpace to Pure (`EXCLUDED_DSPACE_TYPES` at the top of the script) — or when all contributor fields are empty. Skipped rows still count as DSpace items for the identity checks below (their Handles and DOIs belong to them).
+
 Records are matched in priority order:
+
+0. **DSpace UUID — highest priority.** A Pure record that carries this DSpace item's UUID (an identifier with `idSource: "DSpace"`) is its record; when one is found, no other matching is done.
+
+**A Pure record that already carries a DSpace UUID is matched only through that UUID** — it is never a candidate in steps 1–4 for any other DSpace item, whatever its DOI, Handle or title (these may be wrong on such a record; its DSpace UUID is authoritative). Steps 1–4 only consider Pure records **without** a DSpace UUID. The run log shows how many Pure records are linked and how many are not.
 
 1. **Publisher DOI** — every publisher DOI in `dc.identifier.doi` (multi-entry field) is looked up. A Pure record reached through several DOIs, or indexed twice (e.g. via an electronic version and a DOI link), is counted only once.
 2. **Repository DOI** — from `dc.identifier.uri`, pattern `10.13025/*`, followed by any repository DOI found in `dc.identifier.doi`
@@ -138,6 +144,25 @@ Records are matched in priority order:
    - **Fuzzy** — token-based candidate retrieval + fuzzy scoring, 90% threshold
 
 DOIs and handles are compared in normalised form on both sides — see [DOI & Handle Normalisation](#doi--handle-normalisation).
+
+### Safeguards against false matches
+
+**Title matches** (steps 4a and 4b) compare every combination of title and subtitle on both sides. A candidate is rejected if:
+- **it already belongs to another DSpace item** — the Pure record carries a DSpace UUID that isn't this row's, and that item is in the CSV. It is that item's record, so it is never matched to another item by title (identifier matches are handled separately, see below). Consequence: when the same work was deposited twice in DSpace, the second deposit gets its own Pure record unless an identifier links it;
+- **both sides have publisher DOIs and none agree** — different DOIs mean different outputs, whatever the titles say (e.g. two articles both titled "Introduction");
+-  **the numbers in the two titles differ** (items of a numbered series: "Factsheet No. 17" vs "No. 18", "Volume 5" vs "Volume 6", "2014" vs "1998-2022"). Otherwise it is only accepted if:
+- **the full title is identical** (title + subtitle on both sides; case, punctuation and the title/subtitle split ignored, **numbers kept** — so "An Reiviú 2015" ≠ "An Reiviú 2024" and "Part 1" ≠ "Part 2") **and** the research output type is the same **and** the publication year is the same (when either year is missing it can't be compared and isn't required — generic titles such as "Introduction" or "Editorial" recur every year); or
+- **otherwise** (fuzzy match, or equal only when one side's subtitle is ignored — e.g. Pure "Introduction" + subtitle vs DSpace "Introduction"): the **publication year and the research output type are both confirmed to be the same**.
+
+**Short titles need a common author.** When a title match passes all of the rules above but either side's full title (title + subtitle) has **at most 5 words, small words included** (`SHORT_TITLE_MAX_WORDS` — generic titles such as "Introduction", "Editorial", "Book review"), at least one person must appear on both sides: the same surname (case, accents and apostrophe form ignored) with the same first initial, or no initial on one side. DSpace people come from the author, editor, translator and illustrator fields (institution names excluded); Pure people from the record's contributors. A Pure record without contributors can't confirm a short title, so it isn't matched. DOI, Handle and DSpace UUID matches are not affected.
+
+**Fuzzy title matches** (step 4b) must also pass a **word-level check**: for at least one combination of title / title + subtitle on each side, every content word of each title has a counterpart in the other. Small words (*a, an, the, of, and, in, on, for, to, with, by, at, from, as, or, into, its, their, is, are, be*) are ignored, and spelling variants and small typos count as the same word (word similarity ≥ 80, `TITLE_WORD_SIMILARITY`: "behaviour"/"behavior", "centre"/"center", "cell"/"cells"); case, punctuation and markup tags such as `[clc]` are ignored. **An extra or missing content word means no match** — "The cost-effectiveness of …" vs "The effectiveness of …", "… in tension …" vs "… in compression …", "Correction to: …" vs the original article. This is deliberately strict: titles that differ by a generic word ("… Report" vs "… Final Report") are also kept apart.
+
+The DSpace item's type is the Pure type its `dc.type` maps to (an unmapped type counts as Other contribution, as for new records). On the Pure side, when the Pure record belongs to DSpace item(s) that are in the CSV, those items' `dc.type` is used — so a record created as Other contribution because its journal wasn't found doesn't distort the comparison; otherwise the Pure record's own type. Years: the Pure record's publication years plus those linked items' years. When the best fuzzy candidate is rejected, the next best that passes is used.
+
+**Publisher DOI matches** with a Pure record that already belongs to a **different** DSpace item (in the CSV or not) are only kept if the two describe the same output: the titles agree under the strict **word-level check** (see below) **and** the research output type is the same. Otherwise the DOI match is rejected — the same DOI on two different DSpace items is a data error (a DOI copied to the wrong item) or a DOI shared by several outputs (a book's DOI on its chapters, or chapter vs book). Such cases are listed in `publisher_doi_conflicts_YYYY-MM-DD.csv` and counted in the final summary. DOI matches with a Pure record that belongs to no DSpace item, or to this row's item, are unaffected.
+
+Every rejected candidate is printed in the processing log and recorded in the status log as `rejectedMatches` (`pureUUID`, `reason`).
 
 ### Choosing among duplicates
 
@@ -151,12 +176,25 @@ When several Pure records match one DSpace row, the record to update is chosen a
 
 Which case applied is recorded in the status log as `duplicateResolution`.
 
+### One DSpace identity per record
+
+Every updated Pure record carries exactly **one** DSpace identity: one DSpace UUID (identifier with `idSource: "DSpace"`), one repository Handle link and one repository DOI electronic version — all of the same DSpace item. Other identifiers (Scopus, ORCID, …), other links and other electronic versions are not touched; an existing Handle link or repository DOI electronic version of that item is kept as it is (with its metadata), otherwise it is created.
+
+Which item: the CSV row's — unless the Pure record is already linked to a **different** DSpace item, in which case `DSPACE_UUID_PREFERENCE` (set at the top of the script) decides:
+
+| `DSPACE_UUID_PREFERENCE` | Result |
+|---|---|
+| `"dspace"` (default) | The CSV row's DSpace UUID, Handle and repository DOI are written; the other item's are removed. |
+| `"pure"` | Pure's existing DSpace UUID is kept, with that item's Handle and repository DOI (taken from the CSV when the item is in it). |
+
+If that item's Handle or repository DOI isn't known (item not in the CSV, or it has none), Pure's existing ones are kept — except those the CSV shows belong to a different DSpace item; if more than one remains, a manual-review warning is printed. The status log records `dspaceUuidResolution` for every mismatch. New records always carry a single identity (the CSV row's).
+
 ### DSpace UUID mismatches
 
-Any DSpace UUID counts in step 1, not only the UUID of the DSpace item being processed. Whenever the Pure record about to be updated — whether it was the **only match** or was **chosen among duplicates** — already carries DSpace UUID(s) and none of them equals the processed item's `uuid` (compared case-insensitively), the record is still updated, but the case is reported:
+Since Pure records with a DSpace UUID are only matched through that UUID (step 0), a mismatch can no longer arise from steps 1–4; the report remains as a safeguard. Any DSpace UUID counts in step 1, not only the UUID of the DSpace item being processed. Whenever the Pure record about to be updated — whether it was the **only match** or was **chosen among duplicates** — already carries DSpace UUID(s) and none of them equals the processed item's `uuid` (compared case-insensitively), the record is still updated, but the case is reported:
 
 - a warning line in the processing log: `⚠️ DSpace UUID mismatch (single match | chosen among duplicates): DSpace item … is updating Pure record …, which already has DSpace UUID(s) […]`
-- a row in `dspace_uuid_mismatches_YYYY-MM-DD.csv` with: `dspace_uuid`, `pure_record_dspace_uuids`, `handle`, `pure_uuid`, `dspace_title`, `pure_title`, `portal_url`, `case`
+- a row in `dspace_uuid_mismatches_YYYY-MM-DD.csv` with: `dspace_uuid`, `pure_record_dspace_uuids`, `handle`, `pure_uuid`, `dspace_title`, `pure_title`, `portal_url`, `case`, `match_type` (how the record was matched: Publisher DOI, Repository DOI, Handle, Title (Exact), Title Similarity), `resolution` (per `DSPACE_UUID_PREFERENCE` — see [One DSpace identity per record](#one-dspace-identity-per-record))
 - the `DSpace UUID mismatches` line in the final counts
 
 Records whose DSpace UUID is the processed item's own are never reported.
@@ -301,6 +339,19 @@ DSpace `dc.type` values are mapped to Pure output subtypes:
 Authors are matched via a pre-built name index supporting primary names, alternative names, and both name orders ("First Last" and "Last, First").
 
 **Apostrophes are equivalent.** When names are compared, these characters are all treated as a straight apostrophe (`'`): right curly `’`, left curly `‘`, modifier letter `ʼ`, prime `′` and acute accent `´`. So `O'Malley`, `O’Malley` and `OʼMalley` — or `D'Arcy` and `D’Arcy` — are the same name. This applies wherever person names are compared, across all three name sources (DSpace contributor fields, existing Pure contributors, and the person mapping file), including the author/editor overlap check. It affects comparison only: names written to Pure are not rewritten by it.
+
+**Reading DSpace contributor names.** Before matching:
+- HTML character references are decoded before the field is split into names, so `O&apos;Dowd, Colin` stays one name (the `;` of `&apos;` is not taken as a separator).
+- **Institution names are dropped entirely** — names containing one of these words, as whole words in any case, are neither added as contributors nor listed as unmatched: university, college, academy, institute, association, department, school, nuig, ollscoil, centre, center, laboratory, institution, organisation, organization, foundation, society, proceedings, bank, programme, union, education, research, national, international, group, committee (`NAME_STOPWORDS`).
+
+**Matching order.** Each name is first looked up **exactly as before**, so a name that matched before always matches the same person. Only if that finds nobody, corrected readings are tried:
+1. a trailing comma with nothing after it is removed (`Damien Haberlin,` → `Damien Haberlin`);
+2. digits attached to the end of a word are removed — footnote marks (`Ní Fhlathartaigh1, Mary` → `Ní Fhlathartaigh, Mary`);
+3. a surname prefix left at the end of the first name is moved to the surname (`Shea, Emma O’` → `O’Shea, Emma`; `Bruijn, Jos de` → `de Bruijn, Jos`). Prefixes: Mac Giolla, Mac Con, Mac an, Nic an, van der, Mhic, Mac, Nic, Mc, O' (any apostrophe form), Ó, Ní, de, Uí, Ua, van, von, La. A bare `O` without an apostrophe is not a prefix (it is usually a middle initial: `Amer, Amal O`).
+
+If none of these finds anybody, the same readings are tried **ignoring accents** (`Ni Riordain` = `Ní Ríordáin`). Names that still find nobody are listed as unmatched under their original DSpace spelling.
+
+**Accented spelling preferred.** The name written on a contributor is the person mapping's — except that if the same name exists with more accents, that spelling is used, wherever it comes from: the mapping's alternative names, the DSpace name, or (when reusing a Pure contributor) the name Pure already has. It keeps the mapping's capitalisation.
 
 **Duplicate resolution priority:**
 1. Paper evidence match (DOI or handle > title)
@@ -526,7 +577,8 @@ For `ContributionToJournal` **and** `ContributionToPeriodical` records (treated 
 ├── unmatched_funders_YYYY-MM-DD.csv
 ├── unmatched_publishers_YYYY-MM-DD.csv
 ├── unmatched_journals_YYYY-MM-DD.csv
-└── dspace_uuid_mismatches_YYYY-MM-DD.csv
+├── dspace_uuid_mismatches_YYYY-MM-DD.csv
+└── publisher_doi_conflicts_YYYY-MM-DD.csv
 ```
 
 | Path | Contents |
@@ -543,6 +595,7 @@ For `ContributionToJournal` **and** `ContributionToPeriodical` records (treated 
 | `unmatched_publishers.csv` | Publishers not found in publisher mapping |
 | `unmatched_journals.csv` | Journal-type records for which no journal was found — see [Journal Matching](#journal-matching) |
 | `dspace_uuid_mismatches.csv` | Records updated although they carry a different DSpace item's UUID — see [DSpace UUID mismatches](#dspace-uuid-mismatches) |
+| `publisher_doi_conflicts.csv` | Publisher DOI matches rejected because the DOI is on a different DSpace item with a different title: `dspace_uuid`, `handle`, `dspace_title`, `doi`, `pure_uuid`, `pure_title`, `pure_record_dspace_uuids` |
 
 The CSV files are only written when they have at least one row.
 
@@ -553,6 +606,7 @@ At the end of a run, the processing log shows:
 ```
    Skipped (out of scope): …
      ↳ Not in Publications collection: …
+     ↳ Dataset (not uploaded to Pure): …
      ↳ No contributors in any field: …
    Matched to existing Pure record: …
    Unmatched (new records created): …
@@ -565,6 +619,7 @@ At the end of a run, the processing log shows:
    Unmatched publishers: …
    Unmatched journals: …
    DSpace UUID mismatches: …
+   Publisher DOI conflicts: …
    Logs saved to: …
 ```
 
@@ -595,6 +650,8 @@ Additional fields appear only when relevant:
 | Field | When |
 |---|---|
 | `duplicateResolution` | Several Pure records matched — how the one to update was chosen |
+| `rejectedMatches` | Title or publisher-DOI candidates rejected by the safeguards — `pureUUID` and `reason` |
+| `dspaceUuidResolution` | The Pure record was linked to a different DSpace item — which DSpace UUID was kept |
 | `journalMatchedBy` | Journal found by `ISSN` or `title` (not needed for `journal_uuid`) |
 | `journalCandidates` | Several journals qualified — all of their UUIDs |
 | `typeChangedToOther` | New record downgraded to `OtherContribution` (no journal found) |

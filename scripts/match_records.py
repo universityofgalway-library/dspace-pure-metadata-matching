@@ -30,14 +30,28 @@ COLLECT_EXTERNAL_ORGS = False
 
 OVERRIDE_MODE = False  # Change to True to override existing Pure data
 
-# DSPACE_CSV = "./dspace_data/prod_samples/records_to_update_contributors_2026-04-27.csv"
-DSPACE_CSV = "./dspace_data/all_data_test/enriched_dspace_test_items_2026-09-16.csv"
-PURE_JSON = "./pure_research_outputs/pure_temp_research-outputs_2026-09-23.json"
-PERSON_MAPPING_JSON = "./author_matching/2026-07-17-temp/updated_authors_temp_2026-09-17.json"
-ORGANIZATION_MAPPING_JSON = "./pure_entities/temp_organizations_mapping_2026-09-16.json"
-PUBLISHER_MAPPING_JSON = "./pure_entities/pure_temp_publishers_2026-09-16.json"
-JOURNAL_MAPPING_JSON = "./pure_entities/pure_temp_journals_2026-09-23.json"
-OUTPUT_DIR = f"./record_matching/temp_output_{TODAY}"
+# A Pure record carries exactly ONE DSpace identity: one DSpace UUID (external
+# ID), one repository Handle and one repository DOI, all of the same DSpace
+# item. When the Pure record being updated is already linked to a DIFFERENT
+# DSpace item than the CSV row:
+#   "dspace" -> the CSV row's DSpace UUID is written, with that item's Handle
+#               and repository DOI; the other DSpace identity is removed
+#   "pure"   -> Pure's existing DSpace UUID is kept, with that item's Handle
+#               and repository DOI (taken from the CSV when the item is in it)
+
+DSPACE_UUID_PREFERENCE = "pure"  # "dspace" or "pure"
+
+# DSpace item types that are never uploaded to Pure (dc.type, lower case).
+EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
+
+DSPACE_CSV = "./dspace_data/prod_samples/enriched_dspace_prod_items_2026-10-05_subset.csv"
+# DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
+PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-05.json"
+PERSON_MAPPING_JSON = "./author_matching/2026-04-24/updated_merged_prod_all_authors_strict_with_allow_block_withorcid_20260423.json"
+ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-09-30.json"
+PUBLISHER_MAPPING_JSON = "./pure_entities/pure_prod_publishers_2026-09-30.json"
+JOURNAL_MAPPING_JSON = "./pure_entities/pure_prod_journals_2026-09-30.json"
+OUTPUT_DIR = f"./record_matching/prod_output_sample_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -91,8 +105,8 @@ dspace_pure_subtype_map = {
     "journal article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/article",
     "review article": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
     "review": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontojournal/systematicreview",
-    # "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
-    # "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
+    "doctoral thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/doc",
+    "master thesis": "/dk/atira/pure/researchoutput/researchoutputtypes/thesis/master",
     "conference paper": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/paper",
     "conference output": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/other",
     "conference poster": "/dk/atira/pure/researchoutput/researchoutputtypes/contributiontoconference/poster",
@@ -243,6 +257,11 @@ _unmatched_funders = []
 _unmatched_publishers = []
 _unmatched_journals = []
 _dspace_uuid_mismatches = []
+_publisher_doi_conflicts = []
+
+# Lookups over the whole DSpace CSV (filled in main): DSpace items by UUID,
+# and which DSpace item each repository Handle / repository DOI belongs to.
+_DSPACE_ITEMS = {"by_uuid": {}, "uuid_by_handle": {}, "uuid_by_repo_doi": {}}
 
 # --- LOGGER SETUP --- #
 
@@ -807,9 +826,12 @@ def add_type_specific_fields(record, dspace_row, valid_journal_uuids=None, journ
 
 
 def parse_author_names(author_str):
-    """Parse semicolon-separated author names from DSpace"""
+    """Parse semicolon-separated author names from DSpace. HTML character
+    references are decoded first, so "O&apos;Dowd, Colin" isn't split at the
+    ";" of "&apos;"."""
     if not author_str:
         return []
+    author_str = html.unescape(author_str)
     return [a.strip() for a in author_str.split(";") if a.strip()] 
 
 
@@ -868,24 +890,205 @@ def build_person_name_index(person_mapping):
     return person_index
 
 
-def find_person_match(person_name, person_index):
-    """Find matching person using pre-built index - O(1) lookup"""
-    first, last = "", ""
+# Names containing any of these words (as whole words, any case) are
+# institutions, not people: they are dropped from the DSpace contributors
+# entirely -- neither added as contributors nor listed as unmatched.
+NAME_STOPWORDS = [
+    "university", "college", "academy", "institute", "association", "department",
+    "school", "nuig", "ollscoil", "centre", "center", "laboratory", "institution",
+    "organisation", "organization", "foundation", "society", "proceedings",
+    "bank", "programme", "union", "education", "research", "national",
+    "international", "group", "committee",
+]
+_NAME_STOPWORD_SET = set(NAME_STOPWORDS)
+
+
+def is_institution_name(name):
+    """True if the name contains a NAME_STOPWORDS word (whole words only)."""
+    return bool(_NAME_STOPWORD_SET & set(re.findall(r"\w+", (name or "").lower())))
+
+
+# Surname prefixes that DSpace sometimes leaves at the end of the first name
+# ("Shea, Emma O’" = "O'Shea, Emma"). (prefix, written without a space).
+# Longer prefixes first. A bare "O" (no apostrophe) is NOT included: in the
+# data it is a middle initial ("Amer, Amal O").
+SURNAME_PREFIXES = [
+    ("mac giolla", False), ("mac con", False), ("mac an", False), ("nic an", False),
+    ("van der", False),
+    ("mhic", False), ("mac", False), ("nic", False), ("mc", True), ("o'", True),
+    ("ó", False), ("ní", False), ("de", False), ("uí", False), ("ua", False),
+    ("van", False), ("von", False), ("la", False),
+]
+
+_TRAILING_DIGITS = re.compile(r"(?<=[^\W\d_])\d+(?=[\s,]|$)")
+
+
+def fold_accents(s):
+    """Remove accents (diacritics): "Ní Ríordáin" -> "Ni Riordain"."""
+    if not s:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
+def accent_count(s):
+    """Number of accent marks in a string."""
+    if not s:
+        return 0
+    return sum(1 for c in unicodedata.normalize("NFD", s) if unicodedata.combining(c))
+
+
+def _split_person_name(person_name):
+    """'Last, First' or 'First ... Last' -> (first, last). Unchanged split rule."""
     if "," in person_name:
         parts = [p.strip() for p in person_name.split(",", 1)]
-        last = parts[0]
-        first = parts[1] if len(parts) > 1 else ""
-    else:
-        parts = person_name.split()
-        if len(parts) >= 2:
-            first = " ".join(parts[:-1])
-            last = parts[-1]
+        return (parts[1] if len(parts) > 1 else ""), parts[0]
+    parts = person_name.split()
+    if len(parts) >= 2:
+        return " ".join(parts[:-1]), parts[-1]
+    return person_name, ""
+
+
+def _move_surname_prefix(first, last):
+    """
+    "Emma O’" + "Shea" -> ("Emma", "O’Shea"); "Jos de" + "Bruijn" -> ("Jos", "de Bruijn").
+    Returns None if the first name doesn't end with a known prefix. The
+    prefix keeps its original spelling.
+    """
+    words = first.split()
+    for prefix, joined in SURNAME_PREFIXES:
+        n = len(prefix.split())
+        if len(words) > n and " ".join(words[-n:]).translate(_APOSTROPHE_TRANSLATION).lower() == prefix:
+            written = " ".join(words[-n:])
+            return " ".join(words[:-n]), (written + last if joined else written + " " + last)
+    return None
+
+
+def _repaired_name_candidates(person_name):
+    """
+    Corrected readings of a malformed DSpace name, in order:
+      - a trailing comma with nothing after it is removed
+        ("Damien Haberlin," -> "Damien Haberlin");
+      - digits attached to the end of a word are removed (footnote marks:
+        "Ní Fhlathartaigh1, Mary" -> "Ní Fhlathartaigh, Mary");
+      - a surname prefix left at the end of the first name is moved to the
+        surname ("Shea, Emma O’" -> "O’Shea, Emma").
+    Returns a list of (first, last), not including the unchanged reading.
+    """
+    original = _split_person_name(person_name)
+    cleaned = person_name.strip()
+    if cleaned.endswith(","):
+        cleaned = cleaned.rstrip(", ").strip()
+    cleaned = _TRAILING_DIGITS.sub("", cleaned).strip()
+    candidates = []
+    base = _split_person_name(cleaned)
+    if base != original and base[0] and base[1]:
+        candidates.append(base)
+    if "," in cleaned:
+        moved = _move_surname_prefix(*base)
+        if moved and moved[0] and moved not in candidates:
+            candidates.append(moved)
+    return candidates
+
+
+_FOLDED_INDEX_CACHE = {"person_index": None, "folded": None}
+
+
+def _folded_person_index(person_index):
+    """The person index with accents removed from its keys (built once, cached)."""
+    if _FOLDED_INDEX_CACHE["person_index"] is person_index:
+        return _FOLDED_INDEX_CACHE["folded"]
+    folded = {}
+    for (first_key, last_key), entries in person_index.items():
+        bucket = folded.setdefault((fold_accents(first_key), fold_accents(last_key)), [])
+        for entry in entries:
+            if all(entry is not e for e in bucket):
+                bucket.append(entry)
+    _FOLDED_INDEX_CACHE["person_index"] = person_index
+    _FOLDED_INDEX_CACHE["folded"] = folded
+    return folded
+
+
+def match_person_name(person_name, person_index):
+    """
+    Find the person-mapping entries for a DSpace contributor name.
+    Returns (matches, first, last): first/last is the reading of the DSpace
+    name that matched (used to prefer an accented spelling).
+
+    1. The name exactly as before (unchanged behaviour -- tried first, so an
+       existing match can never change).
+    2. Only if that finds nobody: the corrected readings from
+       _repaired_name_candidates (trailing comma, trailing digits, surname
+       prefix).
+    3. Only if that also finds nobody: the same readings with accents ignored
+       ("Ni Riordain" = "Ní Ríordáin"); entries spelled with accents first.
+    """
+    original = _split_person_name(person_name)
+    readings = [original] + _repaired_name_candidates(person_name)
+    for first, last in readings:
+        matches = person_index.get((normalize_person_name(first), normalize_person_name(last)), [])
+        if matches:
+            return matches, first, last
+    folded_index = _folded_person_index(person_index)
+    for first, last in readings:
+        key = (fold_accents(normalize_person_name(first)), fold_accents(normalize_person_name(last)))
+        matches = folded_index.get(key, [])
+        if matches:
+            matches = sorted(
+                matches,
+                key=lambda e: -accent_count(f"{e.get('firstName', '')}{e.get('lastName', '')}"),
+            )
+            return matches, first, last
+    return [], original[0], original[1]
+
+
+def find_person_match(person_name, person_index):
+    """Find matching person using pre-built index (see match_person_name)."""
+    return match_person_name(person_name, person_index)[0]
+
+
+def _with_case_of(base, accented):
+    """
+    The accented spelling written with the capitalisation (and apostrophe) of
+    base, when both are the same letters: "MAIRE" + "Máire" -> "MÁIRE".
+    """
+    a = unicodedata.normalize("NFC", accented)
+    b = unicodedata.normalize("NFC", base)
+    if len(a) != len(b):
+        return None
+    out = []
+    for ca, cb in zip(a, b):
+        if ca.translate(_APOSTROPHE_TRANSLATION) == "'" and cb.translate(_APOSTROPHE_TRANSLATION) == "'":
+            out.append(cb)
+        elif fold_accents(ca).lower() == fold_accents(cb).lower():
+            out.append(ca.upper() if cb.isupper() else ca.lower() if cb.islower() else ca)
         else:
-            first = person_name
-            last = ""
-    
-    key = (normalize_person_name(first), normalize_person_name(last))
-    return person_index.get(key, [])
+            return None
+    return "".join(out)
+
+
+def prefer_accented_spelling(base, candidates):
+    """
+    The accented spelling of a name part is preferred, wherever it comes from.
+    base is the spelling that would be written (from the person mapping);
+    candidates are other spellings (mapping alternatives, the DSpace name, the
+    existing Pure contributor's name). A candidate is used only if it is the
+    same name apart from accents (and capitalisation / apostrophe form) and has
+    more accents than base; it is then written with base's capitalisation.
+    """
+    if not base:
+        return base
+    base_key = fold_accents(normalize_person_name(base))
+    best, best_marks = base, accent_count(base)
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        if fold_accents(normalize_person_name(candidate)) != base_key:
+            continue
+        if accent_count(candidate) > best_marks:
+            best, best_marks = candidate.strip(), accent_count(candidate)
+    if best is base:
+        return base
+    return _with_case_of(base.strip(), best) or best
 
 
 def batch_fetch_person_metadata(person_uuids, api_key, base_url, is_external=False):
@@ -1050,6 +1253,19 @@ def parse_contributors_by_role(dspace_row):
     editors = parse_author_names(dspace_row.get("dc.contributor.editor", ""))
     translators = parse_author_names(dspace_row.get("dc.contributor.translator", ""))
     illustrators = parse_author_names(dspace_row.get("dc.contributor.illustrator", ""))
+
+    # Institution names (NAME_STOPWORDS) are not people: drop them entirely,
+    # so they are neither added as contributors nor listed as unmatched.
+    def drop_institutions(names):
+        institutions = [n for n in names if is_institution_name(n)]
+        if institutions:
+            print(f"  ℹ️ Skipping institution name(s) listed as contributors: {institutions}")
+        return [n for n in names if not is_institution_name(n)]
+
+    authors = drop_institutions(authors)
+    editors = drop_institutions(editors)
+    translators = drop_institutions(translators)
+    illustrators = drop_institutions(illustrators)
 
     # Resolve author/editor overlap for the same name
     # Apostrophe-insensitive, so e.g. author "O'Malley, Mary" and editor
@@ -1301,7 +1517,7 @@ def process_contributors(
 
         for contributor_name in contributor_names:
             print(f"    ➤ Checking match for {role}: '{contributor_name}'")
-            matches = find_person_match(contributor_name, person_index)
+            matches, dspace_first, dspace_last = match_person_name(contributor_name, person_index)
 
             if not matches:
                 print(f"        ⚠️ No matches found — adding to unmatched")
@@ -1357,6 +1573,12 @@ def process_contributors(
             last = matched_person.get("lastName", "")
             name_key = (normalize_person_name(first), normalize_person_name(last))
 
+            # Spelling written to Pure: the person mapping's, except that an
+            # accented spelling of the same name is preferred, wherever it
+            # comes from (mapping alternatives or the DSpace name).
+            display_first = prefer_accented_spelling(first, list(matched_person.get("alternativeFirstName") or []) + [dspace_first])
+            display_last = prefer_accented_spelling(last, list(matched_person.get("alternativeLastName") or []) + [dspace_last])
+
             # Reuse existing contributor if present (skip when existing_contributors is empty,
             # i.e. for new records or override mode)
             if existing_contributors:
@@ -1372,9 +1594,12 @@ def process_contributors(
                         continue
                     print(f"        ℹ️ Contributor already exists (by {matched_by}), using existing: {first} {last}")
                     existing_contrib = dict(existing_match)
-                    if existing_contrib.get("name", {}).get("firstName") != first or existing_contrib.get("name", {}).get("lastName") != last:
-                        print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {first} {last}")
-                    existing_contrib["name"] = {"firstName": first, "lastName": last}
+                    existing_name = existing_contrib.get("name") or {}
+                    reuse_first = prefer_accented_spelling(display_first, [existing_name.get("firstName")])
+                    reuse_last = prefer_accented_spelling(display_last, [existing_name.get("lastName")])
+                    if existing_name.get("firstName") != reuse_first or existing_name.get("lastName") != reuse_last:
+                        print(f"        ✏️  Updating name spelling to match authors JSON: {existing_contrib.get('name', {})} → {reuse_first} {reuse_last}")
+                    existing_contrib["name"] = {"firstName": reuse_first, "lastName": reuse_last}
                     final_contributors.append(existing_contrib)
                     used_existing_ids.add(id(existing_match))
                     added_person_uuids.update(u for u in (existing_uuid, uuid_value) if u)
@@ -1388,6 +1613,8 @@ def process_contributors(
                 matched_person, role, pure_type_key,
                 collect_external_orgs=COLLECT_EXTERNAL_ORGS,
             )
+            if contributor and (display_first, display_last) != (first, last) and isinstance(contributor.get("name"), dict):
+                contributor["name"] = dict(contributor["name"], firstName=display_first, lastName=display_last)
             if contributor:
                 final_contributors.append(contributor)
                 added_person_uuids.add(uuid_value)
@@ -1418,6 +1645,468 @@ def has_dspace_uuid(record):
         and str(identifier.get("value") or "").strip()
         for identifier in (record.get("identifiers") or [])
     )
+
+
+def dspace_item_handles(row):
+    """Normalised repository Handles of a DSpace item (from dc.identifier.uri), in order."""
+    handles = []
+    for handle in extract_handles_from_uri((row or {}).get("dc.identifier.uri", "")):
+        normalized = normalize_handle(handle)
+        if normalized not in handles:
+            handles.append(normalized)
+    return handles
+
+
+def dspace_item_repo_dois(row):
+    """Normalised repository DOIs (10.13025) of a DSpace item: dc.identifier.uri first, then dc.identifier.doi."""
+    dois = [d for d in extract_dois_from_uri((row or {}).get("dc.identifier.uri", "")) if "10.13025" in d]
+    for d in parse_doi_field((row or {}).get("dc.identifier.doi", ""))[0]:
+        if "10.13025" in d and d not in dois:
+            dois.append(d)
+    return dois
+
+
+def build_dspace_item_lookups(dspace_rows):
+    """Fill _DSPACE_ITEMS from the DSpace CSV rows."""
+    _DSPACE_ITEMS["by_uuid"] = {}
+    _DSPACE_ITEMS["uuid_by_handle"] = {}
+    _DSPACE_ITEMS["uuid_by_repo_doi"] = {}
+    for row in dspace_rows:
+        uuid = (row.get("uuid") or "").strip().lower()
+        if not uuid:
+            continue
+        _DSPACE_ITEMS["by_uuid"].setdefault(uuid, row)
+        for handle in dspace_item_handles(row):
+            _DSPACE_ITEMS["uuid_by_handle"].setdefault(handle, uuid)
+        for doi in dspace_item_repo_dois(row):
+            _DSPACE_ITEMS["uuid_by_repo_doi"].setdefault(doi, uuid)
+
+
+def enforce_single_dspace_identity(pure_record, dspace_row, updated_record, log_entry):
+    """
+    Make the updated record carry exactly one DSpace identity: one DSpace UUID
+    identifier, one repository Handle link and one repository DOI electronic
+    version, all belonging to the same DSpace item ("target").
+
+    Target: the CSV row's item -- unless the Pure record is already linked to
+    a different DSpace item and DSPACE_UUID_PREFERENCE is "pure", in which
+    case Pure's existing DSpace UUID is kept (and that item's Handle /
+    repository DOI are used when the item is in the CSV).
+
+    When the target item's Handle / repository DOI isn't known (not in the
+    CSV, or the item has none), Pure's existing ones are kept, except those
+    the CSV shows belong to a different DSpace item; if several remain, a
+    manual-review warning is printed.
+    """
+    row_uuid = (dspace_row.get("uuid") or "").strip()
+    pure_uuids = dspace_uuids_of(pure_record)
+    mismatch = bool(pure_uuids) and row_uuid.lower() not in {u.lower() for u in pure_uuids}
+    if mismatch and DSPACE_UUID_PREFERENCE == "pure":
+        target_uuid = pure_uuids[0]
+        target_row = _DSPACE_ITEMS["by_uuid"].get(target_uuid.lower())
+        log_entry["dspaceUuidResolution"] = "Pure's DSpace UUID kept"
+        print(f"  ℹ️ DSpace UUID mismatch — keeping Pure's DSpace UUID {target_uuid} (DSPACE_UUID_PREFERENCE = 'pure')")
+    else:
+        target_uuid = row_uuid
+        target_row = dspace_row
+        if mismatch:
+            log_entry["dspaceUuidResolution"] = "DSpace UUID from the CSV written"
+            print(f"  ℹ️ DSpace UUID mismatch — writing the CSV's DSpace UUID {row_uuid} (DSPACE_UUID_PREFERENCE = 'dspace')")
+    if not target_uuid:
+        return
+    target_key = target_uuid.lower()
+
+    def belongs_elsewhere(owner):
+        return owner is not None and owner != target_key
+
+    # --- one DSpace UUID identifier ---
+    # Start from Pure's own identifiers; drop every DSpace identifier that is
+    # NOT the target (and repeats of the target), then merge exactly as step 10
+    # does -- so a record that already carries only the target DSpace UUID
+    # comes out exactly as before.
+    current_ids = pure_record.get("identifiers") or []
+    kept_ids, kept_target = [], False
+    for ident in current_ids:
+        if isinstance(ident, dict) and ident.get("idSource") == "DSpace":
+            if str(ident.get("value") or "").strip().lower() == target_key and not kept_target:
+                kept_ids.append(ident)
+                kept_target = True
+            continue
+        kept_ids.append(ident)
+    new_ids = merge_identifiers(kept_ids, target_uuid)
+    if new_ids != (pure_record.get("identifiers") or []) or "identifiers" in updated_record:
+        updated_record["identifiers"] = new_ids
+
+    # --- one repository Handle ---
+    current_links = updated_record["links"] if "links" in updated_record else (pure_record.get("links") or [])
+    handle_links = [l for l in current_links if isinstance(l, dict) and is_handle_url(l.get("url", ""))]
+    other_links = [l for l in current_links if not (isinstance(l, dict) and is_handle_url(l.get("url", "")))]
+    target_handles = dspace_item_handles(target_row) if target_row else []
+    if target_handles:
+        wanted = target_handles[0]
+        existing = next((l for l in handle_links if normalize_handle(l.get("url", "")) == wanted), None)
+        new_handles = [existing or build_link(wanted, alias="Handle", description="Repository Handle")]
+    else:
+        # Target item's Handle unknown: start from Pure's ORIGINAL Handles (the
+        # update may already have put the CSV row's Handle in their place).
+        original_handles = [l for l in (pure_record.get("links") or [])
+                            if isinstance(l, dict) and is_handle_url(l.get("url", ""))]
+        new_handles = [l for l in original_handles
+                       if not belongs_elsewhere(_DSPACE_ITEMS["uuid_by_handle"].get(normalize_handle(l.get("url", ""))))]
+        if len(new_handles) > 1:
+            print(f"  ⚠️ MANUAL REVIEW REQUIRED: {len(new_handles)} repository Handles on record {pure_record.get('uuid')} "
+                  f"and none known for DSpace item {target_uuid} — keeping them")
+    new_links = new_handles + other_links
+    if new_links != current_links:
+        updated_record["links"] = new_links
+
+    # --- one repository DOI ---
+    current_evs = updated_record["electronicVersions"] if "electronicVersions" in updated_record else (pure_record.get("electronicVersions") or [])
+    def is_repo_ev(ev):
+        return (isinstance(ev, dict) and ev.get("typeDiscriminator") == "DoiElectronicVersion"
+                and "10.13025" in str(ev.get("doi") or ""))
+    repo_evs = [ev for ev in current_evs if is_repo_ev(ev)]
+    other_evs = [ev for ev in current_evs if not is_repo_ev(ev)]
+    target_repo_dois = dspace_item_repo_dois(target_row) if target_row else []
+    if target_repo_dois:
+        wanted = target_repo_dois[0]
+        existing = next((ev for ev in repo_evs if normalize_doi(ev.get("doi") or "") == wanted), None)
+        if existing is None:
+            _, embargo_active, _, embargo_period = resolve_embargo_and_access(target_row)
+            existing = apply_repository_access_license_version(
+                build_electronic_version(doi=wanted), embargo_active, embargo_period
+            )
+        new_repo = [existing]
+    else:
+        # Target item's repository DOI unknown: start from Pure's ORIGINAL ones.
+        original_repo = [ev for ev in (pure_record.get("electronicVersions") or []) if is_repo_ev(ev)]
+        new_repo = [ev for ev in original_repo
+                    if not belongs_elsewhere(_DSPACE_ITEMS["uuid_by_repo_doi"].get(normalize_doi(ev.get("doi") or "")))]
+        if len(new_repo) > 1:
+            print(f"  ⚠️ MANUAL REVIEW REQUIRED: {len(new_repo)} repository DOIs on record {pure_record.get('uuid')} "
+                  f"and none known for DSpace item {target_uuid} — keeping them")
+    new_evs = new_repo + other_evs
+    if new_evs != current_evs:
+        updated_record["electronicVersions"] = new_evs
+
+
+# ---- Title matching safeguards ----
+def dspace_publication_year(row):
+    match = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", (row or {}).get("dc.date.issued", "") or "")
+    return int(match.group(1)) if match else None
+
+
+def pure_publication_years(item):
+    years = set()
+    for status in (item or {}).get("publicationStatuses") or []:
+        year = ((status or {}).get("publicationDate") or {}).get("year")
+        if isinstance(year, int) or (isinstance(year, str) and year.isdigit()):
+            years.add(int(year))
+    return years
+
+
+def dspace_output_type_key(row):
+    """
+    Pure output type (e.g. 'contributiontojournal') a DSpace item maps to --
+    the same mapping create_new_record_from_dspace uses: an unmapped dc.type
+    becomes Other contribution.
+    """
+    dspace_type = ((row or {}).get("dc.type") or "").strip().lower()
+    uri = dspace_pure_subtype_map.get(dspace_type, "/dk/atira/pure/researchoutput/researchoutputtypes/othercontribution/other")
+    return get_pure_type_key(uri)
+
+
+def pure_output_type_key(item):
+    uri = ((item or {}).get("type") or {}).get("uri")
+    return get_pure_type_key(uri) if uri else None
+
+
+def full_title_key(title, subtitle):
+    """
+    Title + subtitle as one comparison key for the "identical title" test (an
+    embedded copy of the subtitle is not counted twice). Case, punctuation and
+    symbols are ignored, but -- unlike normalize_for_comparison -- digits are
+    kept, so "An Reiviú 2015" and "An Reiviú 2024", or "Part 1" and "Part 2",
+    are not identical.
+    """
+    title = (title or "").strip()
+    subtitle = (subtitle or "").strip()
+    if subtitle:
+        title = strip_subtitle_from_title(title, subtitle)
+    text = unicodedata.normalize("NFKC", f"{title} {subtitle}").lower()
+    text = "".join(" " if unicodedata.category(ch)[0] in ("P", "S") else ch for ch in text)
+    return " ".join(text.split())
+
+
+# Small words ignored by the word-level title check.
+_TITLE_SMALL_WORDS = {
+    "a", "an", "the", "of", "and", "in", "on", "for", "to", "with", "by", "at",
+    "from", "as", "or", "into", "its", "their", "is", "are", "be",
+}
+# Two words count as the same word from this similarity (rapidfuzz ratio):
+# spelling variants score 83-95 ("centre"/"center", "behaviour"/"behavior",
+# "cell"/"cells"), different words at most ~35.
+TITLE_WORD_SIMILARITY = 80
+
+
+def _title_content_words(text):
+    """Content words of a title: markup tags such as "[clc]" / "[/clc]" removed
+    ("t[clc]e[/clc]v" = "TeV"), lower case, punctuation removed, small words dropped."""
+    text = re.sub(r"\[/?[A-Za-z]{1,10}\]", "", text or "")
+    return [w for w in full_title_key(text, "").split() if w not in _TITLE_SMALL_WORDS]
+
+
+def _missing_words(words, others):
+    """Words of `words` that have no counterpart (same word or spelling variant) in `others`."""
+    return [w for w in words if not any(fuzz.ratio(w, o) >= TITLE_WORD_SIMILARITY for o in others)]
+
+
+def title_words_agree(dspace_title, dspace_subtitle, pure_title, pure_subtitle):
+    """
+    Word-level check for a fuzzy title match: for at least one combination of
+    title / title + subtitle on each side, every content word of each title has
+    a counterpart in the other (spelling variants and small typos allowed,
+    small words ignored). An extra or missing content word ("The
+    cost-effectiveness of ..." vs "The effectiveness of ...") means the titles
+    are different. Returns (agree, extra_words) -- extra_words from the closest
+    combination, for the log.
+    """
+    dspace_versions = [dspace_title] + ([f"{dspace_title} {dspace_subtitle}"] if dspace_subtitle else [])
+    pure_versions = [pure_title] + ([f"{pure_title} {pure_subtitle}"] if pure_subtitle else [])
+    closest = None
+    for d_text in dspace_versions:
+        d_words = _title_content_words(d_text)
+        for p_text in pure_versions:
+            p_words = _title_content_words(p_text)
+            if not d_words or not p_words:
+                continue
+            extra = _missing_words(d_words, p_words) + _missing_words(p_words, d_words)
+            if not extra:
+                return True, []
+            if closest is None or len(extra) < len(closest):
+                closest = extra
+    return False, closest or []
+
+
+def dspace_publisher_dois(row):
+    """Normalised publisher DOIs of a DSpace item (dc.identifier.doi, repository DOIs excluded)."""
+    return {d for d in parse_doi_field((row or {}).get("dc.identifier.doi", ""))[0] if "10.13025" not in d}
+
+
+def pure_publisher_dois(item):
+    """Normalised publisher DOIs of a Pure record (DOI electronic versions and DOI links, repository DOIs excluded)."""
+    dois = set()
+    for ev in (item or {}).get("electronicVersions") or []:
+        if isinstance(ev, dict) and ev.get("doi"):
+            doi = normalize_doi(ev["doi"])
+            if is_valid_doi(doi) and "10.13025" not in doi:
+                dois.add(doi)
+    for link in (item or {}).get("links") or []:
+        url = (link or {}).get("url", "") if isinstance(link, dict) else ""
+        if "doi.org" in url:
+            doi = normalize_doi(url)
+            if is_valid_doi(doi) and "10.13025" not in doi:
+                dois.add(doi)
+    return dois
+
+
+def owned_by_other_dspace_item(row, item):
+    """
+    The DSpace item(s) in the CSV that a Pure record already belongs to, when
+    they are NOT the row's item ([] otherwise). A record with such an owner
+    is another item's record.
+    """
+    row_uuid = (row.get("uuid") or "").strip().lower()
+    pure_uuids = dspace_uuids_of(item or {})
+    if not pure_uuids or row_uuid in {u.lower() for u in pure_uuids}:
+        return []
+    return [u for u in pure_uuids if u.lower() in _DSPACE_ITEMS["by_uuid"]]
+
+
+def _pure_side_types(item):
+    """Output types of a Pure record: its linked DSpace items' dc.type when they are in the CSV, else its own type."""
+    linked_rows = [_DSPACE_ITEMS["by_uuid"].get(u.lower()) for u in dspace_uuids_of(item or {})]
+    linked_rows = [r for r in linked_rows if r]
+    if linked_rows:
+        return {dspace_output_type_key(r) for r in linked_rows}, linked_rows
+    return {t for t in [pure_output_type_key(item)] if t}, linked_rows
+
+
+# Titles of at most this many words (small words included) are "short":
+# generic titles such as "Introduction", "Editorial", "Book review". A title
+# match on a short title also needs an author in common.
+SHORT_TITLE_MAX_WORDS = 5
+
+
+def _author_key(first, last):
+    """(surname, first initial) comparison key: case, accents and apostrophe form ignored."""
+    surname = " ".join(re.sub(r"[^\w']+", " ", fold_accents(normalize_person_name(last or ""))).split())
+    if not surname:
+        return None
+    first_folded = re.sub(r"[^a-z]", "", fold_accents(normalize_person_name(first or "")))
+    return surname, first_folded[:1]
+
+
+def dspace_author_keys(row):
+    """Author keys of a DSpace item's people (author, editor, translator and illustrator fields; institutions excluded)."""
+    keys = set()
+    for field in ("dc.contributor.author", "dc.contributor.editor",
+                  "dc.contributor.translator", "dc.contributor.illustrator"):
+        for name in parse_author_names((row or {}).get(field, "")):
+            if is_institution_name(name):
+                continue
+            key = _author_key(*_split_person_name(name))
+            if key:
+                keys.add(key)
+    return keys
+
+
+def pure_author_keys(item):
+    """Author keys of a Pure record's contributors."""
+    keys = set()
+    for contributor in (item or {}).get("contributors") or []:
+        name = (contributor or {}).get("name") or {} if isinstance(contributor, dict) else {}
+        key = _author_key(name.get("firstName", ""), name.get("lastName", ""))
+        if key:
+            keys.add(key)
+    return keys
+
+
+def authors_in_common(row_keys, item_keys):
+    """True if a person appears on both sides: same surname, and same first initial (or no initial on one side)."""
+    for surname, initial in row_keys:
+        for other_surname, other_initial in item_keys:
+            if surname == other_surname and (initial == other_initial or not initial or not other_initial):
+                return True
+    return False
+
+
+def confirm_title_match(row, item, dspace_title, dspace_subtitle):
+    """
+    Wrapper around the title rules (_confirm_title_match_rules): a match that
+    passes them but involves a SHORT title (at most SHORT_TITLE_MAX_WORDS words,
+    small words included, on either side) also needs an author in common.
+    """
+    accepted, reason = _confirm_title_match_rules(row, item, dspace_title, dspace_subtitle)
+    if not accepted:
+        return accepted, reason
+    pure_title = ((item or {}).get("title") or {}).get("value", "")
+    pure_subtitle = ((item or {}).get("subTitle") or {}).get("value", "")
+    shortest = min(len(full_title_key(dspace_title, dspace_subtitle).split()),
+                   len(full_title_key(pure_title, pure_subtitle).split()))
+    if shortest <= SHORT_TITLE_MAX_WORDS:
+        row_keys, item_keys = dspace_author_keys(row), pure_author_keys(item)
+        if not item_keys:
+            return False, f"short title ({shortest} words) and the Pure record has no contributors to compare"
+        if not authors_in_common(row_keys, item_keys):
+            return False, f"short title ({shortest} words) and no author in common"
+        return True, f"{reason}; short title confirmed by a common author"
+    return accepted, reason
+
+
+def _confirm_title_match_rules(row, item, dspace_title, dspace_subtitle):
+    """
+    Decide whether a title match between a DSpace item and a Pure record is
+    accepted. Returns (accepted, reason).
+      - 100% match (full title + subtitle identical on both sides): accepted
+        unless the research output types differ.
+      - Anything else (fuzzy, or equal only when one side's subtitle is
+        ignored): accepted only if the publication year AND the research
+        output type are confirmed to be the same.
+    The Pure side's type: when the Pure record belongs to DSpace item(s) that
+    are in the CSV, their dc.type is used (compared like with like, and not
+    affected by a record having been created as Other contribution because
+    its journal wasn't found); otherwise the Pure record's own type. Years:
+    the Pure record's publication years, plus those linked items' years.
+    """
+    # Fix 4: a Pure record that already belongs to ANOTHER DSpace item in the
+    # CSV is that item's record -- never matched to this row by title.
+    owners = owned_by_other_dspace_item(row, item)
+    if owners:
+        return False, f"the Pure record belongs to another DSpace item {owners}"
+
+    # Fix 2: if both sides have publisher DOIs and none agree, they are
+    # different outputs, whatever the titles say.
+    row_dois, item_dois = dspace_publisher_dois(row), pure_publisher_dois(item)
+    if row_dois and item_dois and not (row_dois & item_dois):
+        return False, f"different publisher DOIs ({sorted(row_dois)} vs {sorted(item_dois)})"
+
+    pure_title = ((item or {}).get("title") or {}).get("value", "")
+    pure_subtitle = ((item or {}).get("subTitle") or {}).get("value", "")
+    dspace_key = full_title_key(dspace_title, dspace_subtitle)
+    pure_key = full_title_key(pure_title, pure_subtitle)
+    exact = dspace_key == pure_key
+
+    # Numbers in the titles must agree: items of a numbered series ("Factsheet
+    # No. 17" / "No. 18", "Volume 5" / "Volume 6", "2014" / "1998-2022") are
+    # different outputs, even when the rest of the title is the same.
+    dspace_numbers = sorted(n.lstrip("0") or "0" for n in re.findall(r"\d+", dspace_key))
+    pure_numbers = sorted(n.lstrip("0") or "0" for n in re.findall(r"\d+", pure_key))
+    if dspace_numbers != pure_numbers:
+        return False, f"numbers in the titles differ ({dspace_numbers} vs {pure_numbers})"
+
+    linked_rows = [_DSPACE_ITEMS["by_uuid"].get(u.lower()) for u in dspace_uuids_of(item or {})]
+    linked_rows = [r for r in linked_rows if r]
+    d_type = dspace_output_type_key(row)
+    if linked_rows:
+        p_types = {dspace_output_type_key(r) for r in linked_rows}
+    else:
+        p_types = {t for t in [pure_output_type_key(item)] if t}
+
+    d_year = dspace_publication_year(row)
+    p_years = pure_publication_years(item) | {y for y in (dspace_publication_year(r) for r in linked_rows) if y}
+
+    if exact:
+        if d_type and p_types and d_type not in p_types:
+            return False, f"identical title but different output type ({d_type} vs {sorted(p_types)})"
+        # Fix 2: identical titles must also be from the same year (generic
+        # titles such as "Introduction" or "Editorial" recur every year).
+        # When a year is missing on either side it can't be compared.
+        if d_year is not None and p_years and d_year not in p_years:
+            return False, f"identical title but different year ({d_year} vs {sorted(p_years)})"
+        return True, "identical title"
+
+    if d_year is None or not p_years:
+        return False, "title not identical and publication year can't be compared"
+    if d_year not in p_years:
+        return False, f"title not identical and different year ({d_year} vs {sorted(p_years)})"
+    if not d_type or not p_types:
+        return False, "title not identical and output type can't be compared"
+    if d_type not in p_types:
+        return False, f"title not identical and different output type ({d_type} vs {sorted(p_types)})"
+    return True, "same year and output type"
+
+
+def publisher_doi_conflict(row, item, threshold):
+    """
+    A publisher-DOI match is not trusted when the Pure record already belongs
+    to a DIFFERENT DSpace item and the two don't describe the same output --
+    the same DOI on two different DSpace items is a data error (a DOI copied
+    to the wrong item) or a DOI shared by several outputs (a book's DOI on its
+    chapters). The match is kept only if the titles agree at word level
+    (title_words_agree, the strict check used for fuzzy title matches) AND
+    the output types are the same. Returns a reason string, or None if there
+    is no conflict. (threshold is kept for compatibility; no longer used.)
+    """
+    pure_uuids = dspace_uuids_of(item)
+    row_uuid = (row.get("uuid") or "").strip().lower()
+    if not pure_uuids or row_uuid in {u.lower() for u in pure_uuids}:
+        return None
+    dspace_subtitle = (row.get("dc.title.subtitle") or row.get("dc.title.alternative") or "").strip()
+    words_ok, extra_words = title_words_agree(
+        (row.get("dc.title") or "").strip(), dspace_subtitle,
+        ((item.get("title") or {}).get("value") or "").strip(),
+        ((item.get("subTitle") or {}).get("value") or "").strip(),
+    )
+    if not words_ok:
+        return (f"same publisher DOI, but the Pure record belongs to DSpace item(s) {pure_uuids} "
+                f"and the titles differ (words without a counterpart: {extra_words})")
+    d_type = dspace_output_type_key(row)
+    p_types, _ = _pure_side_types(item)
+    if d_type and p_types and d_type not in p_types:
+        return (f"same publisher DOI, but the Pure record belongs to DSpace item(s) {pure_uuids} "
+                f"and the output type differs ({d_type} vs {sorted(p_types)})")
+    return None
 
 
 def dspace_uuids_of(record):
@@ -3068,6 +3757,9 @@ def update_record_from_dspace(pure_record, dspace_row, person_index, org_index, 
     else:
         print(f"  ⚠️ No DSpace UUID found for record: {dspace_row.get('dc.title', '')[:80]}")
     
+    # --- 10b. One DSpace identity: one DSpace UUID, Handle and repository DOI ---
+    enforce_single_dspace_identity(pure_record, dspace_row, updated_record, log_entry)
+
     # --- 11. Publisher (dc.publisher) > inject for BookAnthology / ContributionToBookAnthology ---
     PUBLISHER_TYPES = {"BookAnthology", "ContributionToBookAnthology", "OtherContribution", "WorkingPaper", "NonTextual"}
     if pub_index and pure_type in PUBLISHER_TYPES:
@@ -3537,6 +4229,7 @@ def main():
             if row.get("pdf_handle_paths"):
                 row["pdf_handle_paths"] = clean_dspace_filename(row["pdf_handle_paths"])
             dspace_rows.append(row)
+    build_dspace_item_lookups(dspace_rows)
     print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
 
     print("Loading Pure JSON...")
@@ -3572,8 +4265,24 @@ def main():
     org_index = build_organization_name_index(organization_mapping)
     print(f"✅ Built organization name index with {len(org_index)} entries")
 
+    # A Pure record that already carries a DSpace UUID is matched ONLY through
+    # that DSpace UUID (step 0) -- never by publisher DOI, repository DOI,
+    # Handle or title. Steps 1-4 therefore only see records without a DSpace
+    # UUID ("unlinked").
+    pure_by_dspace_uuid = defaultdict(list)
+    unlinked_pure_items = []
+    for item in pure_items:
+        linked_uuids = dspace_uuids_of(item)
+        if linked_uuids:
+            for linked_uuid in linked_uuids:
+                pure_by_dspace_uuid[linked_uuid.lower()].append(item)
+        else:
+            unlinked_pure_items.append(item)
+    print(f"✅ Pure records linked to a DSpace item: {len(pure_items) - len(unlinked_pure_items)} "
+          f"(matched only by DSpace UUID) | without a DSpace UUID: {len(unlinked_pure_items)}")
+
     print("Building title token index...")
-    title_token_index = build_title_token_index(pure_items)
+    title_token_index = build_title_token_index(unlinked_pure_items)
     print(f"✅ Built title token index with {len(title_token_index)} tokens")
 
     pub_index = build_publisher_name_index(publisher_mapping)
@@ -3598,7 +4307,7 @@ def main():
     pure_by_repo_doi = defaultdict(list)  # For repository DOIs (10.13025)
     pure_by_title = defaultdict(list)
 
-    for item in pure_items:
+    for item in unlinked_pure_items:
         # Index by Publisher DOI (from electronic versions)
         for ev in item.get("electronicVersions", []):
             doi = ev.get("doi", "")
@@ -3660,6 +4369,15 @@ def main():
             print(f"⚠️ Skipping record - not in Publications collection: {row.get('dc.title', '')[:50]}...")
             continue
 
+        # Filter: datasets are not uploaded from DSpace to Pure
+        if (row.get("dc.type") or "").strip().lower() in EXCLUDED_DSPACE_TYPES:
+            log_entry["success"] = False
+            log_entry["error"] = "Skipped: dataset (not uploaded to Pure)"
+            log_entry["handle"] = extract_handles_from_uri(row.get("dc.identifier.uri", ""))[0] if extract_handles_from_uri(row.get("dc.identifier.uri", "")) else None
+            log_entries.append(log_entry)
+            print(f"⚠️ Skipping record - dataset, not uploaded to Pure: {row.get('dc.title', '')[:50]}...")
+            continue
+
         # Check if ALL contributor fields are empty
         has_any_contributors = any([
             row.get("dc.contributor.author", "").strip(),
@@ -3697,16 +4415,39 @@ def main():
         matched_records = []
         match_type = None  # Track which match method was used
 
+        # 0. DSpace UUID -- highest priority: a Pure record that already carries
+        # this item's DSpace UUID is its record. When found, no other matching.
+        row_dspace_uuid = (row.get("uuid") or "").strip().lower()
+        if row_dspace_uuid and row_dspace_uuid in pure_by_dspace_uuid:
+            matched_records.extend(pure_by_dspace_uuid[row_dspace_uuid])
+            match_type = "DSpace UUID"
+
         # 1. Try to match by Publisher DOI -- every DOI in the field. A Pure
         # record reached through several DOIs (or indexed twice, e.g. via an
         # electronic version and a DOI link) is only counted once.
         seen_record_ids = set()
-        for normalized_doi in field_publisher_dois:
+        for normalized_doi in ([] if matched_records else field_publisher_dois):
             for pure_item in pure_by_doi.get(normalized_doi, []):
+                conflict = publisher_doi_conflict(row, pure_item, TITLE_SIMILARITY_THRESHOLD) if id(pure_item) not in seen_record_ids else None
+                if conflict:
+                    seen_record_ids.add(id(pure_item))
+                    print(f"  ⚠️ Publisher DOI match with {pure_item.get('uuid')} rejected: {conflict}")
+                    log_entry.setdefault("rejectedMatches", []).append({"pureUUID": pure_item.get("uuid"), "reason": conflict})
+                    row_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+                    _publisher_doi_conflicts.append({
+                        "dspace_uuid": row.get("uuid", ""),
+                        "handle": row_handles[0] if row_handles else None,
+                        "dspace_title": row.get("dc.title", ""),
+                        "doi": normalized_doi,
+                        "pure_uuid": pure_item.get("uuid"),
+                        "pure_title": (pure_item.get("title") or {}).get("value", ""),
+                        "pure_record_dspace_uuids": " ; ".join(dspace_uuids_of(pure_item)),
+                    })
+                    continue
                 if id(pure_item) not in seen_record_ids:
                     seen_record_ids.add(id(pure_item))
                     matched_records.append(pure_item)
-        if matched_records:
+        if matched_records and match_type is None:
             match_type = "Publisher DOI"
 
         # 2. Try to match by Repository DOI
@@ -3737,19 +4478,31 @@ def main():
             if dspace_title:
                 combined_dspace_title = f"{dspace_title} {dspace_subtitle}".strip() if dspace_subtitle else dspace_title
 
-                # Strategy 4a. Exact match: try all three key variants against the index
+                # Strategy 4a. Exact match: try all three key variants against the index.
+                # Each candidate must pass confirm_title_match (identical full title +
+                # subtitle and same output type, or else same year and output type).
                 exact_candidates = [dspace_title, combined_dspace_title]
                 for candidate in dict.fromkeys(exact_candidates):  # deduplicate, preserve order
                     key = normalize(candidate)
                     if key in pure_by_title:
-                        matched_records.extend(pure_by_title[key])
-                        match_type = "Title (Exact)"
-                        break
+                        accepted = []
+                        for pure_item in pure_by_title[key]:
+                            ok, reason = confirm_title_match(row, pure_item, dspace_title, dspace_subtitle)
+                            if ok:
+                                if all(pure_item is not a for a in accepted):
+                                    accepted.append(pure_item)
+                            else:
+                                print(f"  ⚠️ Title match with {pure_item.get('uuid')} rejected: {reason}")
+                                log_entry.setdefault("rejectedMatches", []).append({"pureUUID": pure_item.get("uuid"), "reason": reason})
+                        if accepted:
+                            matched_records.extend(accepted)
+                            match_type = "Title (Exact)"
+                            break
 
                 # Strategy 4b. Fuzzy title match: candidates only, not all Pure records
                 if not matched_records:
                     candidates = find_fuzzy_title_candidates(
-                        dspace_title, dspace_subtitle, title_token_index, pure_items
+                        dspace_title, dspace_subtitle, title_token_index, unlinked_pure_items
                     )
                     best_match = None
                     best_similarity = 0
@@ -3765,6 +4518,19 @@ def main():
                                 TITLE_SIMILARITY_THRESHOLD,
                             )
                             if is_match and similarity > best_similarity:
+                                words_ok, extra_words = title_words_agree(
+                                    dspace_title, dspace_subtitle, pure_title_val, pure_subtitle_val
+                                )
+                                if not words_ok:
+                                    reason = f"titles differ in wording (words without a counterpart: {extra_words})"
+                                    print(f"  ⚠️ Title match ({similarity:.1%}) with {pure_item.get('uuid')} rejected: {reason}")
+                                    log_entry.setdefault("rejectedMatches", []).append({"pureUUID": pure_item.get("uuid"), "reason": reason})
+                                    continue
+                                ok, reason = confirm_title_match(row, pure_item, dspace_title, dspace_subtitle)
+                                if not ok:
+                                    print(f"  ⚠️ Title match ({similarity:.1%}) with {pure_item.get('uuid')} rejected: {reason}")
+                                    log_entry.setdefault("rejectedMatches", []).append({"pureUUID": pure_item.get("uuid"), "reason": reason})
+                                    continue
                                 best_match = pure_item
                                 best_similarity = similarity
 
@@ -3810,6 +4576,9 @@ def main():
                     "pure_title": (target_record.get("title") or {}).get("value", ""),
                     "portal_url": target_record.get("portalUrl", ""),
                     "case": mismatch_case,
+                    "match_type": match_type,
+                    "resolution": ("Pure's DSpace UUID kept" if DSPACE_UUID_PREFERENCE == "pure"
+                                   else "DSpace UUID from the CSV written"),
                 })
 
         if matched_records:
@@ -3939,6 +4708,17 @@ def main():
             writer.writerows(_unmatched_journals)
         print(f"✅ Unmatched journals saved to: {unmatched_journals_csv}")
 
+    # Publisher DOI conflicts CSV (same publisher DOI on two different DSpace
+    # items with different titles -- the DOI match was not used)
+    if _publisher_doi_conflicts:
+        conflicts_csv = os.path.join(OUTPUT_DIR, f"publisher_doi_conflicts_{TODAY}.csv")
+        with open(conflicts_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['dspace_uuid', 'handle', 'dspace_title', 'doi',
+                                                   'pure_uuid', 'pure_title', 'pure_record_dspace_uuids'])
+            writer.writeheader()
+            writer.writerows(_publisher_doi_conflicts)
+        print(f"✅ Publisher DOI conflicts saved to: {conflicts_csv}")
+
     # DSpace UUID mismatches CSV (the Pure record updated -- single match or
     # chosen among duplicates -- carries a different DSpace item's UUID)
     if _dspace_uuid_mismatches:
@@ -3946,7 +4726,7 @@ def main():
         print(f"\n📝 Writing {len(_dspace_uuid_mismatches)} DSpace UUID mismatches to CSV...")
         with open(mismatches_csv, 'w', newline='', encoding='utf-8') as f:
             fieldnames = ['dspace_uuid', 'pure_record_dspace_uuids', 'handle', 'pure_uuid',
-                          'dspace_title', 'pure_title', 'portal_url', 'case']
+                          'dspace_title', 'pure_title', 'portal_url', 'case', 'match_type', 'resolution']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(_dspace_uuid_mismatches)
@@ -3958,7 +4738,8 @@ def main():
     # nothing below is counted in more than one place within the same total.
     not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
-    skipped_count = not_publications_count + no_contributors_count
+    dataset_count = sum(1 for e in log_entries if e.get('error') == "Skipped: dataset (not uploaded to Pure)")
+    skipped_count = not_publications_count + no_contributors_count + dataset_count
 
     matched_count = sum(1 for e in log_entries if e['matched'])
     unmatched_new_record_count = sum(1 for e in log_entries if not e['matched'] and e['success'])
@@ -3971,6 +4752,7 @@ def main():
     print(f"\n✅ Done! {len(log_entries)} records processed.")
     print(f"   Skipped (out of scope): {skipped_count}")
     print(f"     ↳ Not in Publications collection: {not_publications_count}")
+    print(f"     ↳ Dataset (not uploaded to Pure): {dataset_count}")
     print(f"     ↳ No contributors in any field: {no_contributors_count}")
     print(f"   Matched to existing Pure record: {matched_count}")
     print(f"   Unmatched (new records created): {unmatched_new_record_count}")
@@ -3983,6 +4765,7 @@ def main():
     print(f"   Unmatched publishers: {len(_unmatched_publishers)}")
     print(f"   Unmatched journals: {len(_unmatched_journals)}")
     print(f"   DSpace UUID mismatches: {len(_dspace_uuid_mismatches)}")
+    print(f"   Publisher DOI conflicts: {len(_publisher_doi_conflicts)}")
     print(f"   Logs saved to: {LOG_DIR}")
 
     # Calculate elapsed time
