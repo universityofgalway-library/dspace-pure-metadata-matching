@@ -47,7 +47,7 @@ EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
 # DSPACE_CSV = "./dspace_data/prod_samples/enriched_dspace_prod_items_2026-10-05_subset.csv"
 DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
 PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-06.json"
-PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-05.json"
+PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-05_cleaned.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-10-06.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_prod_publishers_2026-10-06.json"
 JOURNAL_MAPPING_JSON = "./pure_entities/pure_prod_journals_2026-10-06.json"
@@ -835,8 +835,28 @@ def parse_author_names(author_str):
     return [a.strip() for a in author_str.split(";") if a.strip()] 
 
 
+# A first name or last name with more than this many words (split on
+# whitespace) is not a person's name -- e.g. "Of Children And Youth Affairs
+# Working Group On Research Ethics" -- and is neither indexed nor matched.
+MAX_NAME_PART_WORDS = 5
+
+
+def is_valid_name_part(part):
+    """A usable first-name / last-name value: not blank, at most MAX_NAME_PART_WORDS words."""
+    return isinstance(part, str) and bool(part.strip()) and len(part.split()) <= MAX_NAME_PART_WORDS
+
+
 def build_person_name_index(person_mapping):
-    """Build a comprehensive index of all person name variations for O(1) lookup"""
+    """
+    Build a comprehensive index of all person name variations for O(1) lookup.
+
+    Keys are (first, last) and (last, first) for every combination of the
+    person's first names and last names (main and alternative). Blank values
+    and name parts of more than MAX_NAME_PART_WORDS words are left out.
+    A person with NO first name at all (e.g. "Subandriyo") is indexed by
+    surname only, as ("", surname) -- never as (surname, ""): a first name
+    with an empty surname is not a valid key.
+    """
     person_index = {}
     
     for person in person_mapping:
@@ -874,7 +894,18 @@ def build_person_name_index(person_mapping):
         all_firsts.extend(alt_firsts)
         all_lasts = [p_last] if p_last else []
         all_lasts.extend(alt_lasts)
-        
+        # Blank values and name parts of more than MAX_NAME_PART_WORDS words are not indexed.
+        all_firsts = [af for af in all_firsts if is_valid_name_part(af)]
+        all_lasts = [al for al in all_lasts if is_valid_name_part(al)]
+
+        # Surname-only person (no first name at all): indexed as ("", surname) only.
+        if not all_firsts:
+            for al in all_lasts:
+                key = ("", normalize_person_name(al))
+                if key not in person_index:
+                    person_index[key] = []
+                person_index[key].append(person)
+
         for af in all_firsts:
             for al in all_lasts:
                 key1 = (normalize_person_name(af), normalize_person_name(al))
@@ -894,11 +925,45 @@ def build_person_name_index(person_mapping):
 # institutions, not people: they are dropped from the DSpace contributors
 # entirely -- neither added as contributors nor listed as unmatched.
 NAME_STOPWORDS = [
-    "university", "college", "academy", "institute", "association", "department",
-    "school", "nuig", "ollscoil", "centre", "center", "laboratory", "institution",
-    "organisation", "organization", "foundation", "society", "proceedings",
-    "bank", "programme", "union", "education", "research", "national",
-    "international", "group", "committee",
+    "academy",
+    "association",
+    "bank",
+    "center",
+    "centre",
+    "college",
+    "committee",
+    "consortium",
+    "council",
+    "department",
+    "edtech",
+    "education",
+    "elsevier",
+    "european",
+    "foundation",
+    "frontline",
+    "government",
+    "group",
+    "ieee",
+    "institute",
+    "institution",
+    "international",
+    "journal",
+    "laboratory",
+    "national",
+    "network",
+    "nuig",
+    "ollscoil",
+    "organisation",
+    "organization",
+    "proceedings",
+    "programme",
+    "research",
+    "school",
+    "society",
+    "trust",
+    "union",
+    "university",
+    "uplift",
 ]
 _NAME_STOPWORD_SET = set(NAME_STOPWORDS)
 
@@ -1266,6 +1331,21 @@ def parse_contributors_by_role(dspace_row):
     editors = drop_institutions(editors)
     translators = drop_institutions(translators)
     illustrators = drop_institutions(illustrators)
+
+    # A name whose first name or last name has more than MAX_NAME_PART_WORDS
+    # words is not a valid contributor name: dropped entirely as well.
+    def drop_overlong(names):
+        overlong = [n for n in names
+                    if any(len(part.split()) > MAX_NAME_PART_WORDS for part in _split_person_name(n))]
+        if overlong:
+            print(f"  ℹ️ Skipping invalid contributor name(s) (first or last name of more than "
+                  f"{MAX_NAME_PART_WORDS} words): {overlong}")
+        return [n for n in names if n not in overlong]
+
+    authors = drop_overlong(authors)
+    editors = drop_overlong(editors)
+    translators = drop_overlong(translators)
+    illustrators = drop_overlong(illustrators)
 
     # Resolve author/editor overlap for the same name
     # Apostrophe-insensitive, so e.g. author "O'Malley, Mary" and editor
