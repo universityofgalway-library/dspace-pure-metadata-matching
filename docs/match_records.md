@@ -145,6 +145,22 @@ Records are matched in priority order:
 
 DOIs and handles are compared in normalised form on both sides — see [DOI & Handle Normalisation](#doi--handle-normalisation).
 
+### Double matches and double deposits
+
+A Pure record that **belongs to another DSpace item** is never updated by this row:
+- it was already matched (and updated) by another DSpace row **earlier in the same run** — previously the later update silently replaced the earlier one, so only one item's DSpace UUID reached Pure; or
+- it carries a **repository Handle or repository DOI of another DSpace item** (and none of this row's).
+
+What happens then depends on whether the two DSpace items are the **same work** — a publisher DOI in common, or an identical full title from the same year:
+
+| Case | Result |
+|---|---|
+| Another matching record is free | That record is used. |
+| Same work (**double deposit** in DSpace) | The row is **skipped** — no duplicate Pure record is created (counted under *Skipped → Double deposit*). Resolve the duplicate in DSpace. |
+| Different works (e.g. near-identical titles, different Handles / years) | The row continues without that record, and gets its **own new record** if nothing else matches. |
+
+Every case is listed in `double_matches_YYYY-MM-DD.csv`: `pure_uuid`, `pure_title`, `first_dspace_uuid`, `first_handle`, `first_match_type` (or "record carries its Handle / repository DOI"), `dspace_uuid`, `handle`, `match_type`, `same_work`, `action`; the status log records `doubleMatch`.
+
 ### Safeguards against false matches
 
 **Title matches** (steps 4a and 4b) compare every combination of title and subtitle on both sides. A candidate is rejected if:
@@ -584,7 +600,8 @@ For `ContributionToJournal` **and** `ContributionToPeriodical` records (treated 
 ├── unmatched_publishers_YYYY-MM-DD.csv
 ├── unmatched_journals_YYYY-MM-DD.csv
 ├── dspace_uuid_mismatches_YYYY-MM-DD.csv
-└── publisher_doi_conflicts_YYYY-MM-DD.csv
+├── publisher_doi_conflicts_YYYY-MM-DD.csv
+└── double_matches_YYYY-MM-DD.csv
 ```
 
 | Path | Contents |
@@ -613,6 +630,7 @@ At the end of a run, the processing log shows:
    Skipped (out of scope): …
      ↳ Not in Publications collection: …
      ↳ Dataset (not uploaded to Pure): …
+     ↳ Double deposit (Pure record belongs to another DSpace item of the same work): …
      ↳ No contributors in any field: …
    Matched to existing Pure record: …
    Unmatched (new records created): …
@@ -626,6 +644,7 @@ At the end of a run, the processing log shows:
    Unmatched journals: …
    DSpace UUID mismatches: …
    Publisher DOI conflicts: …
+   Double matches (Pure record belonging to another DSpace item): …
    Logs saved to: …
 ```
 

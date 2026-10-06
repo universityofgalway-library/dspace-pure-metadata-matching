@@ -28,15 +28,22 @@ Options:
     --dry-run               Match records and report what would be done, but do not upload/PUT
     --skip-existing /
     --no-skip-existing      Skip files already in Pure with same name and size (default: skip)
+    --username / --password Log in to DSpace (or set DSPACE_USERNAME / DSPACE_PASSWORD), so that
+                            embargoed and restricted files can be downloaded. Without them,
+                            files are downloaded anonymously (embargoed ones fail with HTTP 401).
+    --dspace-api-root       DSpace REST API root for the login (or set DSPACE_API_ROOT);
+                            by default derived from the PDF links (.../server/api).
     --refresh-from-pure     Re-read each matched record from Pure (GET) just before
                             checking / updating it, instead of using the export.
                             Off by default: records come from --pure-json, and keeping
                             that export up to date is the user's responsibility.
 
 Record matching is identifier-only and follows match_records.py:
-    0. DSpace UUID -- a Pure record carrying the row's DSpace UUID is its record.
-    1-3. Only Pure records WITHOUT a DSpace UUID: publisher DOI, then repository
-       DOI (10.13025), then Handle. Titles are never used.
+    0. DSpace UUID -- a Pure record carrying the row's DSpace UUID is its record
+       (and is matched only through it).
+    1-3. Only Pure records WITHOUT a DSpace UUID: Handle, then repository DOI
+       (10.13025), then publisher DOI -- the latter only with an identical title
+       (title + subtitle, case and punctuation ignored, numbers kept).
     Ambiguous matches (2+ different Pure records) are skipped and reported.
 """
 
@@ -144,9 +151,25 @@ def clean_dspace_filename(filename: str) -> str:
     return unicodedata.normalize("NFKC", unescaped)
 
 
+def pdf_problem(content: bytes) -> str | None:
+    """
+    Why the downloaded content is not an acceptable PDF, or None if it is.
+    A PDF must be larger than 1 KB and contain the "%PDF" header within its
+    first 1 KB -- PDF readers accept a header that is not at the very start
+    (e.g. after a leading newline).
+    """
+    if not content:
+        return "empty file (0 bytes) — the file needs to be fixed in DSpace"
+    if len(content) <= 1024:
+        return f"file is under 1 KB ({len(content)} bytes)"
+    if b"%PDF" not in content[:1024]:
+        return f"no %PDF header in the first 1 KB (first bytes: {content[:8]!r})"
+    return None
+
+
 def is_valid_pdf(content: bytes) -> bool:
-    """Return True if content starts with the PDF magic bytes and is larger than 1kb."""
-    return len(content) > 1024 and content[:4] == b'%PDF'
+    """Return True if content is larger than 1 KB and has a %PDF header within its first 1 KB."""
+    return pdf_problem(content) is None
 
 
 def normalize_doi(value: str) -> str:
@@ -481,6 +504,106 @@ def resolve_duplicate_file_versions(pure_record: dict) -> tuple[bool, list, list
 # Matching: build lookup indices from Pure JSON
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Title comparison -- identical to match_records.py ("identical title" test)
+# ---------------------------------------------------------------------------
+# Punctuation set of match_records.py (same characters), used by strip_subtitle_from_title.
+PUNC = set('!"#$%&\'()*+,-./0123456789:;<=>?@[\\]^_{|}~£©®¿‐–—€™')
+
+
+def strip_subtitle_from_title(title, subtitle):
+    """
+    If title ends with subtitle (case-insensitive, punctuation-ignored),
+    strip it from the title, including any preceding colon (and optional space).
+    Returns the cleaned title string (original register/punctuation preserved).
+    """
+    if not title or not subtitle:
+        return title
+
+    def strip_punc(s):
+        return "".join(ch for ch in s.lower() if ch not in PUNC and not ch.isspace())
+
+    title_clean = strip_punc(title)
+    sub_clean = strip_punc(subtitle)
+
+    if not sub_clean or not title_clean.endswith(sub_clean):
+        return title
+
+    # Find how many original chars of `title` correspond to the subtitle suffix.
+    # Walk backwards through title matching against sub_clean in reverse.
+    sub_rev = sub_clean[::-1]
+    matched = 0
+    i = len(title) - 1
+    for target_ch in sub_rev:
+        while i >= 0:
+            ch = title[i]
+            i -= 1
+            if ch.lower() not in PUNC and not ch.isspace():
+                if ch.lower() == target_ch:
+                    matched += 1
+                    break
+                else:
+                    return title  # mismatch — safety exit
+    # i now points just before the subtitle portion
+    cut = i + 1  # index in original title where subtitle begins (approx)
+
+    # Walk back over any whitespace then an optional colon (and its preceding space)
+    trimmed = title[:cut].rstrip()
+    if trimmed.endswith(":"):
+        trimmed = trimmed[:-1].rstrip()
+
+    return trimmed if trimmed else title
+
+
+def full_title_key(title, subtitle):
+    """
+    Title + subtitle as one comparison key for the "identical title" test (an
+    embedded copy of the subtitle is not counted twice). Case, punctuation and
+    symbols are ignored, but -- unlike normalize_for_comparison -- digits are
+    kept, so "An Reiviú 2015" and "An Reiviú 2024", or "Part 1" and "Part 2",
+    are not identical.
+    """
+    title = (title or "").strip()
+    subtitle = (subtitle or "").strip()
+    if subtitle:
+        title = strip_subtitle_from_title(title, subtitle)
+    text = unicodedata.normalize("NFKC", f"{title} {subtitle}").lower()
+    text = "".join(" " if unicodedata.category(ch)[0] in ("P", "S") else ch for ch in text)
+    return " ".join(text.split())
+
+
+def dspace_full_title_key(dspace_row: dict) -> str:
+    """dc.title + subtitle (dc.title.subtitle, else dc.title.alternative), as in match_records.py."""
+    subtitle = (dspace_row.get("dc.title.subtitle") or dspace_row.get("dc.title.alternative") or "").strip()
+    return full_title_key((dspace_row.get("dc.title") or "").strip(), subtitle)
+
+
+def pure_full_title_key(item: dict) -> str:
+    """Pure title + subTitle."""
+    return full_title_key(((item.get("title") or {}).get("value") or "").strip(),
+                          ((item.get("subTitle") or {}).get("value") or "").strip())
+
+
+def _pure_repository_ids(item: dict) -> set:
+    """Normalised repository Handles and repository DOIs (10.13025) carried by a Pure record."""
+    ids = set()
+    for link in item.get("links") or []:
+        url = (link or {}).get("url", "") if isinstance(link, dict) else ""
+        if is_handle_url(url):
+            ids.add(normalize_handle(url))
+        elif "10.13025" in url:
+            ids.add(normalize_doi(url))
+    for ev in item.get("electronicVersions") or []:
+        doi = (ev or {}).get("doi") if isinstance(ev, dict) else None
+        if not doi:
+            continue
+        if is_handle_url(doi):
+            ids.add(normalize_handle(doi))
+        elif "10.13025" in doi:
+            ids.add(normalize_doi(doi))
+    return ids
+
+
 def _dspace_uuids_of(item: dict) -> list:
     """All DSpace UUIDs (idSource "DSpace") of a Pure record, lower case."""
     uuids = []
@@ -558,50 +681,46 @@ def build_pure_index(pure_items: list) -> dict:
 
 def find_pure_record(dspace_row: dict, pure_index: dict):
     """
-    Match a DSpace row to a Pure record by identifiers only (no titles), in
-    the same order and with the same rules as match_records.py:
+    Match a DSpace row to a Pure record by identifiers, in this order:
 
-      0. DSpace UUID (case-insensitive)
-      1. Publisher DOI(s) -- every non-10.13025 DOI in dc.identifier.doi
+      0. DSpace UUID (case-insensitive). A Pure record that carries a DSpace
+         UUID is matched ONLY through it.
+      Pure records WITHOUT a DSpace UUID:
+      1. Handle(s) -- the 'handle' column, then dc.identifier.uri
       2. Repository DOI(s) -- every 10.13025 DOI in dc.identifier.uri or dc.identifier.doi
-      3. Handle(s) -- the 'handle' column, then dc.identifier.uri
-    Steps 1-3 only see Pure records without a DSpace UUID.
+      3. Publisher DOI(s) -- every non-10.13025 DOI in dc.identifier.doi, and
+         ONLY together with an identical title: title + subtitle on both sides,
+         case and punctuation ignored, numbers kept (full_title_key, as in
+         match_records.py).
 
     The first step that finds anything decides. If it finds two or more
     DIFFERENT Pure records, the match is ambiguous: no record is returned.
 
-    Returns (pure_record | None, match_type | None, candidates list).
+    Returns (pure_record | None, match_type | None, candidates list):
+      - match:      (record, match_type, [record])
+      - ambiguous:  (None, "Ambiguous (<step>)", [candidates])
+      - no match:   (None, None, []) -- or (None, <reason>, []) when a publisher
+                    DOI matched but the title did not.
     """
-    def decide(found, match_type):
-        unique = []
+    def unique(found):
+        result = []
         for item in found:
-            if all(item is not u for u in unique):
-                unique.append(item)
-        if len(unique) == 1:
-            return unique[0], match_type, unique
-        return None, f"Ambiguous ({match_type})", unique
+            if all(item is not u for u in result):
+                result.append(item)
+        return result
+
+    def decide(found, match_type):
+        found = unique(found)
+        if len(found) == 1:
+            return found[0], match_type, found
+        return None, f"Ambiguous ({match_type})", found
 
     # 0. DSpace UUID
     dspace_uuid = (dspace_row.get("uuid") or "").strip().lower()
     if dspace_uuid and pure_index["by_dspace_uuid"].get(dspace_uuid):
         return decide(pure_index["by_dspace_uuid"][dspace_uuid], "DSpace UUID")
 
-    field_dois = parse_doi_field(dspace_row.get("dc.identifier.doi", ""))
-
-    # 1. Publisher DOI(s)
-    found = [item for doi in field_dois if "10.13025" not in doi
-             for item in pure_index["by_doi"].get(doi, [])]
-    if found:
-        return decide(found, "Publisher DOI")
-
-    # 2. Repository DOI(s)
-    repo_dois = [d for d in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")) if "10.13025" in d]
-    repo_dois += [d for d in field_dois if "10.13025" in d and d not in repo_dois]
-    found = [item for doi in repo_dois for item in pure_index["by_repo_doi"].get(doi, [])]
-    if found:
-        return decide(found, "Repository DOI")
-
-    # 3. Handle(s) -- the 'handle' column first, then dc.identifier.uri
+    # 1. Handle(s) -- the 'handle' column first, then dc.identifier.uri
     handles = []
     handle_col = (dspace_row.get("handle") or "").strip()
     if handle_col:
@@ -613,7 +732,109 @@ def find_pure_record(dspace_row: dict, pure_index: dict):
     if found:
         return decide(found, "Handle")
 
+    field_dois = parse_doi_field(dspace_row.get("dc.identifier.doi", ""))
+
+    # 2. Repository DOI(s)
+    repo_dois = [d for d in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")) if "10.13025" in d]
+    repo_dois += [d for d in field_dois if "10.13025" in d and d not in repo_dois]
+    found = [item for doi in repo_dois for item in pure_index["by_repo_doi"].get(doi, [])]
+    if found:
+        return decide(found, "Repository DOI")
+
+    # 3. Publisher DOI(s) + identical title
+    found = unique([item for doi in field_dois if "10.13025" not in doi
+                    for item in pure_index["by_doi"].get(doi, [])])
+    if found:
+        row_title = dspace_full_title_key(dspace_row)
+        same_title = [item for item in found if row_title and pure_full_title_key(item) == row_title]
+        # A record carrying a repository Handle / DOI, none of which is this
+        # row's, belongs to another DSpace item (e.g. a separately deposited
+        # item with the same title) -- not this row's record.
+        row_repo_ids = set(handles) | set(repo_dois)
+        other_item = [item for item in same_title
+                      if _pure_repository_ids(item) and not (_pure_repository_ids(item) & row_repo_ids)]
+        same_title = [item for item in same_title if all(item is not o for o in other_item)]
+        if same_title:
+            return decide(same_title, "Publisher DOI + title")
+        return None, (f"publisher DOI matches {len(found)} Pure record(s) "
+                      f"({'; '.join(i.get('uuid', '') for i in found)}) but the title differs"), []
+
     return None, None, []
+
+
+class DSpaceClient:
+    """
+    HTTP access to DSpace for PDF downloads, separate from the Pure session
+    (so the Pure API key is never sent to DSpace). Optionally logged in as a
+    DSpace user -- the same login sequence as the DSpace export tool (core.py):
+      1. POST {api_root}/csrf                -> DSPACE-XSRF-TOKEN (header or cookie)
+      2. POST {api_root}/authn/login         (user, password) with X-XSRF-TOKEN
+                                             -> Authorization: Bearer ... (header or cookie)
+      3. GET  {api_root}/authn/status        -> must say authenticated
+    A download that returns HTTP 401 while logged in triggers one re-login and
+    retry (the token may have expired).
+    """
+
+    def __init__(self, api_root: str | None = None, username: str | None = None,
+                 password: str | None = None, timeout: float = 120):
+        self.api_root = (api_root or "").rstrip("/") or None
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.logged_in = False
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = "add-pdfs-to-pure"
+
+    def login(self) -> None:
+        if not self.api_root:
+            raise RuntimeError("DSpace API root unknown — set --dspace-api-root or DSPACE_API_ROOT")
+        r = self.session.post(f"{self.api_root}/csrf", headers={"Accept": "application/json"}, timeout=self.timeout)
+        if r.status_code not in (200, 204, 403):
+            r.raise_for_status()
+        token = r.headers.get("DSPACE-XSRF-TOKEN") or self.session.cookies.get("DSPACE-XSRF-COOKIE")
+        if not token:
+            raise RuntimeError("No CSRF token returned by DSpace during login")
+        self.session.headers["X-XSRF-TOKEN"] = token
+        r2 = self.session.post(
+            f"{self.api_root}/authn/login",
+            data={"user": self.username, "password": self.password},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            timeout=self.timeout,
+        )
+        r2.raise_for_status()
+        jwt = r2.headers.get("Authorization") or self.session.cookies.get("Authorization-cookie")
+        if not jwt:
+            raise RuntimeError("No Authorization token returned by DSpace during login")
+        self.session.headers["Authorization"] = jwt
+        r3 = self.session.get(f"{self.api_root}/authn/status", headers={"Accept": "application/json"}, timeout=self.timeout)
+        r3.raise_for_status()
+        if not r3.json().get("authenticated", False):
+            raise RuntimeError("DSpace did not confirm the login")
+        self.logged_in = True
+
+    def _request(self, method: str, url: str, **kwargs):
+        kwargs.setdefault("timeout", self.timeout)
+        resp = self.session.request(method, url, **kwargs)
+        if resp.status_code == 401 and self.logged_in:
+            print("    🔑 DSpace returned 401 — logging in again and retrying")
+            self.login()
+            resp = self.session.request(method, url, **kwargs)
+        return resp
+
+    def get(self, url: str, **kwargs):
+        return self._request("GET", url, **kwargs)
+
+    def head(self, url: str, **kwargs):
+        return self._request("HEAD", url, **kwargs)
+
+
+def dspace_api_root_from_links(urls) -> str | None:
+    """The DSpace REST API root (https://host/server/api) taken from a PDF link."""
+    for url in urls:
+        match = re.match(r"^(https?://[^/]+/server/api)/", url or "")
+        if match:
+            return match.group(1)
+    return None
 
 
 def fetch_pure_record(uuid: str, base_url: str, session) -> tuple:
@@ -642,7 +863,9 @@ def upload_pdf_to_pure(
     save_locally: bool,
     pdf_save_dir: str,
     session: requests.Session,
+    dspace: "DSpaceClient | None" = None,
 ) -> dict | None:
+    """Download the PDF from DSpace (with the DSpace client when given) and upload it to Pure (session)."""
     try:
         os.makedirs(safe_path(pdf_save_dir), exist_ok=True)
     except OSError as exc:
@@ -654,7 +877,7 @@ def upload_pdf_to_pure(
     # Always download to disk first to ensure the complete file
     if not os.path.exists(local_path):
         try:
-            src = session.get(full_pdf_url, timeout=120, allow_redirects=True)
+            src = (dspace.get if dspace else session.get)(full_pdf_url, timeout=120, allow_redirects=True)
             if src.status_code != 200:
                 print(f"    ❌ PDF download failed (HTTP {src.status_code}): {full_pdf_url}")
                 return None
@@ -662,9 +885,9 @@ def upload_pdf_to_pure(
             if "text/html" in content_type:
                 print(f"    ❌ DSpace returned HTML instead of PDF: {full_pdf_url}")
                 return None
-            if not is_valid_pdf(src.content):
-                print(f"    ❌ Content is not a valid PDF or is under 1kb "
-                      f"(first bytes: {src.content[:8]!r}, size: {len(src.content)})")
+            problem = pdf_problem(src.content)
+            if problem:
+                print(f"    ❌ Content is not a valid PDF: {problem}")
                 return None
             try:
                 with open(safe_path(local_path), "wb") as fh:
@@ -986,6 +1209,15 @@ def main():
     parser.add_argument("--skip-existing",    action="store_true", default=True,
                         help="Skip files already in Pure with same name and size (default).")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
+    parser.add_argument("--username", default=os.getenv("DSPACE_USERNAME"),
+                        help="DSpace user (EPerson) to log in as, so embargoed / restricted files can be "
+                             "downloaded (or set DSPACE_USERNAME). Without it, files are downloaded anonymously.")
+    parser.add_argument("--password", default=os.getenv("DSPACE_PASSWORD"),
+                        help="Password for --username (or set DSPACE_PASSWORD).")
+    parser.add_argument("--dspace-api-root", default=os.getenv("DSPACE_API_ROOT"),
+                        help="DSpace REST API root used for the login, e.g. "
+                             "https://researchrepository.universityofgalway.ie/server/api (or set DSPACE_API_ROOT). "
+                             "Default: derived from the PDF links.")
     parser.add_argument("--refresh-from-pure", action="store_true", default=False,
                         help="Re-read each matched record from Pure (GET) just before checking / updating it, "
                              "instead of using the --pure-json export. Off by default (one extra API call per "
@@ -1078,6 +1310,7 @@ def main():
         print(f"  Save PDFs locally : {args.save_locally}")
     print(f"  Skip existing EVs : {args.skip_existing}")
     print(f"  Refresh from Pure : {args.refresh_from_pure}")
+    print(f"  DSpace login      : {'as ' + args.username if args.username else 'no (anonymous downloads)'}")
     print(f"  Dry run           : {args.dry_run}")
     print(f"  Log dir           : {args.log_dir}")
     print(f"{'='*70}\n")
@@ -1151,6 +1384,23 @@ def main():
     # ---- Session -----------------------------------------------------------
     session = requests.Session()
     session.headers.update({"api-key": api_key})
+
+    # ---- DSpace client (downloads) -------------------------------------------
+    if bool(args.username) != bool(args.password):
+        sys.exit("❌ Give both --username and --password (or DSPACE_USERNAME and DSPACE_PASSWORD) for the DSpace login.")
+    dspace_root = args.dspace_api_root or dspace_api_root_from_links(
+        link for r in rows_with_pdf for link in (r.get("pdf_links", "") or "").split(";")
+    )
+    dspace = DSpaceClient(api_root=dspace_root, username=args.username, password=args.password)
+    if args.username and args.source == "dspace" and not args.dry_run:
+        try:
+            dspace.login()
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            sys.exit(f"❌ DSpace login failed ({dspace_root}): {exc}")
+        print(f"🔑 Logged in to DSpace as {args.username} ({dspace_root})\n")
+    elif args.source == "dspace" and not args.dry_run:
+        print("ℹ️  Not logged in to DSpace — embargoed / restricted files will fail with HTTP 401 "
+              "(use --username / --password)\n")
 
     # ---- Process -----------------------------------------------------------
     results      = []
@@ -1235,10 +1485,10 @@ def main():
             skipped_rows.append(entry)
             continue
         if pure_record is None:
-            print(f"  ⚠️  No Pure record matched — skipping")
+            print(f"  ⚠️  No Pure record matched — skipping" + (f" ({match_type})" if match_type else ""))
             counters["no_match"] += 1
             entry["status"] = "no_match"
-            entry["detail"] = "No Pure record found for this DSpace row"
+            entry["detail"] = "No Pure record found for this DSpace row" + (f": {match_type}" if match_type else "")
             results.append(entry)
             skipped_rows.append(entry)
             continue
@@ -1308,10 +1558,10 @@ def main():
                             time.sleep(wait)
                         print(f"    💾 Pre-downloading for local save: {disk_file_name}")
                         try:
-                            presrc = session.get(full_pdf_url, timeout=120, allow_redirects=True)
+                            presrc = dspace.get(full_pdf_url, timeout=120, allow_redirects=True)
                             if presrc.status_code == 200 and "text/html" not in presrc.headers.get("Content-Type", ""):
                                 if not is_valid_pdf(presrc.content):
-                                    print(f"    ❌ Pre-download is not a valid PDF or under 1kb — skipping save")
+                                    print(f"    ❌ Pre-download is not a valid PDF ({pdf_problem(presrc.content)}) — skipping save")
                                 else:
                                     try:
                                         with open(safe_path(local_path), "wb") as fh:
@@ -1364,7 +1614,7 @@ def main():
                             known_size = os.path.getsize(lp)
                         else:
                             try:
-                                head = session.head(full_pdf_url, timeout=10)
+                                head = dspace.head(full_pdf_url, timeout=10)
                                 cl = head.headers.get("Content-Length")
                                 known_size = int(cl) if cl else None
                             except Exception:
@@ -1516,6 +1766,7 @@ def main():
                     save_locally=args.save_locally,
                     pdf_save_dir=args.pdf_dir,
                     session=session,
+                    dspace=dspace,
                 )
                 last_dspace_request = time.time()
 

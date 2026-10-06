@@ -2,7 +2,7 @@
 
 Downloads PDFs from a DSpace repository, uploads them to Pure's file-upload endpoint, and immediately attaches them to the matching Pure research output as a `FileElectronicVersion`. It can also detect and resolve duplicate `FileElectronicVersion`s already present on a record. Only `electronicVersions` is changed; the rest of the record is sent back as it is in the Pure export (see [Keeping records current](#keeping-records-current)).
 
-Record matching follows the same rules as `match_records.py` — see [Record matching](#record-matching).
+Records are matched by DSpace UUID, Handle, repository DOI, or publisher DOI with an identical title — see [Record matching](#record-matching).
 
 ---
 
@@ -67,6 +67,9 @@ PURE_ROOT_API_KEY=your_production_key_here
 | `--save-locally` | `False` | Only applicable when `--source dspace`. Keep downloaded PDFs on disk after upload instead of deleting them. Each file is written to `--pdf-dir` before being uploaded. If a file with the same name already exists locally it is reused rather than re-downloaded. |
 | `--log-dir` | `./pdf_upload_logs` | Directory where all log files are written. |
 | `--skip-existing` / `--no-skip-existing` | `--skip-existing` | Skip individual files that already exist in Pure as a `FileElectronicVersion` with the **same filename and size**. Filename comparison is performed after Pure-style normalization (non-alphanumeric characters other than hyphens, underscores, dots, and spaces are replaced with underscores), with HTML-entity artifacts (e.g. an accented character rendered as `&#769;`) decoded first. A file already uploaded by an older version of this script under its un-decoded, Pure-mangled name (e.g. `Me_769_liacin.pdf` for what should be `Méliacin.pdf`) is still recognised as the same file via a fallback normalization, so it isn't uploaded again as a duplicate. Applied per file when a record has multiple PDFs. If filename matches but size differs or cannot be determined, the file is uploaded and appended alongside the existing one. |
+| `--username` | `DSPACE_USERNAME` | DSpace user (EPerson) to log in as, so **embargoed and restricted files** can be downloaded. Without a login, files are downloaded anonymously and embargoed / restricted ones fail with HTTP 401. Give it together with `--password`. |
+| `--password` | `DSPACE_PASSWORD` | Password for `--username`. |
+| `--dspace-api-root` | `DSPACE_API_ROOT`, else derived from the PDF links | DSpace REST API root used for the login, e.g. `https://researchrepository.universityofgalway.ie/server/api`. |
 | `--refresh-from-pure` | off | Re-read each matched record from Pure (`GET research-outputs/{uuid}`) just before checking and updating it, instead of using the `--pure-json` export. Costs one extra API call per record. If the record can't be read, the row is skipped with status `refresh_failed` (it does not fall back to the export). Not used with `--dry-run`. See [Keeping records current](#keeping-records-current). |
 | `--dry-run` | `False` | Match records and report what would be done without making any API calls. |
 
@@ -137,20 +140,31 @@ Additionally, all Publications rows **without** a `pdf_handle_paths` value are m
 
 ---
 
+## DSpace login and downloads
+
+PDFs are downloaded from DSpace through their own HTTP session — the Pure API key is never sent to DSpace. With `--username` / `--password` the script logs in at startup, using the same sequence as the DSpace export tool: `POST {api_root}/csrf` (CSRF token), `POST {api_root}/authn/login` (user + password → `Authorization: Bearer …`), `GET {api_root}/authn/status` (must confirm `authenticated`). If the login fails, the script stops before processing anything. If a download returns HTTP 401 during the run (expired token), the script logs in again once and retries. No login is done with `--dry-run` or `--source local`.
+
+A downloaded file is accepted as a PDF when it is larger than 1 KB and has a `%PDF` header **within its first 1 KB** (PDF readers accept a header after e.g. a leading newline). Otherwise the log says why: an empty file (0 bytes — to be fixed in DSpace), a file under 1 KB, or no `%PDF` header.
+
 ## Record matching
 
-Identifier-only, with the same rules as `match_records.py`. Titles are never used — a PDF is only attached when an identifier links the DSpace item to the Pure record.
+Identifiers decide, in this order of priority. A publisher DOI only counts together with an identical title.
 
 0. **DSpace UUID** (case-insensitive). A Pure record that carries the row's DSpace UUID is its record.
-1. **Publisher DOI(s)** — every DOI in `dc.identifier.doi` that is not a repository DOI.
-2. **Repository DOI(s)** — every `10.13025` DOI, from `dc.identifier.uri` or `dc.identifier.doi`.
-3. **Handle(s)** — the `handle` column, then the Handles in `dc.identifier.uri`.
 
-**A Pure record that already carries a DSpace UUID is matched only through that UUID** — it is never a candidate in steps 1–3, whatever its DOI or Handle. This stops a PDF from being attached to another DSpace item's record.
+   **A Pure record that already carries a DSpace UUID is matched only through that UUID** — it is never a candidate in steps 1–3, whatever its Handle, DOI or title. This stops a PDF from being attached to another DSpace item's record.
+
+For Pure records **without** a DSpace UUID:
+
+1. **Handle(s)** — the `handle` column, then the Handles in `dc.identifier.uri`.
+2. **Repository DOI(s)** — every `10.13025` DOI, from `dc.identifier.uri` or `dc.identifier.doi`.
+3. **Publisher DOI(s) + identical title** — a Pure record carrying a repository Handle or repository DOI, none of which is this row's, belongs to another DSpace item and is not used here — every DOI in `dc.identifier.doi` that is not a repository DOI, and only if the title is identical: title + subtitle on both sides (DSpace: `dc.title` + `dc.title.subtitle`, else `dc.title.alternative`; Pure: `title` + `subTitle`), case and punctuation ignored, the title/subtitle split ignored, **numbers kept** — the same "identical title" comparison as `match_records.py` (`full_title_key`). So "Annual Review 2015" ≠ "Annual Review 2016", and "Erratum to: …" ≠ the original article. If the DOI is found but no title is identical, the row is not matched (status `no_match`, the reason and the DOI's records in `detail`). When several Pure records share the DOI, the title picks the right one.
 
 The first step that finds anything decides. If it finds **two or more different Pure records**, the match is **ambiguous**: the row is skipped (status `ambiguous_match`, candidates listed in `detail`) rather than one record being picked.
 
 DOIs and Handles are recognised in the same forms as in `match_records.py`: DOIs as bare `10.…`, `doi.org` / `dx.doi.org` URLs, `doi:` / `DOI:` / `DOI ` prefixes, with trailing full stops removed, case-insensitive; Handles with `hdl.handle.net`, `handle.net` or `www.handle.net` hosts, with or without a scheme, any case, ignoring trailing slashes.
+
+**Difference from `match_records.py`:** that script tries the publisher DOI first and does not require a title for it. Attaching a PDF is less forgiving than updating metadata, so here the repository identifiers (Handle, repository DOI) come first and a publisher DOI needs the identical title.
 
 ## Licence, access and version of files
 
@@ -207,7 +221,7 @@ All log files are written to `--log-dir` and timestamped with the run start time
 | `success` | All PDFs uploaded and Pure record updated. |
 | `partial_success` | At least one PDF uploaded successfully, but one or more failed. |
 | `metadata_updated` | File already existed with the same filename and size. Covers two (possibly combined) changes made via the same PUT: one or more metadata fields (license, access type, version type, visible on portal date, or embargo period) were missing or out of date and have been corrected, and/or duplicate `FileElectronicVersion`s were found on the record and collapsed down to one per group (see "Resolves duplicate FileElectronicVersions" in How it works). The `detail` field in `results_<timestamp>.json` distinguishes which of the two occurred. |
-| `no_match` | No Pure record could be matched to this DSpace row. |
+| `no_match` | No Pure record could be matched to this DSpace row. When a publisher DOI matched but the title did not, `detail` says so and lists the DOI's Pure records. |
 | `ambiguous_match` | Two or more different Pure records match this DSpace row in the same matching step — skipped; the candidates are listed in `detail`. |
 | `refresh_failed` | `--refresh-from-pure`: the matched record could not be re-read from Pure — skipped. |
 | `skipped_existing_fev` | All files for this row already exist in Pure with the same filename and size, and metadata is up to date. |

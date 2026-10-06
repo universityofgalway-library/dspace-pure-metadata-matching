@@ -44,14 +44,14 @@ DSPACE_UUID_PREFERENCE = "pure"  # "dspace" or "pure"
 # DSpace item types that are never uploaded to Pure (dc.type, lower case).
 EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
 
-# DSPACE_CSV = "./dspace_data/prod_samples/enriched_dspace_prod_items_2026-10-05_subset.csv"
-DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
+DSPACE_CSV = "./dspace_data/prod_samples/unmatched_contributor_records_2026-10-06.csv"
+# DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
 PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-06.json"
-PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-05_cleaned.json"
+PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-06.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-10-06.json"
 PUBLISHER_MAPPING_JSON = "./pure_entities/pure_prod_publishers_2026-10-06.json"
 JOURNAL_MAPPING_JSON = "./pure_entities/pure_prod_journals_2026-10-06.json"
-OUTPUT_DIR = f"./record_matching/prod_output_{TODAY}"
+OUTPUT_DIR = f"./record_matching/prod_output_sample_{TODAY}"
 MATCHED_DIR = os.path.join(OUTPUT_DIR, "matched")
 UNMATCHED_DIR = os.path.join(OUTPUT_DIR, "unmatched")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
@@ -258,6 +258,12 @@ _unmatched_publishers = []
 _unmatched_journals = []
 _dspace_uuid_mismatches = []
 _publisher_doi_conflicts = []
+# Pure records matched (and updated) by a DSpace row in THIS run: Pure UUID ->
+# info about that row. A later row is never allowed to update the same record
+# again -- the double match is reported instead (double_matches CSV).
+_claimed_pure_records = {}
+_double_matches = []
+DOUBLE_DEPOSIT_ERROR = "Skipped: double deposit (the Pure record belongs to another DSpace item of the same work)"
 
 # Lookups over the whole DSpace CSV (filled in main): DSpace items by UUID,
 # and which DSpace item each repository Handle / repository DOI belongs to.
@@ -2044,6 +2050,78 @@ def _pure_side_types(item):
     if linked_rows:
         return {dspace_output_type_key(r) for r in linked_rows}, linked_rows
     return {t for t in [pure_output_type_key(item)] if t}, linked_rows
+
+
+def pure_repository_ids(item):
+    """Normalised repository Handles and repository DOIs (10.13025) carried by a Pure record."""
+    ids = set()
+    for link in (item or {}).get("links") or []:
+        url = (link or {}).get("url", "") if isinstance(link, dict) else ""
+        if is_handle_url(url):
+            ids.add(normalize_handle(url))
+        elif "10.13025" in url:
+            ids.add(normalize_doi(url))
+    for ev in (item or {}).get("electronicVersions") or []:
+        doi = (ev or {}).get("doi") if isinstance(ev, dict) else None
+        if not doi:
+            continue
+        if is_handle_url(doi):
+            ids.add(normalize_handle(doi))
+        elif "10.13025" in doi:
+            ids.add(normalize_doi(doi))
+    return ids
+
+
+def dspace_repository_ids(row):
+    """Normalised repository Handles and repository DOIs of a DSpace item."""
+    ids = set(dspace_item_handles(row)) | set(dspace_item_repo_dois(row))
+    handle_col = (row.get("handle") or "").strip()
+    if handle_col:
+        ids.add(normalize_handle(handle_col))
+    return ids
+
+
+def carries_other_repository_ids(row, item):
+    """
+    True if the Pure record carries a repository Handle or repository DOI and
+    NONE of them is this DSpace item's -- it then belongs to another DSpace
+    item (e.g. an item with a near-identical title deposited separately), even
+    without a DSpace UUID, and is not matched to this row by title or
+    publisher DOI.
+    """
+    item_ids = pure_repository_ids(item)
+    return bool(item_ids) and not (item_ids & dspace_repository_ids(row))
+
+
+def repository_owner_of(row, item):
+    """
+    If the Pure record carries repository Handles / DOIs, none of which is
+    this row's, the DSpace item they belong to: (uuid, row-or-None, handle).
+    None if the record carries none, or carries this row's.
+    """
+    if not carries_other_repository_ids(row, item):
+        return None
+    for rid in sorted(pure_repository_ids(item)):
+        owner = _DSPACE_ITEMS["uuid_by_handle"].get(rid) or _DSPACE_ITEMS["uuid_by_repo_doi"].get(rid)
+        if owner:
+            return owner, _DSPACE_ITEMS["by_uuid"].get(owner), rid
+    return "", None, sorted(pure_repository_ids(item))[0]
+
+
+def dspace_rows_same_work(row_a, row_b):
+    """
+    True if two DSpace rows describe the same work (a double deposit): a
+    publisher DOI in common, or an identical full title from the same year.
+    """
+    dois_a = {d for d in parse_doi_field(row_a.get("dc.identifier.doi", ""))[0] if "10.13025" not in d}
+    dois_b = {d for d in parse_doi_field(row_b.get("dc.identifier.doi", ""))[0] if "10.13025" not in d}
+    if dois_a & dois_b:
+        return True
+    sub_a = (row_a.get("dc.title.subtitle") or row_a.get("dc.title.alternative") or "").strip()
+    sub_b = (row_b.get("dc.title.subtitle") or row_b.get("dc.title.alternative") or "").strip()
+    same_title = full_title_key(row_a.get("dc.title", ""), sub_a) == full_title_key(row_b.get("dc.title", ""), sub_b)
+    year_a, year_b = dspace_publication_year(row_a), dspace_publication_year(row_b)
+    return same_title and year_a is not None and year_a == year_b
 
 
 # Titles of at most this many words (small words included) are "short":
@@ -4635,6 +4713,72 @@ def main():
                 "matchType": match_type
             })
 
+        # Double matches: a Pure record that belongs to ANOTHER DSpace item --
+        # matched (and updated) by another row earlier in this run, or carrying
+        # another item's repository Handle / DOI -- is not updated by this row
+        # (previously a later update silently replaced the earlier one). Every
+        # such case is reported (double_matches CSV). If the two DSpace items
+        # are the same work (double deposit), this row is skipped; otherwise
+        # they are different works and this row continues without that record
+        # (new record if nothing else matches).
+        if matched_records:
+            row_key = (row.get("uuid") or "").strip().lower()
+            # Owner of each candidate other than this row: a DSpace row that
+            # matched it earlier in this run, or the DSpace item whose
+            # repository Handle / DOI the record carries.
+            owners = {}
+            for r in matched_records:
+                claim = _claimed_pure_records.get(r.get("uuid"))
+                if claim and claim["dspace_uuid"].lower() != row_key:
+                    owners[id(r)] = claim
+                    continue
+                repo_owner = repository_owner_of(row, r)
+                if repo_owner:
+                    owner_uuid, owner_row, owner_id = repo_owner
+                    owners[id(r)] = {"dspace_uuid": owner_uuid, "handle": owner_id,
+                                     "match_type": "record carries its Handle / repository DOI",
+                                     "row": owner_row}
+            claimed = [r for r in matched_records if id(r) in owners]
+            if claimed:
+                free = [r for r in matched_records if all(r is not c for c in claimed)]
+                same_work_any = False
+                for record_taken in claimed:
+                    first = owners[id(record_taken)]
+                    same_work = bool(first["row"]) and dspace_rows_same_work(row, first["row"])
+                    same_work_any = same_work_any or same_work
+                    if free:
+                        action = "another matching record used"
+                    elif same_work:
+                        action = "skipped (double deposit)"
+                    else:
+                        action = "different work - new record"
+                    row_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+                    print(f"  ⚠️ Pure record {record_taken.get('uuid')} was already matched in this run by DSpace item "
+                          f"{first['dspace_uuid']} ({first['handle']}) — {'same work (double deposit)' if same_work else 'different work'}: {action}")
+                    _double_matches.append({
+                        "pure_uuid": record_taken.get("uuid", ""),
+                        "pure_title": (record_taken.get("title") or {}).get("value", ""),
+                        "first_dspace_uuid": first["dspace_uuid"],
+                        "first_handle": first["handle"],
+                        "first_match_type": first["match_type"],
+                        "dspace_uuid": row.get("uuid", ""),
+                        "handle": row_handles[0] if row_handles else None,
+                        "match_type": match_type,
+                        "same_work": "yes" if same_work else "no",
+                        "action": action,
+                    })
+                log_entry["doubleMatch"] = [r.get("uuid") for r in claimed]
+                if free:
+                    matched_records = free
+                elif same_work_any:
+                    log_entry["success"] = False
+                    log_entry["error"] = DOUBLE_DEPOSIT_ERROR
+                    log_entries.append(log_entry)
+                    continue
+                else:
+                    matched_records = []
+                    match_type = None
+
         # Resolve duplicate records
         resolved_from_duplicates = len(matched_records) > 1
         if len(matched_records) > 1:
@@ -4673,6 +4817,14 @@ def main():
         if matched_records:
             log_entry["matched"] = True
             record = matched_records[0]
+            if record.get("uuid") and record.get("uuid") not in _claimed_pure_records:
+                claim_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+                _claimed_pure_records[record.get("uuid")] = {
+                    "dspace_uuid": (row.get("uuid") or "").strip(),
+                    "handle": claim_handles[0] if claim_handles else None,
+                    "match_type": match_type,
+                    "row": row,
+                }
             log_entry["uuid"] = record.get("uuid", "")
             log_entry["pureType"] = record.get("type", {}).get("uri", "")
             log_entry["matchType"] = match_type
@@ -4797,6 +4949,17 @@ def main():
             writer.writerows(_unmatched_journals)
         print(f"✅ Unmatched journals saved to: {unmatched_journals_csv}")
 
+    # Double matches CSV (a Pure record matched by two or more DSpace rows in this run)
+    if _double_matches:
+        double_csv = os.path.join(OUTPUT_DIR, f"double_matches_{TODAY}.csv")
+        with open(double_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['pure_uuid', 'pure_title', 'first_dspace_uuid', 'first_handle',
+                                                   'first_match_type', 'dspace_uuid', 'handle', 'match_type',
+                                                   'same_work', 'action'])
+            writer.writeheader()
+            writer.writerows(_double_matches)
+        print(f"✅ Double matches saved to: {double_csv}")
+
     # Publisher DOI conflicts CSV (same publisher DOI on two different DSpace
     # items with different titles -- the DOI match was not used)
     if _publisher_doi_conflicts:
@@ -4828,7 +4991,8 @@ def main():
     not_publications_count = sum(1 for e in log_entries if e.get('error') == "Skipped: not in a Publications collection")
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
     dataset_count = sum(1 for e in log_entries if e.get('error') == "Skipped: dataset (not uploaded to Pure)")
-    skipped_count = not_publications_count + no_contributors_count + dataset_count
+    double_deposit_count = sum(1 for e in log_entries if e.get('error') == DOUBLE_DEPOSIT_ERROR)
+    skipped_count = not_publications_count + no_contributors_count + dataset_count + double_deposit_count
 
     matched_count = sum(1 for e in log_entries if e['matched'])
     unmatched_new_record_count = sum(1 for e in log_entries if not e['matched'] and e['success'])
@@ -4843,6 +5007,7 @@ def main():
     print(f"     ↳ Not in Publications collection: {not_publications_count}")
     print(f"     ↳ Dataset (not uploaded to Pure): {dataset_count}")
     print(f"     ↳ No contributors in any field: {no_contributors_count}")
+    print(f"     ↳ Double deposit (Pure record belongs to another DSpace item of the same work): {double_deposit_count}")
     print(f"   Matched to existing Pure record: {matched_count}")
     print(f"   Unmatched (new records created): {unmatched_new_record_count}")
     print(f"   Successfully processed: {success_count}")
@@ -4855,6 +5020,7 @@ def main():
     print(f"   Unmatched journals: {len(_unmatched_journals)}")
     print(f"   DSpace UUID mismatches: {len(_dspace_uuid_mismatches)}")
     print(f"   Publisher DOI conflicts: {len(_publisher_doi_conflicts)}")
+    print(f"   Double matches (Pure record belonging to another DSpace item): {len(_double_matches)}")
     print(f"   Logs saved to: {LOG_DIR}")
 
     # Calculate elapsed time
