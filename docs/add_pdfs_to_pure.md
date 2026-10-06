@@ -1,6 +1,8 @@
 # add_pdfs_to_pure.py
 
-Downloads PDFs from a DSpace repository, uploads them to Pure's file-upload endpoint, and immediately attaches them to the matching Pure research output as a `FileElectronicVersion`. It can also detect and resolve duplicate `FileElectronicVersion`s already present on a record. No fields outside `electronicVersions` are modified.
+Downloads PDFs from a DSpace repository, uploads them to Pure's file-upload endpoint, and immediately attaches them to the matching Pure research output as a `FileElectronicVersion`. It can also detect and resolve duplicate `FileElectronicVersion`s already present on a record. Only `electronicVersions` is changed; the rest of the record is sent back as it is in the Pure export (see [Keeping records current](#keeping-records-current)).
+
+Record matching follows the same rules as `match_records.py` — see [Record matching](#record-matching).
 
 ---
 
@@ -33,21 +35,21 @@ PURE_ROOT_API_KEY=your_production_key_here
 
 | Argument | Description |
 |---|---|
-| `--dspace-csv` | Path to the enriched DSpace CSV export. Must contain the columns listed below. |
-| `--pure-json` | Path to a Pure research-outputs JSON export (list of record dicts). |
+| `--dspace-csv` | Path to the enriched DSpace CSV export. Must contain the columns listed below. Read as UTF-8 with or without a BOM. |
+| `--pure-json` | Path to a Pure research-outputs JSON export (list of record dicts). It is the user's responsibility to keep this export up to date — or use `--refresh-from-pure`. |
 
 **Required DSpace CSV columns:**
 
 | Column | Description |
 |---|---|
-| `collection_names` | Collection membership string. Only rows containing `Publications` are processed. |
+| `collection_names` | Collection membership string. Only rows whose value is exactly `Publications` (case-insensitive) are processed, as in `match_records.py`. |
+| `dc.type` | Item type. Rows of a type that is not uploaded to Pure (`dataset`, `doctoral thesis`, `master thesis`; `EXCLUDED_DSPACE_TYPES`) are skipped. |
 | `pdf_handle_paths` | Semicolon-separated handle-based paths to PDFs, e.g. `/10379/4728/1/file.pdf` or `/10379/4728/1/cover.pdf ; /10379/4728/2/fulltext.pdf`. Rows without this value are skipped. All paths are processed. |
 | `pdf_links` | Semicolon-separated direct download URLs for the PDFs, e.g. `https://…/bitstreams/uuid/content`. Positionally aligned with `pdf_handle_paths`. Used as the actual download source. |
-| `handle` | The item handle, e.g. `http://hdl.handle.net/10379/4728`. Used as the primary handle source for matching and for the file references output. |
+| `handle` | The item handle, e.g. `http://hdl.handle.net/10379/4728`. Used for Handle matching (before `dc.identifier.uri`) and for the file references output. |
 | `uuid` | DSpace item UUID. Used as the first matching strategy. |
-| `dc.identifier.uri` | Semicolon-separated URIs (handles and DOIs). Used as fallback for matching when `handle` is empty. |
-| `dc.identifier.doi` | Publisher DOI. Used as the second matching strategy. |
-| `dc.rights` | Rights/license string (e.g. `CC BY`). Mapped to a Pure license URI. |
+| `dc.identifier.uri` | Semicolon-separated URIs (handles and DOIs). Its Handles and repository DOIs (`10.13025`) are used for matching. |
+| `dc.identifier.doi` | DOI(s), possibly several (`a ; b`). `10.13025` DOIs are repository DOIs; every other DOI is a publisher DOI. |
 | `dc.date.embargo` | Embargo end date. Determines access type (`open` or `embargoed`). |
 | `dc.description.embargo` | Alternative embargo end date field. |
 | `dc.title` | Record title. Used for logging only. |
@@ -58,12 +60,14 @@ PURE_ROOT_API_KEY=your_production_key_here
 
 | Flag | Default | Description |
 |---|---|---|
-| `--test` / `--no-test` | `--test` | Use UAT (`--test`) or Production (`--no-test`) API. |
+| `--test` | off | Use the UAT environment (`PURE_ROOT_API_KEY_TEST`). |
+| `--temp` | off | Use the TEMP environment (`PURE_ROOT_API_KEY`). Without `--test` or `--temp`, **Production** is used. |
 | `--source` | `dspace` | Where to get PDFs from: `dspace` (download from DSpace) or `local` (read from disk). |
 | `--pdf-dir` | `./dspace_pdfs` | If `--source dspace`: directory used to stage PDFs temporarily during upload (or permanently when `--save-locally` is set). If `--source local`: directory to read PDFs from. Must exist when using `--source local`. |
 | `--save-locally` | `False` | Only applicable when `--source dspace`. Keep downloaded PDFs on disk after upload instead of deleting them. Each file is written to `--pdf-dir` before being uploaded. If a file with the same name already exists locally it is reused rather than re-downloaded. |
 | `--log-dir` | `./pdf_upload_logs` | Directory where all log files are written. |
 | `--skip-existing` / `--no-skip-existing` | `--skip-existing` | Skip individual files that already exist in Pure as a `FileElectronicVersion` with the **same filename and size**. Filename comparison is performed after Pure-style normalization (non-alphanumeric characters other than hyphens, underscores, dots, and spaces are replaced with underscores), with HTML-entity artifacts (e.g. an accented character rendered as `&#769;`) decoded first. A file already uploaded by an older version of this script under its un-decoded, Pure-mangled name (e.g. `Me_769_liacin.pdf` for what should be `Méliacin.pdf`) is still recognised as the same file via a fallback normalization, so it isn't uploaded again as a duplicate. Applied per file when a record has multiple PDFs. If filename matches but size differs or cannot be determined, the file is uploaded and appended alongside the existing one. |
+| `--refresh-from-pure` | off | Re-read each matched record from Pure (`GET research-outputs/{uuid}`) just before checking and updating it, instead of using the `--pure-json` export. Costs one extra API call per record. If the record can't be read, the row is skipped with status `refresh_failed` (it does not fall back to the export). Not used with `--dry-run`. See [Keeping records current](#keeping-records-current). |
 | `--dry-run` | `False` | Match records and report what would be done without making any API calls. |
 
 ---
@@ -82,7 +86,6 @@ python add_pdfs_to_pure.py \
 python add_pdfs_to_pure.py \
   --dspace-csv ./dspace_data/export.csv \
   --pure-json  ./pure_research_outputs/outputs.json \
-  --no-test \
   --save-locally \
   --pdf-dir ./downloaded_pdfs
 ```
@@ -110,10 +113,10 @@ python add_pdfs_to_pure.py \
 
 For each DSpace row that has a `pdf_handle_paths` value, the script:
 
-1. **Filters** to rows in a Publications collection (i.e. `collection_names` contains `Publications`) with a `pdf_handle_paths` value.
-2. **Matches** the row to a Pure record using (in priority order): DSpace UUID → Publisher DOI → Repository DOI → Handle. The `handle` column is checked first for handle matching; `dc.identifier.uri` is used as a fallback. Lookup is O(1) via a pre-built index.
+1. **Filters** to rows whose `collection_names` is exactly `Publications`, whose `dc.type` is uploaded to Pure (not `dataset`, `doctoral thesis` or `master thesis`), and that have a `pdf_handle_paths` value.
+2. **Matches** the row to a Pure record — see [Record matching](#record-matching). Ambiguous matches are skipped. With `--refresh-from-pure`, the matched record is then re-read from Pure.
 3. **Parses all PDF paths** from `pdf_handle_paths` (semicolon-separated). Each path is processed independently through the steps below.
-4. **Checks for duplicates** (if `--skip-existing`): skips a file only if a `FileElectronicVersion` with the **same filename and size** already exists in Pure. Filename comparison is performed after Pure-style normalization so that characters substituted by Pure on ingest (e.g. commas) do not prevent a match, and after decoding any literal HTML-entity artifacts in the DSpace-side filename. If the direct normalized comparison doesn't find a match, a looser fallback (diacritic stripping + collapsing any Pure-mangled `_NNN_` remnant) is tried, so a file already uploaded under its old, un-decoded name is still recognised rather than re-uploaded as a duplicate. Size and name are read from the nested `file` object inside the `FileElectronicVersion` block (`file.fileName` and `file.size`). When a match is found, the script also checks whether the existing FileEV's metadata is up to date — specifically `licenseType`, `accessType`, `versionType`, `visibleOnPortalDate`, and `embargoPeriod`. If any field is missing or differs from the DSpace-derived values, the Pure record is PUTted with the corrected metadata without re-uploading the file. If size differs or is unknown, the file is uploaded and appended alongside the existing version.
+4. **Checks for duplicates** (if `--skip-existing`): skips a file only if a `FileElectronicVersion` with the **same filename and size** already exists in Pure. Filename comparison is performed after Pure-style normalization so that characters substituted by Pure on ingest (e.g. commas) do not prevent a match, and after decoding any literal HTML-entity artifacts in the DSpace-side filename. The raw, undecoded form of the name (as an older version of this script sent it, e.g. `Me_769_liacin.pdf` for `Méliacin.pdf`) is also accepted after the same normalization, so a file already uploaded under its old name is still recognised rather than re-uploaded as a duplicate. Size and name are read from the nested `file` object inside the `FileElectronicVersion` block (`file.fileName` and `file.size`). When a match is found, the script also checks whether the existing FileEV's metadata is up to date — specifically `licenseType`, `accessType`, `versionType`, `visibleOnPortalDate`, and `embargoPeriod`. If any field is missing or differs from the DSpace-derived values, the Pure record is PUTted with the corrected metadata without re-uploading the file. If size differs or is unknown, the file is uploaded and appended alongside the existing version.
 5. **Resolves duplicate `FileElectronicVersion`s already on the record** (if `--skip-existing`, whenever step 4 finds an existing match): before PUTting, the script scans the *entire* record's `electronicVersions` for any other groups of `FileElectronicVersion`s that share the same `fileName` and `size` — not just the file currently being processed — and collapses each group down to a single entry. This piggybacks on the same PUT triggered by step 4, so no extra API calls are made; a record's duplicates are only cleaned up when at least one of its files is actually processed in the current run (a record with no matching DSpace row in this run's CSV is left untouched, even if it has duplicates).
 
    For each duplicate group, one entry is kept and the rest are removed, chosen in this priority order:
@@ -134,6 +137,31 @@ Additionally, all Publications rows **without** a `pdf_handle_paths` value are m
 
 ---
 
+## Record matching
+
+Identifier-only, with the same rules as `match_records.py`. Titles are never used — a PDF is only attached when an identifier links the DSpace item to the Pure record.
+
+0. **DSpace UUID** (case-insensitive). A Pure record that carries the row's DSpace UUID is its record.
+1. **Publisher DOI(s)** — every DOI in `dc.identifier.doi` that is not a repository DOI.
+2. **Repository DOI(s)** — every `10.13025` DOI, from `dc.identifier.uri` or `dc.identifier.doi`.
+3. **Handle(s)** — the `handle` column, then the Handles in `dc.identifier.uri`.
+
+**A Pure record that already carries a DSpace UUID is matched only through that UUID** — it is never a candidate in steps 1–3, whatever its DOI or Handle. This stops a PDF from being attached to another DSpace item's record.
+
+The first step that finds anything decides. If it finds **two or more different Pure records**, the match is **ambiguous**: the row is skipped (status `ambiguous_match`, candidates listed in `detail`) rather than one record being picked.
+
+DOIs and Handles are recognised in the same forms as in `match_records.py`: DOIs as bare `10.…`, `doi.org` / `dx.doi.org` URLs, `doi:` / `DOI:` / `DOI ` prefixes, with trailing full stops removed, case-insensitive; Handles with `hdl.handle.net`, `handle.net` or `www.handle.net` hosts, with or without a scheme, any case, ignoring trailing slashes.
+
+## Licence, access and version of files
+
+Every `FileElectronicVersion` on a matched record carries the repository licence **CC BY** — the same rule as `match_records.py` (`dc.rights` is not used). This applies to the new file, to an existing file whose metadata is checked, and to every other file on the record whenever the record is PUT. Access is *Open*, or *Embargoed* with the embargo period while a DSpace embargo is active; the version type is *Author accepted manuscript* when missing.
+
+## Keeping records current
+
+By default, records are read from the `--pure-json` export, and the PUT sends the whole record as it is in that export (system fields removed) with the updated `electronicVersions`. Anything changed in Pure after the export was made — for example by `match_records.py` — would be overwritten, so **it is the user's responsibility to use an up-to-date export**.
+
+With `--refresh-from-pure`, each matched record is read from Pure just before it is checked and updated, so the PUT is based on Pure's current version.
+
 ## Logging
 
 All log files are written to `--log-dir` and timestamped with the run start time.
@@ -144,7 +172,7 @@ All log files are written to `--log-dir` and timestamped with the run start time
 | `results_<timestamp>.json` | One entry per processed DSpace row with all fields, status, and error detail. |
 | `success_<timestamp>.csv` | Rows where the PDF was uploaded and the PUT succeeded. |
 | `failed_<timestamp>.csv` | Rows where the PDF upload or PUT failed. |
-| `skipped_<timestamp>.csv` | Rows with no Pure match, or already having a matching `FileElectronicVersion`. |
+| `skipped_<timestamp>.csv` | Rows with no Pure match, an ambiguous match, or already having a matching `FileElectronicVersion`. |
 | `pdf_matched_records_<timestamp>.csv` | All DSpace rows matched to a Pure record that had PDFs, written continuously as processing proceeds. Each row is flushed to disk immediately, so the file is complete even if the run is interrupted. |
 | `no_pdf_matched_records_<timestamp>.csv` | All DSpace rows in the Publications collection that had no `pdf_handle_paths` value but were successfully matched to a Pure record. Written before PDF processing begins. |
 
@@ -180,6 +208,8 @@ All log files are written to `--log-dir` and timestamped with the run start time
 | `partial_success` | At least one PDF uploaded successfully, but one or more failed. |
 | `metadata_updated` | File already existed with the same filename and size. Covers two (possibly combined) changes made via the same PUT: one or more metadata fields (license, access type, version type, visible on portal date, or embargo period) were missing or out of date and have been corrected, and/or duplicate `FileElectronicVersion`s were found on the record and collapsed down to one per group (see "Resolves duplicate FileElectronicVersions" in How it works). The `detail` field in `results_<timestamp>.json` distinguishes which of the two occurred. |
 | `no_match` | No Pure record could be matched to this DSpace row. |
+| `ambiguous_match` | Two or more different Pure records match this DSpace row in the same matching step — skipped; the candidates are listed in `detail`. |
+| `refresh_failed` | `--refresh-from-pure`: the matched record could not be re-read from Pure — skipped. |
 | `skipped_existing_fev` | All files for this row already exist in Pure with the same filename and size, and metadata is up to date. |
 | `pdf_upload_failed` | All PDF uploads failed (not found locally, or download/upload error). |
 | `put_failed` | File uploaded but the subsequent PUT to Pure failed. |
@@ -189,11 +219,11 @@ All log files are written to `--log-dir` and timestamped with the run start time
 
 ## Notes
 
-- The script only modifies `electronicVersions`. All other fields on the Pure record are preserved as-is.
+- The script only modifies `electronicVersions`. All other fields are sent back as they are in the Pure export (or in Pure itself, with `--refresh-from-pure`) — see [Keeping records current](#keeping-records-current).
 - Re-runs are safe when `--skip-existing` is on — files with an identical filename and size already in Pure will be skipped on a per-file basis.
 - Duplicate `FileElectronicVersion` resolution (see step 5 in How it works) only runs when `--skip-existing` is on, and only for records where at least one file in the current run's DSpace CSV already matches an existing entry. It will not proactively clean up duplicates on records that have no corresponding row being processed in that run.
 - The run summary (printed at the end and in `run_<timestamp>.log`) includes a `Duplicate FileEVs removed` count, separate from `Only file metadata updated`.
 - If a PUT fails after a successful upload, the uploaded file will be orphaned in Pure and deleted automatically after 2 hours. The failed row is written to `failed_<timestamp>.csv` for manual follow-up.
-- The Pure JSON input does not need to be regenerated between runs; the script reads it once at startup.
+- The script reads the Pure JSON once at startup. Regenerate it before a run if records may have changed in Pure since it was made, or use `--refresh-from-pure`.
 - Filenames saved to disk and sent to Pure are always fully decoded: URL-decoded, then any literal HTML-entity artifacts (e.g. `&#769;`) are decoded and the result is Unicode-normalized (NFKC). The original encoded paths from `pdf_handle_paths` are preserved as-is in `dspace_file_id` in all log outputs. `--dry-run`'s "Would upload" preview uses this same fully-decoded name, so it accurately reflects what a real run would produce.
 - On Windows, characters illegal in filenames (`\ / : * ? " < > |`) are silently replaced with underscores in the on-disk copy only. The original filename is preserved in Pure and in all logs. A warning is printed when sanitization occurs.

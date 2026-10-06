@@ -28,6 +28,16 @@ Options:
     --dry-run               Match records and report what would be done, but do not upload/PUT
     --skip-existing /
     --no-skip-existing      Skip files already in Pure with same name and size (default: skip)
+    --refresh-from-pure     Re-read each matched record from Pure (GET) just before
+                            checking / updating it, instead of using the export.
+                            Off by default: records come from --pure-json, and keeping
+                            that export up to date is the user's responsibility.
+
+Record matching is identifier-only and follows match_records.py:
+    0. DSpace UUID -- a Pure record carrying the row's DSpace UUID is its record.
+    1-3. Only Pure records WITHOUT a DSpace UUID: publisher DOI, then repository
+       DOI (10.13025), then Handle. Titles are never used.
+    Ambiguous matches (2+ different Pure records) are skipped and reported.
 """
 
 
@@ -55,18 +65,25 @@ from urllib.parse import unquote
 TODAY  = date.today().isoformat()
 RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-DOI_REGEX    = re.compile(r'^(?:https?://)?(?:doi\.org/|doi:)?(10\.\S+)$', re.IGNORECASE)
-HANDLE_REGEX = re.compile(r'^(?:https?://hdl\.handle\.net/)?(10379/\S+)$', re.IGNORECASE)
+# DOI and Handle recognition -- identical to match_records.py.
+# DOIs: bare "10.xxx/..", doi.org or dx.doi.org URLs (http/https, and the
+# "https:/" typo), and "doi:", "DOI:", "DOI " or ":" prefixes.
+DOI_REGEX    = re.compile(r'^(?:https?:/{1,2})?(?:(?:dx\.)?doi\.org/|doi\s*:?\s*|:)?(10\.\S+)$', re.IGNORECASE)
+# Handles: hdl.handle.net, handle.net and www.handle.net hosts, with or without
+# an http(s):// scheme, in any case, ignoring trailing slashes.
+HANDLE_REGEX = re.compile(r'^(?:(?:https?://)?(?:www\.|hdl\.)?handle\.net/)?(10379/\S+?)/*$', re.IGNORECASE)
+# Separator between multiple values in one DSpace CSV cell (" ; "); at least one
+# side must be whitespace, so a DOI containing a bare ";" is never split.
+_MULTI_VALUE_SEPARATOR = re.compile(r"\s+;\s*|\s*;\s+")
 
-LICENSE_MAP = {
-    "CC BY-NC-ND":         "cc_by_nc_nd",
-    "CC BY":               "cc_by",
-    "CC BY-SA":            "cc_by_sa",
-    "CC BY-NC":            "cc_by_nc",
-    "CC BY-NC-SA":         "cc_by_nc_sa",
-    "Public Domain":       "public_domain",
-    "All rights reserved": "all_rights_reserved",
-}
+# Only rows in this collection are processed (exact match, as in match_records.py).
+PUBLICATIONS_COLLECTION = "publications"
+# DSpace item types never uploaded to Pure (dc.type, lower case) -- same as match_records.py.
+EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
+
+# Every file of a DSpace-linked record carries the repository licence (CC BY),
+# as in match_records.py.
+REPOSITORY_LICENSE_URI = "/dk/atira/pure/core/document/licenses/cc_by"
 
 # System fields stripped before PUT
 SYSTEM_FIELDS = {
@@ -133,10 +150,26 @@ def is_valid_pdf(content: bytes) -> bool:
 
 
 def normalize_doi(value: str) -> str:
+    """Same as match_records.normalize_doi: https://doi.org/<doi>, lower case, trailing full stops removed."""
     if not isinstance(value, str):
         return value
     match = DOI_REGEX.match(value.strip().lower())
-    return f"https://doi.org/{match.group(1)}" if match else value
+    return f"https://doi.org/{match.group(1).rstrip('.')}" if match else value
+
+
+def is_valid_doi(value) -> bool:
+    """True if value is a DOI already normalised by normalize_doi()."""
+    return isinstance(value, str) and value.startswith("https://doi.org/10.")
+
+
+def parse_doi_field(raw: str) -> list:
+    """All DOIs in a (possibly multi-valued) dc.identifier.doi cell, normalised, unique, in order."""
+    dois = []
+    for piece in _MULTI_VALUE_SEPARATOR.split((raw or "").strip()):
+        doi = normalize_doi(piece.strip())
+        if is_valid_doi(doi) and doi not in dois:
+            dois.append(doi)
+    return dois
 
 
 def normalize_handle(value: str) -> str:
@@ -144,6 +177,18 @@ def normalize_handle(value: str) -> str:
         return value
     match = HANDLE_REGEX.match(value.strip().lower())
     return f"http://hdl.handle.net/{match.group(1)}" if match else value
+
+
+def is_handle_url(value) -> bool:
+    """True if value is a Handle URL (same rule as match_records.py)."""
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    if "hdl.handle.net" in lowered:
+        return True
+    if "handle.net" not in lowered:
+        return False
+    return str(normalize_handle(value)).startswith("http://hdl.handle.net/")
 
 
 def extract_dois_from_uri(uri_str: str) -> list:
@@ -154,7 +199,7 @@ def extract_dois_from_uri(uri_str: str) -> list:
         u = u.strip().lower()
         m = DOI_REGEX.match(u)
         if m:
-            result.append(f"https://doi.org/{m.group(1)}")
+            result.append(f"https://doi.org/{m.group(1).rstrip('.')}")
     return result
 
 
@@ -197,9 +242,6 @@ def remove_nulls(obj):
 # DSpace / Pure helpers
 # ---------------------------------------------------------------------------
 
-def resolve_license_uri(rights_str: str) -> str:
-    key = LICENSE_MAP.get(rights_str.strip(), "cc_by_nc") if rights_str else "cc_by_nc"
-    return f"/dk/atira/pure/core/document/licenses/{key}"
 
 
 def resolve_embargo_and_access(dspace_row: dict):
@@ -267,7 +309,7 @@ def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
     Checks: licenseType, accessType, versionType, visibleOnPortalDate, embargoPeriod.
     """
     _, embargo_active, embargo_period = resolve_embargo_and_access(dspace_row)
-    license_uri = resolve_license_uri(dspace_row.get("dc.rights", "").strip())
+    license_uri = REPOSITORY_LICENSE_URI
     access_uri  = (
         "/dk/atira/pure/core/openaccesspermission/embargoed"
         if embargo_active else
@@ -439,51 +481,72 @@ def resolve_duplicate_file_versions(pure_record: dict) -> tuple[bool, list, list
 # Matching: build lookup indices from Pure JSON
 # ---------------------------------------------------------------------------
 
+def _dspace_uuids_of(item: dict) -> list:
+    """All DSpace UUIDs (idSource "DSpace") of a Pure record, lower case."""
+    uuids = []
+    for id_entry in item.get("identifiers") or []:
+        if isinstance(id_entry, dict) and id_entry.get("idSource") == "DSpace":
+            value = str(id_entry.get("value") or "").strip().lower()
+            if value and value not in uuids:
+                uuids.append(value)
+    return uuids
+
+
 def build_pure_index(pure_items: list) -> dict:
     """
-    Returns a dict with keys: by_doi, by_repo_doi, by_handle, by_dspace_uuid
-    Each maps a normalised key -> Pure record dict.
+    Lookup indexes over the Pure records, as in match_records.py. Each maps a
+    normalised key -> LIST of Pure records (several records can share a key).
+
+      by_dspace_uuid  every DSpace UUID of every record (lower case)
+      by_doi, by_repo_doi, by_handle
+                      ONLY records without a DSpace UUID: a record that is
+                      already linked to a DSpace item is matched solely through
+                      that item's UUID, never by DOI or Handle.
     """
-    by_doi         = {}
-    by_repo_doi    = {}
-    by_handle      = {}
-    by_dspace_uuid = {}
+    by_doi         = defaultdict(list)
+    by_repo_doi    = defaultdict(list)
+    by_handle      = defaultdict(list)
+    by_dspace_uuid = defaultdict(list)
+
+    def add(index, key, item):
+        if key and all(item is not existing for existing in index[key]):
+            index[key].append(item)
 
     for item in pure_items:
-        # DSpace UUID stored in Pure's electronicVersions or links
-        for ev in item.get("electronicVersions", []):
-            doi = ev.get("doi", "")
-            if doi:
-                ndoi = normalize_doi(doi)
-                if "10.13025" in ndoi:
-                    by_repo_doi[ndoi] = item
-                elif "hdl.handle.net" in ndoi:
-                    by_handle[normalize_handle(ndoi)] = item
-                else:
-                    by_doi[ndoi] = item
+        if not isinstance(item, dict):
+            continue
+        linked_uuids = _dspace_uuids_of(item)
+        if linked_uuids:
+            for dspace_uuid in linked_uuids:
+                add(by_dspace_uuid, dspace_uuid, item)
+            continue
 
-        for link in item.get("links", []):
+        for ev in item.get("electronicVersions") or []:
+            if not isinstance(ev, dict):
+                continue
+            doi = ev.get("doi") or ""
+            if not doi:
+                continue
+            if is_handle_url(doi):
+                add(by_handle, normalize_handle(doi), item)
+                continue
+            ndoi = normalize_doi(doi)
+            if not is_valid_doi(ndoi):
+                continue
+            add(by_repo_doi if "10.13025" in ndoi else by_doi, ndoi, item)
+
+        for link in item.get("links") or []:
             if not isinstance(link, dict):
                 continue
-            url = link.get("url", "")
+            url = link.get("url") or ""
             if not url:
                 continue
-            if "hdl.handle.net" in url:
-                by_handle[normalize_handle(url)] = item
-            elif "10.13025" in url:
-                by_repo_doi[normalize_doi(url)] = item
-            elif url.startswith("https://doi.org/") or url.startswith("http://doi.org/"):
-                by_doi[normalize_doi(url)] = item
-
-        # Index by DSpace UUID from identifiers list
-        for id_entry in item.get("identifiers", []):
-            if not isinstance(id_entry, dict):
-                continue
-            if id_entry.get("idSource", "") == "DSpace":
-                dspace_uuid = id_entry.get("value", "").strip()
-                if dspace_uuid:
-                    by_dspace_uuid[dspace_uuid] = item
-                break
+            if is_handle_url(url):
+                add(by_handle, normalize_handle(url), item)
+            elif "doi.org" in url.lower():
+                ndoi = normalize_doi(url)
+                if is_valid_doi(ndoi):
+                    add(by_repo_doi if "10.13025" in ndoi else by_doi, ndoi, item)
 
     return {
         "by_doi":         by_doi,
@@ -495,40 +558,76 @@ def build_pure_index(pure_items: list) -> dict:
 
 def find_pure_record(dspace_row: dict, pure_index: dict):
     """
-    Try to match a DSpace row to a Pure record.
-    Priority: DSpace UUID -> Publisher DOI -> Repository DOI -> Handle.
-    Returns (pure_record | None, match_type str | None)
+    Match a DSpace row to a Pure record by identifiers only (no titles), in
+    the same order and with the same rules as match_records.py:
+
+      0. DSpace UUID (case-insensitive)
+      1. Publisher DOI(s) -- every non-10.13025 DOI in dc.identifier.doi
+      2. Repository DOI(s) -- every 10.13025 DOI in dc.identifier.uri or dc.identifier.doi
+      3. Handle(s) -- the 'handle' column, then dc.identifier.uri
+    Steps 1-3 only see Pure records without a DSpace UUID.
+
+    The first step that finds anything decides. If it finds two or more
+    DIFFERENT Pure records, the match is ambiguous: no record is returned.
+
+    Returns (pure_record | None, match_type | None, candidates list).
     """
-    # 1. DSpace UUID
-    dspace_uuid = dspace_row.get("uuid", "").strip()
-    if dspace_uuid and dspace_uuid in pure_index["by_dspace_uuid"]:
-        return pure_index["by_dspace_uuid"][dspace_uuid], "DSpace UUID"
+    def decide(found, match_type):
+        unique = []
+        for item in found:
+            if all(item is not u for u in unique):
+                unique.append(item)
+        if len(unique) == 1:
+            return unique[0], match_type, unique
+        return None, f"Ambiguous ({match_type})", unique
 
-    # 2. Publisher DOI
-    pub_doi = dspace_row.get("dc.identifier.doi", "").strip()
-    if pub_doi:
-        ndoi = normalize_doi(pub_doi)
-        if ndoi in pure_index["by_doi"]:
-            return pure_index["by_doi"][ndoi], "Publisher DOI"
+    # 0. DSpace UUID
+    dspace_uuid = (dspace_row.get("uuid") or "").strip().lower()
+    if dspace_uuid and pure_index["by_dspace_uuid"].get(dspace_uuid):
+        return decide(pure_index["by_dspace_uuid"][dspace_uuid], "DSpace UUID")
 
-    # 3. Repository DOI (from dc.identifier.uri)
-    for rdoi in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")):
-        nrdoi = normalize_doi(rdoi)
-        if nrdoi in pure_index["by_repo_doi"]:
-            return pure_index["by_repo_doi"][nrdoi], "Repository DOI"
+    field_dois = parse_doi_field(dspace_row.get("dc.identifier.doi", ""))
 
-    # 4. Handle — prefer dedicated 'handle' column, then dc.identifier.uri
-    candidates = []
-    handle_col = dspace_row.get("handle", "").strip()
+    # 1. Publisher DOI(s)
+    found = [item for doi in field_dois if "10.13025" not in doi
+             for item in pure_index["by_doi"].get(doi, [])]
+    if found:
+        return decide(found, "Publisher DOI")
+
+    # 2. Repository DOI(s)
+    repo_dois = [d for d in extract_dois_from_uri(dspace_row.get("dc.identifier.uri", "")) if "10.13025" in d]
+    repo_dois += [d for d in field_dois if "10.13025" in d and d not in repo_dois]
+    found = [item for doi in repo_dois for item in pure_index["by_repo_doi"].get(doi, [])]
+    if found:
+        return decide(found, "Repository DOI")
+
+    # 3. Handle(s) -- the 'handle' column first, then dc.identifier.uri
+    handles = []
+    handle_col = (dspace_row.get("handle") or "").strip()
     if handle_col:
-        candidates.append(handle_col)
-    candidates.extend(extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")))
-    for h in candidates:
-        nh = normalize_handle(h)
-        if nh in pure_index["by_handle"]:
-            return pure_index["by_handle"][nh], "Handle"
+        handles.append(normalize_handle(handle_col))
+    for h in extract_handles_from_uri(dspace_row.get("dc.identifier.uri", "")):
+        if normalize_handle(h) not in handles:
+            handles.append(normalize_handle(h))
+    found = [item for h in handles for item in pure_index["by_handle"].get(h, [])]
+    if found:
+        return decide(found, "Handle")
 
-    return None, None
+    return None, None, []
+
+
+def fetch_pure_record(uuid: str, base_url: str, session) -> tuple:
+    """GET a research output from Pure. Returns (record | None, error | None)."""
+    try:
+        resp = session.get(f"{base_url}research-outputs/{uuid}", headers={"accept": "application/json"}, timeout=60)
+    except requests.RequestException as exc:
+        return None, str(exc)
+    if resp.status_code != 200:
+        return None, f"{resp.status_code} - {resp.text[:300]}"
+    try:
+        return resp.json(), None
+    except ValueError as exc:
+        return None, f"invalid JSON: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +728,7 @@ def build_file_electronic_version(
     dspace_row: dict,
 ) -> dict:
     """Build a FileElectronicVersion dict from a successful Pure file-upload response."""
-    license_uri = resolve_license_uri(dspace_row.get("dc.rights", "").strip())
+    license_uri = REPOSITORY_LICENSE_URI
     _, embargo_active, embargo_period = resolve_embargo_and_access(dspace_row)
 
     access_uri = (
@@ -751,6 +850,11 @@ def put_pure_record(
     evs = cleaned.get("electronicVersions", [])
     if file_ev is not None:
         evs.append(file_ev)
+    # Every file of a DSpace-linked record carries the repository licence (CC BY),
+    # as in match_records.py.
+    for ev in evs:
+        if isinstance(ev, dict) and ev.get("typeDiscriminator") == "FileElectronicVersion":
+            ev["licenseType"] = {"uri": REPOSITORY_LICENSE_URI}
     cleaned["electronicVersions"] = evs
 
     url = f"{base_url}research-outputs/{uuid}"
@@ -882,6 +986,11 @@ def main():
     parser.add_argument("--skip-existing",    action="store_true", default=True,
                         help="Skip files already in Pure with same name and size (default).")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
+    parser.add_argument("--refresh-from-pure", action="store_true", default=False,
+                        help="Re-read each matched record from Pure (GET) just before checking / updating it, "
+                             "instead of using the --pure-json export. Off by default (one extra API call per "
+                             "record); without it, keeping the export up to date is the user's responsibility. "
+                             "Not used in --dry-run.")
     parser.add_argument("--source",           choices=["dspace", "local"], default="dspace",
                         help="Where to get PDFs from: 'dspace' (default) or 'local'.")
     parser.add_argument("--pdf-dir",          default="./dspace_pdfs",
@@ -968,6 +1077,7 @@ def main():
     if args.source == "dspace":
         print(f"  Save PDFs locally : {args.save_locally}")
     print(f"  Skip existing EVs : {args.skip_existing}")
+    print(f"  Refresh from Pure : {args.refresh_from_pure}")
     print(f"  Dry run           : {args.dry_run}")
     print(f"  Log dir           : {args.log_dir}")
     print(f"{'='*70}\n")
@@ -975,29 +1085,38 @@ def main():
     # ---- Load data ---------------------------------------------------------
     print("Loading DSpace CSV...")
     dspace_rows = []
-    with open(args.dspace_csv, "r", encoding="utf-8") as fh:
+    with open(args.dspace_csv, "r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             dspace_rows.append(row)
     print(f"✅ Loaded {len(dspace_rows)} DSpace rows")
 
     print("Loading Pure JSON...")
-    with open(args.pure_json, "r", encoding="utf-8") as fh:
+    with open(args.pure_json, "r", encoding="utf-8-sig") as fh:
         pure_items = json.load(fh)
     print(f"✅ Loaded {len(pure_items)} Pure records\n")
 
     # ---- Build Pure index --------------------------------------------------
     print("Building Pure lookup index...")
     pure_index = build_pure_index(pure_items)
+    linked_count = sum(1 for item in pure_items if isinstance(item, dict) and _dspace_uuids_of(item))
+    print(f"  Pure records linked to a DSpace item: {linked_count} (matched only by DSpace UUID)")
     print(f"  by_doi         : {len(pure_index['by_doi'])} entries")
     print(f"  by_repo_doi    : {len(pure_index['by_repo_doi'])} entries")
     print(f"  by_handle      : {len(pure_index['by_handle'])} entries")
     print(f"  by_dspace_uuid : {len(pure_index['by_dspace_uuid'])} entries\n")
 
     # ---- Filter to rows with a PDF path ------------------------------------
-    rows_in_publications = [
+    rows_in_collection = [
         r for r in dspace_rows
-        if "Publications" in r.get("collection_names", "")
+        if r.get("collection_names", "").strip().lower() == PUBLICATIONS_COLLECTION
     ]
+    excluded_type_rows = [
+        r for r in rows_in_collection
+        if r.get("dc.type", "").strip().lower() in EXCLUDED_DSPACE_TYPES
+    ]
+    rows_in_publications = [r for r in rows_in_collection if r not in excluded_type_rows]
+    print(f"DSpace rows skipped (dc.type not uploaded to Pure: {', '.join(sorted(EXCLUDED_DSPACE_TYPES))}): "
+          f"{len(excluded_type_rows)}")
     rows_with_pdf = [
         r for r in rows_in_publications
         if r.get("pdf_handle_paths", "").strip()
@@ -1012,7 +1131,7 @@ def main():
 
     print("Matching no-PDF rows to Pure records...")
     for row in rows_without_pdf:
-        pure_record, match_type = find_pure_record(row, pure_index)
+        pure_record, match_type, _ = find_pure_record(row, pure_index)
         if pure_record is None:
             continue
         handle_str = row.get("handle", "").strip()
@@ -1042,6 +1161,8 @@ def main():
     counters = {
         "total":            len(rows_with_pdf),
         "no_match":         0,
+        "ambiguous":        0,
+        "refresh_fail":     0,
         "already_has_fev":  0,
         "metadata_updated": 0,
         "duplicates_removed": 0,
@@ -1102,7 +1223,17 @@ def main():
         }
 
         # 1. Match to Pure record
-        pure_record, match_type = find_pure_record(row, pure_index)
+        pure_record, match_type, candidates = find_pure_record(row, pure_index)
+        if pure_record is None and candidates:
+            candidate_uuids = [c.get("uuid", "") for c in candidates]
+            print(f"  ⚠️  Ambiguous match — {len(candidates)} Pure records ({match_type}): {candidate_uuids} — skipping")
+            counters["ambiguous"] += 1
+            entry["status"] = "ambiguous_match"
+            entry["match_type"] = match_type
+            entry["detail"] = f"{len(candidates)} Pure records match: {'; '.join(candidate_uuids)}"
+            results.append(entry)
+            skipped_rows.append(entry)
+            continue
         if pure_record is None:
             print(f"  ⚠️  No Pure record matched — skipping")
             counters["no_match"] += 1
@@ -1117,6 +1248,23 @@ def main():
         entry["pure_id"]    = str(pure_record.get("pureId", ""))
         entry["match_type"] = match_type
         print(f"  ✅ Matched Pure record ({match_type}): {pure_uuid}  pureId: {entry['pure_id']}")
+
+        # Optional: use Pure's current version of the record instead of the export.
+        if args.refresh_from_pure and not args.dry_run:
+            fresh, fetch_error = fetch_pure_record(pure_uuid, base_url, session)
+            if fresh is None:
+                print(f"  ❌ Could not re-read the record from Pure: {fetch_error} — skipping")
+                counters["refresh_fail"] += 1
+                entry["status"] = "refresh_failed"
+                entry["detail"] = f"GET research-outputs/{pure_uuid} failed: {fetch_error}"
+                results.append(entry)
+                failed_rows.append(entry)
+                continue
+            # Update the record object in place, so other rows matched to the
+            # same record (via the index) also see the current version.
+            pure_record.clear()
+            pure_record.update(fresh)
+            print(f"  🔄 Re-read the current record from Pure")
 
         # Steps 2-6: process each PDF path individually
         any_success             = False
@@ -1502,6 +1650,9 @@ def main():
     print(f"{'='*70}")
     print(f"  Total rows with PDF           : {counters['total']}")
     print(f"  No Pure match                 : {counters['no_match']}")
+    print(f"  Ambiguous match (skipped)     : {counters['ambiguous']}")
+    if args.refresh_from_pure:
+        print(f"  Re-read from Pure failed      : {counters['refresh_fail']}")
     print(f"  Already had FileEV            : {counters['already_has_fev']}")
     print(f"  Only file metadata updated    : {counters['metadata_updated']}")
     print(f"  Duplicate FileEVs removed     : {counters['duplicates_removed']}")
