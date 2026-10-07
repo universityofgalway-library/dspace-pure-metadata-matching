@@ -134,7 +134,7 @@ Records are matched in priority order:
 
 0. **DSpace UUID — highest priority.** A Pure record that carries this DSpace item's UUID (an identifier with `idSource: "DSpace"`) is its record; when one is found, no other matching is done.
 
-**A Pure record that already carries a DSpace UUID is matched only through that UUID** — it is never a candidate in steps 1–4 for any other DSpace item, whatever its DOI, Handle or title (these may be wrong on such a record; its DSpace UUID is authoritative). Steps 1–4 only consider Pure records **without** a DSpace UUID. The run log shows how many Pure records are linked and how many are not.
+**A Pure record that already carries a DSpace UUID is matched only through that UUID** (except the DSpace UUID of an item in the *Duplicates* collection — see [Double matches and double deposits](#double-matches-and-double-deposits)) — it is never a candidate in steps 1–4 for any other DSpace item, whatever its DOI, Handle or title (these may be wrong on such a record; its DSpace UUID is authoritative). Steps 1–4 only consider Pure records **without** a DSpace UUID. The run log shows how many Pure records are linked and how many are not.
 
 1. **Publisher DOI** — every publisher DOI in `dc.identifier.doi` (multi-entry field) is looked up. A Pure record reached through several DOIs, or indexed twice (e.g. via an electronic version and a DOI link), is counted only once.
 2. **Repository DOI** — from `dc.identifier.uri`, pattern `10.13025/*`, followed by any repository DOI found in `dc.identifier.doi`
@@ -147,6 +147,8 @@ DOIs and handles are compared in normalised form on both sides — see [DOI & Ha
 
 ### Double matches and double deposits
 
+**A Pure record carrying this row's own DSpace UUID is always this row's record**, whatever Handle or repository DOI it carries — even one of another DSpace item, in the CSV or not. It is updated, and any other item's Handle / repository DOI on it is **replaced** by this row's (processing log `🔁 … replaced by this item's Handle / repository DOI`; status log `repositoryIdsReplaced`). The rules below only apply to records that don't carry the row's DSpace UUID.
+
 A Pure record that **belongs to another DSpace item** is never updated by this row:
 - it was already matched (and updated) by another DSpace row **earlier in the same run** — previously the later update silently replaced the earlier one, so only one item's DSpace UUID reached Pure; or
 - it carries a **repository Handle or repository DOI of another DSpace item** (and none of this row's).
@@ -158,6 +160,10 @@ What happens then depends on whether the two DSpace items are the **same work** 
 | Another matching record is free | That record is used. |
 | Same work (**double deposit** in DSpace) | The row is **skipped** — no duplicate Pure record is created (counted under *Skipped → Double deposit*). Resolve the duplicate in DSpace. |
 | Different works (e.g. near-identical titles, different Handles / years) | The row continues without that record, and gets its **own new record** if nothing else matches. |
+
+**The DSpace *Duplicates* collection.** Items in the *Duplicates* collection are redundant copies of double deposits: they are never processed, and they **never own a Pure record**. When a Pure record carries the **DSpace UUID**, Handle or repository DOI of a *Duplicates* item, the *Publications* item that matches it (by publisher DOI or title, with the usual safeguards) **takes the record over**: the record is updated, and its DSpace UUID, Handle and repository DOI are **replaced** by those of the *Publications* item (the duplicate's are removed). A *Duplicates* item's DSpace UUID therefore does **not** link a record (it isn't used in step 0, and the record is a candidate in steps 1–4 like an unlinked one); it is never kept, whatever `DSPACE_UUID_PREFERENCE` says, and replacing it is not reported as a DSpace UUID mismatch. When comparing types and years for such a record, the *Duplicates* item's `dc.type` and year are used, as for a record linked by DSpace UUID. Every takeover is listed in `duplicate_takeovers_YYYY-MM-DD.csv`: `pure_uuid`, `pure_title`, `duplicate_dspace_uuid`, `duplicate_handle`, `duplicate_repository_doi`, `pure_dspace_uuids_before`, `pure_repository_ids_before`, `dspace_uuid`, `handle`, `repository_doi`, `match_type`; the status log records `duplicateTakeover`.
+
+This needs the *Duplicates* item to be in the DSpace CSV — use the full dump. If a Pure record carries the Handle or repository DOI of a DSpace item that is **not in the CSV** (e.g. a subset run), it can't be checked whether that item is a duplicate, so the row is **skipped** rather than given a new record (which could duplicate the Pure record); it is counted under *Skipped → Pure record carries the Handle / repository DOI of a DSpace item not in the CSV* and listed in `double_matches` with action `skipped (owner not in the CSV)`.
 
 Every case is listed in `double_matches_YYYY-MM-DD.csv`: `pure_uuid`, `pure_title`, `first_dspace_uuid`, `first_handle`, `first_match_type` (or "record carries its Handle / repository DOI"), `dspace_uuid`, `handle`, `match_type`, `same_work`, `action`; the status log records `doubleMatch`.
 
@@ -601,7 +607,8 @@ For `ContributionToJournal` **and** `ContributionToPeriodical` records (treated 
 ├── unmatched_journals_YYYY-MM-DD.csv
 ├── dspace_uuid_mismatches_YYYY-MM-DD.csv
 ├── publisher_doi_conflicts_YYYY-MM-DD.csv
-└── double_matches_YYYY-MM-DD.csv
+├── double_matches_YYYY-MM-DD.csv
+└── duplicate_takeovers_YYYY-MM-DD.csv
 ```
 
 | Path | Contents |
@@ -631,6 +638,7 @@ At the end of a run, the processing log shows:
      ↳ Not in Publications collection: …
      ↳ Dataset (not uploaded to Pure): …
      ↳ Double deposit (Pure record belongs to another DSpace item of the same work): …
+     ↳ Pure record carries the Handle / repository DOI of a DSpace item not in the CSV: …
      ↳ No contributors in any field: …
    Matched to existing Pure record: …
    Unmatched (new records created): …
@@ -645,6 +653,7 @@ At the end of a run, the processing log shows:
    DSpace UUID mismatches: …
    Publisher DOI conflicts: …
    Double matches (Pure record belonging to another DSpace item): …
+   Taken over from the Duplicates collection: …
    Logs saved to: …
 ```
 

@@ -263,6 +263,16 @@ _publisher_doi_conflicts = []
 # again -- the double match is reported instead (double_matches CSV).
 _claimed_pure_records = {}
 _double_matches = []
+# Pure records carrying the Handle / repository DOI of an item in the DSpace
+# "Duplicates" collection, taken over by the Publications item of the same
+# work (duplicate_takeovers CSV).
+_duplicate_takeovers = []
+# DSpace collection holding the redundant copies of double deposits. Its items
+# are never processed, and never own a Pure record: a Pure record carrying the
+# Handle / repository DOI of such an item is taken over by the Publications
+# item that matches it, and gets that item's Handle / repository DOI instead.
+DUPLICATES_COLLECTION = "duplicates"
+OWNER_NOT_IN_CSV_ERROR = "Skipped: the Pure record carries the Handle / repository DOI of a DSpace item that is not in the CSV"
 DOUBLE_DEPOSIT_ERROR = "Skipped: double deposit (the Pure record belongs to another DSpace item of the same work)"
 
 # Lookups over the whole DSpace CSV (filled in main): DSpace items by UUID,
@@ -1837,7 +1847,9 @@ def enforce_single_dspace_identity(pure_record, dspace_row, updated_record, log_
     manual-review warning is printed.
     """
     row_uuid = (dspace_row.get("uuid") or "").strip()
-    pure_uuids = dspace_uuids_of(pure_record)
+    # A Duplicates-collection item's DSpace UUID is never kept: it is replaced
+    # by the row's, whatever DSPACE_UUID_PREFERENCE says.
+    pure_uuids = owning_dspace_uuids(pure_record)
     mismatch = bool(pure_uuids) and row_uuid.lower() not in {u.lower() for u in pure_uuids}
     if mismatch and DSPACE_UUID_PREFERENCE == "pure":
         target_uuid = pure_uuids[0]
@@ -2037,16 +2049,34 @@ def owned_by_other_dspace_item(row, item):
     is another item's record.
     """
     row_uuid = (row.get("uuid") or "").strip().lower()
-    pure_uuids = dspace_uuids_of(item or {})
+    pure_uuids = owning_dspace_uuids(item or {})
     if not pure_uuids or row_uuid in {u.lower() for u in pure_uuids}:
         return []
     return [u for u in pure_uuids if u.lower() in _DSPACE_ITEMS["by_uuid"]]
 
 
+def linked_dspace_rows(item):
+    """
+    The DSpace items (CSV rows) a Pure record is linked to: those whose DSpace
+    UUID it carries; if none, the Duplicates-collection items whose Handle /
+    repository DOI it carries (a record created from that redundant copy --
+    its dc.type / year describe the record, as for a DSpace UUID link).
+    """
+    rows = [_DSPACE_ITEMS["by_uuid"].get(u.lower()) for u in dspace_uuids_of(item or {})]
+    rows = [r for r in rows if r]
+    if rows:
+        return rows
+    for rid in sorted(pure_repository_ids(item or {})):
+        owner = _DSPACE_ITEMS["uuid_by_handle"].get(rid) or _DSPACE_ITEMS["uuid_by_repo_doi"].get(rid)
+        owner_row = _DSPACE_ITEMS["by_uuid"].get(owner) if owner else None
+        if owner_row is not None and is_duplicates_item(owner_row) and all(owner_row is not r for r in rows):
+            rows.append(owner_row)
+    return rows
+
+
 def _pure_side_types(item):
     """Output types of a Pure record: its linked DSpace items' dc.type when they are in the CSV, else its own type."""
-    linked_rows = [_DSPACE_ITEMS["by_uuid"].get(u.lower()) for u in dspace_uuids_of(item or {})]
-    linked_rows = [r for r in linked_rows if r]
+    linked_rows = linked_dspace_rows(item)
     if linked_rows:
         return {dspace_output_type_key(r) for r in linked_rows}, linked_rows
     return {t for t in [pure_output_type_key(item)] if t}, linked_rows
@@ -2106,6 +2136,11 @@ def repository_owner_of(row, item):
         if owner:
             return owner, _DSPACE_ITEMS["by_uuid"].get(owner), rid
     return "", None, sorted(pure_repository_ids(item))[0]
+
+
+def is_duplicates_item(dspace_row):
+    """True if the DSpace item is in the "Duplicates" collection (a redundant copy)."""
+    return (dspace_row or {}).get("collection_names", "").strip().lower() == DUPLICATES_COLLECTION
 
 
 def dspace_rows_same_work(row_a, row_b):
@@ -2237,8 +2272,7 @@ def _confirm_title_match_rules(row, item, dspace_title, dspace_subtitle):
     if dspace_numbers != pure_numbers:
         return False, f"numbers in the titles differ ({dspace_numbers} vs {pure_numbers})"
 
-    linked_rows = [_DSPACE_ITEMS["by_uuid"].get(u.lower()) for u in dspace_uuids_of(item or {})]
-    linked_rows = [r for r in linked_rows if r]
+    linked_rows = linked_dspace_rows(item)
     d_type = dspace_output_type_key(row)
     if linked_rows:
         p_types = {dspace_output_type_key(r) for r in linked_rows}
@@ -2280,7 +2314,7 @@ def publisher_doi_conflict(row, item, threshold):
     the output types are the same. Returns a reason string, or None if there
     is no conflict. (threshold is kept for compatibility; no longer used.)
     """
-    pure_uuids = dspace_uuids_of(item)
+    pure_uuids = owning_dspace_uuids(item)
     row_uuid = (row.get("uuid") or "").strip().lower()
     if not pure_uuids or row_uuid in {u.lower() for u in pure_uuids}:
         return None
@@ -2310,6 +2344,23 @@ def dspace_uuids_of(record):
         and identifier.get("idSource") == "DSpace"
         and str(identifier.get("value") or "").strip()
     ]
+
+
+def duplicates_dspace_uuids_of(record):
+    """DSpace UUIDs on a Pure record that belong to items in the Duplicates collection (in the CSV)."""
+    return [u for u in dspace_uuids_of(record)
+            if is_duplicates_item(_DSPACE_ITEMS["by_uuid"].get(u.lower()))]
+
+
+def owning_dspace_uuids(record):
+    """
+    The DSpace UUIDs that make a Pure record belong to a DSpace item: all of
+    its DSpace UUIDs except those of Duplicates-collection items. A record
+    whose only DSpace UUIDs are Duplicates items' belongs to no item -- the
+    Publications item of the same work takes it over and replaces the UUID.
+    """
+    duplicates = {u.lower() for u in duplicates_dspace_uuids_of(record)}
+    return [u for u in dspace_uuids_of(record) if u.lower() not in duplicates]
 
 
 def resolve_record_duplicate(records, log_entry=None):
@@ -4439,7 +4490,9 @@ def main():
     pure_by_dspace_uuid = defaultdict(list)
     unlinked_pure_items = []
     for item in pure_items:
-        linked_uuids = dspace_uuids_of(item)
+        # DSpace UUIDs of Duplicates-collection items don't link a record: such
+        # a record is matched like an unlinked one and taken over.
+        linked_uuids = owning_dspace_uuids(item)
         if linked_uuids:
             for linked_uuid in linked_uuids:
                 pure_by_dspace_uuid[linked_uuid.lower()].append(item)
@@ -4447,6 +4500,10 @@ def main():
             unlinked_pure_items.append(item)
     print(f"✅ Pure records linked to a DSpace item: {len(pure_items) - len(unlinked_pure_items)} "
           f"(matched only by DSpace UUID) | without a DSpace UUID: {len(unlinked_pure_items)}")
+    duplicates_linked = sum(1 for item in pure_items if duplicates_dspace_uuids_of(item))
+    if duplicates_linked:
+        print(f"ℹ️ Pure records carrying the DSpace UUID of a Duplicates-collection item: {duplicates_linked} "
+              f"(not linked by it — can be taken over by the Publications item)")
 
     print("Building title token index...")
     title_token_index = build_title_token_index(unlinked_pure_items)
@@ -4727,14 +4784,38 @@ def main():
             # matched it earlier in this run, or the DSpace item whose
             # repository Handle / DOI the record carries.
             owners = {}
+            takeover_from = {}   # id(record) -> the Duplicates item whose Handle / DOI it carries
             for r in matched_records:
                 claim = _claimed_pure_records.get(r.get("uuid"))
                 if claim and claim["dspace_uuid"].lower() != row_key:
                     owners[id(r)] = claim
                     continue
+                if row_key and row_key in {u.lower() for u in dspace_uuids_of(r)}:
+                    # The record carries this row's own DSpace UUID: it is this
+                    # row's record, whatever Handle / repository DOI it carries.
+                    # Other items' Handles / repository DOIs on it are replaced
+                    # by this row's (single-identity step).
+                    other_ids = sorted(pure_repository_ids(r) - dspace_repository_ids(row))
+                    if other_ids:
+                        print(f"  🔁 Pure record {r.get('uuid')} carries this item's DSpace UUID but other repository "
+                              f"identifiers {other_ids} — replaced by this item's Handle / repository DOI")
+                        log_entry["repositoryIdsReplaced"] = {"pureUUID": r.get("uuid"), "replaced": other_ids}
+                    continue
+                dup_uuids = [u for u in duplicates_dspace_uuids_of(r) if u.lower() != row_key]
+                if dup_uuids and not owning_dspace_uuids(r):
+                    # Linked only to a Duplicates-collection item by DSpace
+                    # UUID: this row takes the record over.
+                    dup_row = _DSPACE_ITEMS["by_uuid"].get(dup_uuids[0].lower())
+                    takeover_from[id(r)] = (dup_uuids[0], dup_row, f"DSpace UUID {dup_uuids[0]}")
+                    continue
                 repo_owner = repository_owner_of(row, r)
                 if repo_owner:
                     owner_uuid, owner_row, owner_id = repo_owner
+                    if owner_row is not None and is_duplicates_item(owner_row):
+                        # The owner is the redundant copy in the Duplicates
+                        # collection: this row takes the record over.
+                        takeover_from[id(r)] = (owner_uuid, owner_row, owner_id)
+                        continue
                     owners[id(r)] = {"dspace_uuid": owner_uuid, "handle": owner_id,
                                      "match_type": "record carries its Handle / repository DOI",
                                      "row": owner_row}
@@ -4742,12 +4823,22 @@ def main():
             if claimed:
                 free = [r for r in matched_records if all(r is not c for c in claimed)]
                 same_work_any = False
+                owner_unknown_any = False
                 for record_taken in claimed:
                     first = owners[id(record_taken)]
+                    owner_unknown = first["row"] is None
+                    owner_unknown_any = owner_unknown_any or owner_unknown
                     same_work = bool(first["row"]) and dspace_rows_same_work(row, first["row"])
                     same_work_any = same_work_any or same_work
                     if free:
                         action = "another matching record used"
+                    elif owner_unknown:
+                        # The Handle / DOI on the record belongs to a DSpace
+                        # item that isn't in the CSV (e.g. a subset run), so it
+                        # can't be checked whether that item is a duplicate of
+                        # this one: no new record is created, to avoid a
+                        # duplicate in Pure.
+                        action = "skipped (owner not in the CSV)"
                     elif same_work:
                         action = "skipped (double deposit)"
                     else:
@@ -4770,6 +4861,11 @@ def main():
                 log_entry["doubleMatch"] = [r.get("uuid") for r in claimed]
                 if free:
                     matched_records = free
+                elif owner_unknown_any:
+                    log_entry["success"] = False
+                    log_entry["error"] = OWNER_NOT_IN_CSV_ERROR
+                    log_entries.append(log_entry)
+                    continue
                 elif same_work_any:
                     log_entry["success"] = False
                     log_entry["error"] = DOUBLE_DEPOSIT_ERROR
@@ -4778,6 +4874,8 @@ def main():
                 else:
                     matched_records = []
                     match_type = None
+        else:
+            takeover_from = {}
 
         # Resolve duplicate records
         resolved_from_duplicates = len(matched_records) > 1
@@ -4793,7 +4891,7 @@ def main():
         # but every such case is reported (processing log + CSV).
         if matched_records:
             target_record = matched_records[0]
-            record_dspace_uuids = dspace_uuids_of(target_record)
+            record_dspace_uuids = owning_dspace_uuids(target_record)
             row_dspace_uuid = (row.get("uuid") or "").strip()
             if record_dspace_uuids and row_dspace_uuid.lower() not in {u.lower() for u in record_dspace_uuids}:
                 row_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
@@ -4813,6 +4911,30 @@ def main():
                     "resolution": ("Pure's DSpace UUID kept" if DSPACE_UUID_PREFERENCE == "pure"
                                    else "DSpace UUID from the CSV written"),
                 })
+
+        if matched_records and id(matched_records[0]) in takeover_from:
+            dup_uuid, dup_row, dup_id = takeover_from[id(matched_records[0])]
+            taken = matched_records[0]
+            row_handles = extract_handles_from_uri(row.get("dc.identifier.uri", ""))
+            new_repo = dspace_item_repo_dois(row)
+            print(f"  🔁 Pure record {taken.get('uuid')} carries the DSpace UUID / Handle / repository DOI of DSpace item "
+                  f"{dup_uuid} ({dup_id}) in the Duplicates collection — taken over by this item; its DSpace UUID, "
+                  f"Handle and repository DOI will replace the duplicate's")
+            log_entry["duplicateTakeover"] = {"pureUUID": taken.get("uuid"), "duplicateDSpaceUUID": dup_uuid,
+                                              "duplicateId": dup_id}
+            _duplicate_takeovers.append({
+                "pure_uuid": taken.get("uuid", ""),
+                "pure_title": (taken.get("title") or {}).get("value", ""),
+                "duplicate_dspace_uuid": dup_uuid,
+                "duplicate_handle": (dspace_item_handles(dup_row) or [""])[0],
+                "duplicate_repository_doi": (dspace_item_repo_dois(dup_row) or [""])[0],
+                "pure_dspace_uuids_before": " ; ".join(dspace_uuids_of(taken)),
+                "pure_repository_ids_before": " ; ".join(sorted(pure_repository_ids(taken))),
+                "dspace_uuid": row.get("uuid", ""),
+                "handle": row_handles[0] if row_handles else None,
+                "repository_doi": new_repo[0] if new_repo else "",
+                "match_type": match_type,
+            })
 
         if matched_records:
             log_entry["matched"] = True
@@ -4949,6 +5071,19 @@ def main():
             writer.writerows(_unmatched_journals)
         print(f"✅ Unmatched journals saved to: {unmatched_journals_csv}")
 
+    # Takeovers from the Duplicates collection CSV
+    if _duplicate_takeovers:
+        takeover_csv = os.path.join(OUTPUT_DIR, f"duplicate_takeovers_{TODAY}.csv")
+        with open(takeover_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['pure_uuid', 'pure_title', 'duplicate_dspace_uuid',
+                                                   'duplicate_handle', 'duplicate_repository_doi',
+                                                   'pure_dspace_uuids_before', 'pure_repository_ids_before',
+                                                   'dspace_uuid', 'handle',
+                                                   'repository_doi', 'match_type'])
+            writer.writeheader()
+            writer.writerows(_duplicate_takeovers)
+        print(f"✅ Duplicate takeovers saved to: {takeover_csv}")
+
     # Double matches CSV (a Pure record matched by two or more DSpace rows in this run)
     if _double_matches:
         double_csv = os.path.join(OUTPUT_DIR, f"double_matches_{TODAY}.csv")
@@ -4992,7 +5127,9 @@ def main():
     no_contributors_count = sum(1 for e in log_entries if e.get('error') == "No contributors found in any contributor field")
     dataset_count = sum(1 for e in log_entries if e.get('error') == "Skipped: dataset (not uploaded to Pure)")
     double_deposit_count = sum(1 for e in log_entries if e.get('error') == DOUBLE_DEPOSIT_ERROR)
-    skipped_count = not_publications_count + no_contributors_count + dataset_count + double_deposit_count
+    owner_not_in_csv_count = sum(1 for e in log_entries if e.get('error') == OWNER_NOT_IN_CSV_ERROR)
+    skipped_count = (not_publications_count + no_contributors_count + dataset_count + double_deposit_count
+                     + owner_not_in_csv_count)
 
     matched_count = sum(1 for e in log_entries if e['matched'])
     unmatched_new_record_count = sum(1 for e in log_entries if not e['matched'] and e['success'])
@@ -5008,6 +5145,7 @@ def main():
     print(f"     ↳ Dataset (not uploaded to Pure): {dataset_count}")
     print(f"     ↳ No contributors in any field: {no_contributors_count}")
     print(f"     ↳ Double deposit (Pure record belongs to another DSpace item of the same work): {double_deposit_count}")
+    print(f"     ↳ Pure record carries the Handle / repository DOI of a DSpace item not in the CSV: {owner_not_in_csv_count}")
     print(f"   Matched to existing Pure record: {matched_count}")
     print(f"   Unmatched (new records created): {unmatched_new_record_count}")
     print(f"   Successfully processed: {success_count}")
@@ -5021,6 +5159,7 @@ def main():
     print(f"   DSpace UUID mismatches: {len(_dspace_uuid_mismatches)}")
     print(f"   Publisher DOI conflicts: {len(_publisher_doi_conflicts)}")
     print(f"   Double matches (Pure record belonging to another DSpace item): {len(_double_matches)}")
+    print(f"   Taken over from the Duplicates collection: {len(_duplicate_takeovers)}")
     print(f"   Logs saved to: {LOG_DIR}")
 
     # Calculate elapsed time
