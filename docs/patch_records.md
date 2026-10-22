@@ -252,14 +252,25 @@ Patch shape: `{ "uuid": "…", "links": [ /* cleaned links */ ] }`
 
 Removes duplicate `FileElectronicVersion` entries from a record's `electronicVersions` — typically left behind by repeated/retried upload attempts on the same underlying file (e.g. a filename-decoding bug that made earlier attempts fail, or simply re-running an upload job).
 
-Two entries are only considered duplicates of each other if **all** of the following match exactly: normalized filename, file size, `versionType.uri`, `licenseType.uri`, and `file.fileStoreLocations`. Filename normalization is fuzzy enough to bridge an HTML-entity-corrupted name and its correctly-decoded counterpart (e.g. `Me_769_liacin.pdf` and `Méliacin.pdf` are recognised as the same file) — file size acts as the safety net against two genuinely different files coincidentally colliding on name alone.
+The rules are the same as in `add_pdfs_to_pure.py` — the duplicate-file code is identical in both scripts.
 
-Each duplicate group is resolved differently depending on its contents:
+Two entries are duplicates when **both sizes are known and identical** and the **file names are the same file name**. Other metadata — licence, version type, access type, embargo, storage location, creator — does not matter for this decision; it only decides which copy stays. Entries without a known size are never removed. Grouping is transitive: if A and B are the same file and B and C are the same file, A, B and C form one group.
 
-1. **Corrupted name alongside a clean one** — each corrupted-named entry is removed, keeping the clean-named entry(ies), but only when a clean sibling in the same group has at least as many accented characters as the corrupted name has digit-runs (each artifact replaces exactly one accented character). This guards against a filename that merely contains an ordinary bare number (a year, an ID) being wrongly treated as a corrupted duplicate of an unrelated file. A group with no clean-named entry at all, or where a corrupted candidate fails this check, is left untouched.
-2. **Two or more genuinely identical clean-named duplicates** — nothing left to distinguish them via the matching key, so one is kept based on a weighted score: uploaded by a real Pure user (not `root`/`atira`/`sync_user`/`admin`/`system`) > most complete metadata (`accessType`, `visibleOnPortalDate`, `embargoPeriod`, `title`) > most recently created. Ties fall back to the earliest entry in the original order.
+**Same file name.** Two names are the same file name if either check passes (a name with a number between underscores, such as `Smith_2019_final.pdf`, goes through both):
 
-Records with no `electronicVersions`, or where no group is actionable, are skipped. Nothing outside `electronicVersions` is changed. The `--modified-after` date filter applies.
+1. **Exact match after normalisation** — HTML entities decoded, Unicode NFKC, accents removed, Pure's punctuation replacement (anything other than letters, digits, `-`, `_`, `.` and space becomes `_`), lower case. So `Paper.PDF` = `paper.pdf`, `Résumé.pdf` = `Resume.pdf`, `a,b.pdf` = `a_b.pdf`, and `Smith_2019_final.pdf` = `Smith_2019_final.pdf`.
+2. **Garbled name** — Pure stores an un-decoded `&#769;` as `_769_`, so `Me_769_liacin.pdf` (combining accent) and `M_233_liacin.pdf` (precomposed letter) are garbled copies of `Méliacin.pdf`. This only counts when the clean name has at least as many accented letters as the garbled name has `_NNN_` runs, so `Smith_2019_final.pdf` is never treated as a garbled copy of `Smith_final.pdf`.
+
+**Which copy stays.** From each group one entry is kept and the others are removed, in this priority order (each step only breaks ties left by the previous one):
+
+1. **Open access** — an entry with access type *open* beats any other access type.
+2. **Most complete metadata** — the most of `accessType`, `licenseType`, `versionType`, `visibleOnPortalDate`, `embargoPeriod` and `title` populated.
+3. **Clean file name** — a correctly spelled name beats a garbled one (`_NNN_` / `&#NNN;` remnants).
+4. **Uploaded by a real Pure user** — `creator` is not a system/import account (`root`, `atira`, `sync_user`, `admin`, `system`, empty; case-insensitive).
+5. **Oldest** — earliest `created` (a missing date counts as newest).
+6. **First** in the record's `electronicVersions` order.
+
+Records with no `electronicVersions`, or without duplicates, are skipped. Nothing outside `electronicVersions` is changed. The `--modified-after` date filter applies.
 
 Output file: `duplicate_file_patch_YYYY-MM-DD.json`
 Patch shape: `{ "uuid": "…", "electronicVersions": [ /* full list, with duplicates removed */ ] }`
@@ -439,4 +450,4 @@ python patch_records.py data/records.json --output-dir patches/ \
 - `--workflow-from-log` requires `--patch-workflow`; supplying it without `--patch-workflow` is an error.
 - `--patch-publishers` requires both `--publisher-mapping` and `--dspace-csv`; `--publisher-mapping` without `--patch-publishers` is an error.
 - `--patch-subjects` requires `--dspace-csv`.
-- `--dspace-csv` requires `--patch-publishers` or `--patch-subjects`; supplying it with neither is an error.
+- `--dspace-csv` requires `--patch-publishers` or `--patch-subjects`; supplying it with neither is an error.

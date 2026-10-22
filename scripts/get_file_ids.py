@@ -2,24 +2,47 @@
 """
 get_file_ids.py
 
-Match records between a DSpace CSV and a Pure JSON export by Handle URL.
-Outputs a CSV with matched record identifiers from both systems, including
-file IDs for all matching PDFs (semicolon-separated when multiple).
+Match records between a DSpace CSV and a Pure JSON export (by DSpace UUID,
+falling back to Handle), pair their PDF files by filename, and write the
+identifiers from both systems in two formats:
 
-Output columns:
+  - one row per matched record (file columns semicolon-separated), and
+  - one row per file (each DSpace file on the same row as the Pure file it
+    matched; unmatched files on rows of their own).
+
+Record-level output columns:
     dspace_uuid, pure_uuid, pure_id, title,
     dspace_file_id, pure_file_id, pure_file_pure_id, pure_file_name,
     file_match_type, handle
 
+File-level output columns: the same, plus "file_match" (per file).
+
+In the record-level file the file lists are ordered so that matched files
+come first and line up by position (the n-th DSpace file matched the n-th
+Pure file); then unmatched DSpace files; then unmatched Pure files. The
+file-level file states each pairing explicitly and is the one to use for
+per-file work.
+
 dspace_file_id format:
     "{handle}:{seq}/{file uuid}:{filename}", e.g.
     "10379/1034:1/3c246f30-8d3a-4077-a013-6ca4ef262a3e:paper_0078.pdf"
-    — the handle comes from the CSV's "handle" column, the sequence and
+    -- the handle comes from the CSV's "handle" column, the sequence and
     filename come from "pdf_handle_paths", and the file UUID is extracted
     from the matching "pdf_links" entry. This mirrors how create_pure_xml.py
     builds DSpace <file id="..."> values. If a file UUID can't be found for
     an entry, the raw pdf_handle_paths value is used instead so no file
     information is silently dropped.
+
+A Pure record's DSpace UUID is read from its identifiers with idSource
+"DSpace" -- "PrimaryId" first, then "Id". A record belongs to ONE DSpace
+item: a record carrying several distinct DSpace UUIDs uses the first
+(PrimaryId before Id) and is reported (multiple_dspace_ids). Every file has
+its own ID on both sides (DSpace bitstream UUID; Pure fileId / pureId).
+
+Also written: a duplicates report (several Pure records for one DSpace
+item), unmatched reports (DSpace items no Pure record links to; Pure
+records whose DSpace UUID / Handle isn't in the CSV) and the
+multiple_dspace_ids report.
 
 Usage:
     python get_file_ids.py --csv input.csv --json input.json --output output.csv
@@ -34,6 +57,7 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import html
@@ -46,12 +70,33 @@ from urllib.parse import unquote
 
 HANDLE_BASE_URL = "http://hdl.handle.net/"
 
+# Output files are written as UTF-8 with a BOM, so Excel shows accented
+# characters correctly (Python and other CSV readers ignore the BOM when
+# reading with "utf-8-sig").
+OUTPUT_ENCODING = "utf-8-sig"
+
 # Matches a DSpace bitstream/file UUID embedded in a content URL, e.g.
 # '.../server/api/core/bitstreams/{uuid}/content' -> {uuid}.
 # (Same pattern used by create_pure_xml.py to build DSpace file IDs.)
 BITSTREAM_UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
+
+# A Handle, bare ("10379/6474") or as a URL: hdl.handle.net, handle.net or
+# www.handle.net hosts, with or without http(s)://, any case, ignoring
+# trailing slashes -- the same forms match_records.py and add_pdfs_to_pure.py
+# accept.
+HANDLE_RE = re.compile(
+    r"^(?:(?:https?://)?(?:www\.|hdl\.)?handle\.net/)?(\d+(?:\.\d+)*/\S+?)/*$",
+    re.IGNORECASE,
+)
+
+# Per-file match statuses (file-level output, "file_match" column).
+FILE_MATCHED = "matched"
+FILE_MATCHED_FALLBACK = "matched_fallback"
+FILE_DSPACE_ONLY = "dspace_only"
+FILE_PURE_ONLY = "pure_only"
+FILE_NO_FILES = "no_files"
 
 
 def clean_dspace_filename(filename: str) -> str:
@@ -111,12 +156,36 @@ def _legacy_skeleton(name: str) -> str:
     return step.lower()
 
 
+def normalize_handle(value: str) -> str:
+    """
+    A Handle in canonical form: "http://hdl.handle.net/<handle>", lower case.
+    Bare handles and the URL forms in HANDLE_RE are accepted. A value that is
+    not recognisable as a Handle is returned stripped, unchanged.
+    """
+    value = (value or "").strip()
+    match = HANDLE_RE.match(value)
+    if not match:
+        return value
+    return HANDLE_BASE_URL + match.group(1).lower()
+
+
+def is_handle_url(value: str) -> bool:
+    """True if value is a Handle URL (contains handle.net and normalizes to a Handle)."""
+    if not isinstance(value, str) or "handle.net" not in value.lower():
+        return False
+    return normalize_handle(value).startswith(HANDLE_BASE_URL)
+
+
 def build_handle_url(raw_handle: str) -> str:
-    """Prefix a bare handle (e.g. '10379/6474') with the HDL base URL."""
-    raw_handle = raw_handle.strip()
-    if raw_handle.startswith("http"):
-        return raw_handle
-    return HANDLE_BASE_URL + raw_handle
+    """Canonical Handle URL for a bare handle (e.g. '10379/6474') or a Handle URL."""
+    return normalize_handle(raw_handle)
+
+
+def bare_handle_of(handle_url: str) -> str:
+    """'http://hdl.handle.net/10379/6474' -> '10379/6474'."""
+    if handle_url.startswith(HANDLE_BASE_URL):
+        return handle_url[len(HANDLE_BASE_URL):]
+    return handle_url
 
 
 def parse_handles_arg(handles_arg: str | None) -> set[str]:
@@ -165,46 +234,131 @@ def extract_handles_from_xml_filter(xml_path: str) -> set[str]:
     return handles
 
 
-def load_csv_records(csv_path: str) -> tuple[dict[str, dict], dict[str, dict]]:
+def load_csv_records(csv_path: str) -> tuple[dict[str, dict], dict[str, dict], list[dict], int]:
+    """
+    Read the DSpace CSV.
+
+    Returns (by_handle, by_uuid, rows, handle_collisions):
+      by_handle  canonical Handle URL -> row
+      by_uuid    DSpace UUID (lower case) -> row
+      rows       every row that has a handle, in file order
+      handle_collisions  number of rows whose handle was already used by an
+                 earlier row (the later row wins in by_handle)
+    Rows without a handle value are ignored.
+    """
     by_handle: dict[str, dict] = {}
     by_uuid:   dict[str, dict] = {}
+    rows: list[dict] = []
+    collisions = 0
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            raw_handle = row.get("handle", "").strip()
+            raw_handle = (row.get("handle") or "").strip()
             if not raw_handle:
                 continue
             full_handle = build_handle_url(raw_handle)
+            if full_handle in by_handle:
+                collisions += 1
             by_handle[full_handle] = row
-            dspace_uuid = row.get("uuid", "").strip()
+            rows.append(row)
+            dspace_uuid = (row.get("uuid") or "").strip().lower()
             if dspace_uuid:
                 by_uuid[dspace_uuid] = row
-    return by_handle, by_uuid
+    return by_handle, by_uuid, rows, collisions
+
+
+# Identifier types that carry a record's DSpace UUID (idSource "DSpace"):
+# "PrimaryId" (written by match_records.py) and "Id" (Pure's import). PrimaryId
+# is checked first. Any other identifier type with idSource "DSpace" is still
+# read, after these two.
+DSPACE_ID_TYPES = ("PrimaryId", "Id")
+
+
+def extract_dspace_uuids_from_json_record(record: dict) -> list[str]:
+    """
+    All distinct DSpace UUIDs of a Pure record (identifiers with idSource
+    "DSpace", any case), lower case: those in "PrimaryId" identifiers first,
+    then "Id", then any other identifier type. A record should carry only
+    one (see record_dspace_uuid); the same UUID in both a PrimaryId and an
+    Id identifier counts once. (File UUIDs are not identifiers: each DSpace
+    file's own bitstream UUID is read from pdf_links, see
+    build_dspace_file_ids.)
+    """
+    found: dict[str, list[str]] = defaultdict(list)
+    for identifier in record.get("identifiers") or []:
+        if not isinstance(identifier, dict):
+            continue
+        if str(identifier.get("idSource") or "").strip().lower() != "dspace":
+            continue
+        value = str(identifier.get("value") or "").strip().lower()
+        if value:
+            found[str(identifier.get("typeDiscriminator") or "")].append(value)
+    order = list(DSPACE_ID_TYPES) + [t for t in found if t not in DSPACE_ID_TYPES]
+    uuids: list[str] = []
+    for id_type in order:
+        for value in found.get(id_type, []):
+            if value not in uuids:
+                uuids.append(value)
+    return uuids
+
+
+def record_dspace_uuid(record: dict) -> tuple[str | None, list[str]]:
+    """
+    (the record's DSpace UUID, all DSpace UUIDs it carries). A Pure record
+    belongs to ONE DSpace item: the PrimaryId's UUID if it has one, else the
+    first Id's. More than one distinct UUID is a data error -- only the first
+    is used, and the record is listed in the multiple_dspace_ids report.
+    """
+    uuids = extract_dspace_uuids_from_json_record(record)
+    return (uuids[0] if uuids else None), uuids
 
 
 def extract_dspace_uuid_from_json_record(record: dict) -> str | None:
-    for identifier in record.get("identifiers", []):
-        if identifier.get("idSource") == "DSpace":
-            value = identifier.get("value", "").strip()
-            if value:
-                return value
-    return None
+    """The record's DSpace UUID (see record_dspace_uuid; kept for compatibility)."""
+    return record_dspace_uuid(record)[0]
+
+
+_FRACTION_RE = re.compile(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$")
 
 
 def parse_iso_datetime(dt_string: str) -> datetime:
-    """Parse an ISO-8601 datetime string into a timezone-aware datetime object."""
-    dt_string = dt_string.rstrip("Z") + "+00:00"
-    return datetime.fromisoformat(dt_string)
+    """
+    Parse an ISO-8601 datetime string into a timezone-aware datetime.
+
+    Accepts an explicit offset ("+01:00"), "Z", or no offset at all (taken
+    as UTC), and fractional seconds of any length -- Pure writes e.g.
+    "2026-04-22T13:27:18.721+01:00". Works on Python 3.10+.
+    Raises ValueError for anything else.
+    """
+    if not isinstance(dt_string, str) or not dt_string.strip():
+        raise ValueError("empty datetime")
+    value = dt_string.strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    match = _FRACTION_RE.match(value)
+    if match:
+        fraction = (match.group(2) + "000000")[:6]
+        value = f"{match.group(1)}.{fraction}{match.group(3)}"
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def extract_handles_from_json_record(record: dict) -> list[str]:
-    """Return all Handle URLs found in the 'links' list of a JSON record."""
-    handles = []
-    for link in record.get("links", []):
-        if link.get("alias") == "Handle":
-            url = link.get("url", "").strip()
-            if url:
-                handles.append(url)
+    """
+    All Handles in the 'links' list of a Pure record, canonical form, in
+    order. Any link whose URL is a Handle counts, whatever its alias.
+    """
+    handles: list[str] = []
+    for link in record.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        url = (link.get("url") or "").strip()
+        if url and is_handle_url(url):
+            handle = normalize_handle(url)
+            if handle not in handles:
+                handles.append(handle)
     return handles
 
 
@@ -258,11 +412,10 @@ def build_dspace_file_ids(
     (Same ID construction as create_pure_xml.py's DSpace <file id="..."> values,
     which use "{handle}:{seq}/{bitstream_uuid}:{filename}".)
 
-    Iteration is driven by 'pdf_handle_paths' (semicolon-separated), exactly
-    as get_file_ids.py has always done, so every DSpace file entry is still
-    included even if 'pdf_links' is missing, shorter, or misaligned. The
-    matching entry (by index) in 'pdf_links' supplies the bitstream UUID
-    needed to build the full ID.
+    Iteration is driven by 'pdf_handle_paths' (semicolon-separated), so every
+    DSpace file entry is included even if 'pdf_links' is missing, shorter, or
+    misaligned. The matching entry (by index) in 'pdf_links' supplies the
+    bitstream UUID needed to build the full ID.
 
     Returns a pair of parallel lists:
         filenames — plain filenames, one per DSpace file (used for
@@ -281,8 +434,8 @@ def build_dspace_file_ids(
     for idx, raw_path in enumerate(raw_paths):
         sequence, filename = parse_pdf_handle_path(raw_path, handle)
         if not filename:
-            # Malformed entry: preserve the previous behaviour of using the
-            # raw path string as-is rather than dropping it.
+            # Malformed entry: use the raw path string as-is rather than
+            # dropping it.
             filename = raw_path
             sequence = "1"
         filenames.append(filename)
@@ -319,17 +472,82 @@ def extract_file_ids_from_pure_record(pure_record: dict) -> tuple[list, list, li
     file_ids      = []
     file_pure_ids = []
     file_names    = []
-    for ev in pure_record.get("electronicVersions", []):
-        if ev.get("typeDiscriminator") != "FileElectronicVersion":
+    for ev in pure_record.get("electronicVersions") or []:
+        if not isinstance(ev, dict) or ev.get("typeDiscriminator") != "FileElectronicVersion":
             continue
-        file_block = ev.get("file", {})
-        fid  = file_block.get("fileId", "")
-        fpid = str(file_block.get("pureId", ""))
-        fname = file_block.get("fileName", "")
-        file_ids.append(fid)
-        file_pure_ids.append(fpid)
+        file_block = ev.get("file") or {}
+        fid  = file_block.get("fileId", "") or ""
+        fpid = file_block.get("pureId", "")
+        fname = file_block.get("fileName", "") or ""
+        file_ids.append(str(fid))
+        file_pure_ids.append("" if fpid is None else str(fpid))
         file_names.append(fname)
     return file_ids, file_pure_ids, file_names
+
+
+def pair_dspace_and_pure_files(
+    dspace_filenames: list[str],
+    pure_file_names: list[str],
+) -> list[tuple[int | None, int | None, str]]:
+    """
+    Pair DSpace files with Pure FileElectronicVersions by filename, one to
+    one (a Pure file is never paired with two DSpace files).
+
+    Two passes, so a direct match is never taken away by a fallback match:
+      1. direct: the cleaned DSpace filename and the Pure fileName are equal
+         after pure_normalize_filename();
+      2. fallback, for the files still unpaired: equal after
+         _legacy_skeleton() (files uploaded under an old, mangled name).
+    When several Pure files share a normalized name (e.g. a duplicate
+    upload), the first unpaired one is used.
+
+    Returns a list of (dspace_index | None, pure_index | None, status), in
+    this order: matched pairs (in DSpace order), then unmatched DSpace files,
+    then unmatched Pure files. status is FILE_MATCHED, FILE_MATCHED_FALLBACK,
+    FILE_DSPACE_ONLY or FILE_PURE_ONLY.
+    """
+    def base_name(path: str) -> str:
+        return pure_normalize_filename(clean_dspace_filename(unquote(path.rstrip("/").split("/")[-1])))
+
+    direct_pure: dict[str, list[int]] = defaultdict(list)
+    legacy_pure: dict[str, list[int]] = defaultdict(list)
+    for i, fname in enumerate(pure_file_names):
+        direct_pure[pure_normalize_filename(fname)].append(i)
+        legacy_pure[_legacy_skeleton(fname)].append(i)
+
+    used_pure: set[int] = set()
+    partner: dict[int, tuple[int, str]] = {}
+
+    def take(candidates: list[int]) -> int | None:
+        for p_idx in candidates:
+            if p_idx not in used_pure:
+                used_pure.add(p_idx)
+                return p_idx
+        return None
+
+    for d_idx, dname in enumerate(dspace_filenames):
+        p_idx = take(direct_pure.get(base_name(dname), []))
+        if p_idx is not None:
+            partner[d_idx] = (p_idx, FILE_MATCHED)
+    for d_idx, dname in enumerate(dspace_filenames):
+        if d_idx in partner:
+            continue
+        p_idx = take(legacy_pure.get(_legacy_skeleton(dname.rstrip("/").split("/")[-1]), []))
+        if p_idx is not None:
+            partner[d_idx] = (p_idx, FILE_MATCHED_FALLBACK)
+
+    pairs: list[tuple[int | None, int | None, str]] = []
+    for d_idx in range(len(dspace_filenames)):
+        if d_idx in partner:
+            p_idx, status = partner[d_idx]
+            pairs.append((d_idx, p_idx, status))
+    for d_idx in range(len(dspace_filenames)):
+        if d_idx not in partner:
+            pairs.append((d_idx, None, FILE_DSPACE_ONLY))
+    for p_idx in range(len(pure_file_names)):
+        if p_idx not in used_pure:
+            pairs.append((None, p_idx, FILE_PURE_ONLY))
+    return pairs
 
 
 def match_dspace_to_pure_files(
@@ -337,51 +555,12 @@ def match_dspace_to_pure_files(
     pure_file_names: list[str],
 ) -> tuple[set[int], set[int]]:
     """
-    Attempt to pair each DSpace pdf_handle_path with a Pure FileElectronicVersion
-    by comparing normalized base filenames.
-
-    Returns a pair of index sets:
-        matched_dspace_indices  — indices into dspace_pdf_paths that found a Pure match
-        matched_pure_indices    — indices into pure_file_names that were matched
-
-    The caller is responsible for assembling output columns from the original lists
-    using these index sets. Unmatched entries from either side are preserved by the
-    caller so that no file information is ever silently dropped.
-
-    Matching is two-tier. The direct pure_normalize_filename() comparison
-    handles the normal case. Files uploaded before clean_dspace_filename()
-    existed can have a Pure-stored fileName that Pure itself already mangled
-    at storage time (e.g. "Me_769_liacin.pdf" for what should be
-    "Méliacin.pdf") -- clean_dspace_filename() can't reconcile that on its
-    own, since the literal HTML-entity markup is long gone by the time either
-    side reaches this function. For any DSpace path that doesn't find a
-    direct match, _legacy_skeleton() is tried as a fallback so those files
-    aren't wrongly reported as unmatched (or picked as the loser in
-    resolve_duplicates' scoring) just because of how they happened to get
-    uploaded.
+    Index sets of the DSpace files and Pure files that were paired
+    (see pair_dspace_and_pure_files). Kept for compatibility.
     """
-    def base_name(path: str) -> str:
-        return pure_normalize_filename(clean_dspace_filename(unquote(path.rstrip("/").split("/")[-1])))
-
-    # Build lookups: normalized Pure filename -> Pure index, both tiers.
-    norm_pure: dict[str, int] = {}
-    legacy_pure: dict[str, int] = {}
-    for i, fname in enumerate(pure_file_names):
-        norm_pure[pure_normalize_filename(fname)] = i
-        legacy_pure.setdefault(_legacy_skeleton(fname), i)
-
-    matched_dspace_indices: set[int] = set()
-    matched_pure_indices:   set[int] = set()
-
-    for d_idx, dpath in enumerate(dspace_pdf_paths):
-        p_idx = norm_pure.get(base_name(dpath))
-        if p_idx is None:
-            p_idx = legacy_pure.get(_legacy_skeleton(dpath.rstrip("/").split("/")[-1]))
-        if p_idx is not None:
-            matched_dspace_indices.add(d_idx)
-            matched_pure_indices.add(p_idx)
-
-    return matched_dspace_indices, matched_pure_indices
+    pairs = pair_dspace_and_pure_files(dspace_pdf_paths, pure_file_names)
+    matched = [(d, p) for d, p, status in pairs if d is not None and p is not None]
+    return {d for d, _ in matched}, {p for _, p in matched}
 
 
 def filter_json_records(
@@ -410,45 +589,110 @@ def filter_json_records(
 
 
 def classify_file_match(
-    dspace_pdf_paths: list[str],
-    pure_fids: list[str],
-    matched_dspace_indices: set[int],
+    n_dspace: int,
+    n_pure: int,
+    n_matched: int,
 ) -> str:
     """
-    Derive the file_match_type label for a record.
+    Derive the file_match_type label for a record from the number of DSpace
+    files, Pure files and matched pairs.
 
-    Categories (evaluated in order):
-      "full_match"            — every DSpace PDF paired with a Pure file AND no Pure
-                          files are unmatched (counts on both sides are equal and
-                          all matched).
-      "partial_match"         — at least one DSpace PDF matched AND at least one did not.
-      "file_name_mismatch"   — both sides have files but zero filenames matched.
-      "dspace_only_pdf" — DSpace has files, Pure has none.
-      "pure_only_pdf"   — Pure has files, DSpace has none.
-      "no_pdf"          — neither side has files (no label needed).
+      "no_pdf"             — neither side has files.
+      "dspace_only_pdf"    — DSpace has files, Pure has none.
+      "pure_only_pdf"      — Pure has files, DSpace has none.
+      "file_name_mismatch" — both sides have files but none matched.
+      "full_match"         — every DSpace file AND every Pure file is in a
+                             matched pair.
+      "partial_match"      — at least one pair matched, but at least one file
+                             on either side is unmatched (including extra
+                             Pure files when every DSpace file matched).
     """
-    has_dspace = bool(dspace_pdf_paths)
-    has_pure   = bool(pure_fids)
-
-    if not has_dspace and not has_pure:
+    if not n_dspace and not n_pure:
         return "no_pdf"
-
-    if has_dspace and not has_pure:
+    if n_dspace and not n_pure:
         return "dspace_only_pdf"
-
-    if has_pure and not has_dspace:
+    if n_pure and not n_dspace:
         return "pure_only_pdf"
-
-    # Both sides have files — examine match coverage
-    n_dspace_matched = len(matched_dspace_indices)
-
-    if n_dspace_matched == 0:
+    if n_matched == 0:
         return "file_name_mismatch"
-
-    if n_dspace_matched == len(dspace_pdf_paths):
+    if n_matched == n_dspace and n_matched == n_pure:
         return "full_match"
-
     return "partial_match"
+
+
+def _build_rows_for_pair(
+    csv_rec: dict,
+    json_rec: dict,
+    handle_url: str,
+) -> tuple[dict, list[dict]]:
+    """Record-level row and file-level rows for one DSpace item / Pure record pair."""
+    dspace_uuid = (csv_rec.get("uuid") or "").strip()
+    pure_uuid   = json_rec.get("uuid", "") or ""
+    pure_id     = str(json_rec.get("pureId", "") or "")
+    title_obj   = json_rec.get("title", {})
+    title       = title_obj.get("value", "").strip() if isinstance(title_obj, dict) else ""
+
+    # bare handle (no "http://hdl.handle.net/" prefix) is what DSpace file IDs
+    # are keyed on, same as create_pure_xml.py.
+    bare_handle = bare_handle_of(handle_url) if handle_url else (csv_rec.get("handle") or "").strip()
+    dspace_names, dspace_ids = build_dspace_file_ids(
+        (csv_rec.get("pdf_handle_paths") or "").strip(),
+        (csv_rec.get("pdf_links") or "").strip(),
+        bare_handle,
+    )
+    pure_fids, pure_fpids, pure_fnames = extract_file_ids_from_pure_record(json_rec)
+
+    pairs = pair_dspace_and_pure_files(dspace_names, pure_fnames) if (dspace_names or pure_fnames) else []
+    n_matched = sum(1 for d, p, _ in pairs if d is not None and p is not None)
+    file_match_type = classify_file_match(len(dspace_names), len(pure_fids), n_matched)
+
+    common = {
+        "dspace_uuid": dspace_uuid,
+        "pure_uuid":   pure_uuid,
+        "pure_id":     pure_id,
+        "title":       title,
+    }
+
+    # Record level: lists in pair order, so the matched files line up.
+    d_order = [d for d, _, _ in pairs if d is not None]
+    p_order = [p for _, p, _ in pairs if p is not None]
+    record_row = dict(
+        common,
+        dspace_file_id="; ".join(dspace_ids[d] for d in d_order),
+        pure_file_id="; ".join(pure_fids[p] for p in p_order),
+        pure_file_pure_id="; ".join(pure_fpids[p] for p in p_order),
+        pure_file_name="; ".join(pure_fnames[p] for p in p_order),
+        file_match_type=file_match_type,
+        handle=handle_url,
+        # Internal fields used for duplicate scoring; not written out.
+        _modified_date=json_rec.get("modifiedDate", ""),
+        _n_matched=n_matched,
+        _n_pure=len(pure_fids),
+    )
+
+    # File level: one row per pair; a record without files gets one row.
+    file_rows: list[dict] = []
+    for d, p, status in pairs:
+        file_rows.append(dict(
+            common,
+            dspace_file_id=dspace_ids[d] if d is not None else "",
+            pure_file_id=pure_fids[p] if p is not None else "",
+            pure_file_pure_id=pure_fpids[p] if p is not None else "",
+            pure_file_name=pure_fnames[p] if p is not None else "",
+            file_match=status,
+            file_match_type=file_match_type,
+            handle=handle_url,
+        ))
+    if not file_rows:
+        file_rows.append(dict(
+            common,
+            dspace_file_id="", pure_file_id="", pure_file_pure_id="", pure_file_name="",
+            file_match=FILE_NO_FILES,
+            file_match_type=file_match_type,
+            handle=handle_url,
+        ))
+    record_row["_file_rows"] = file_rows
+    return record_row, file_rows
 
 
 def match_records(
@@ -457,135 +701,144 @@ def match_records(
     json_records: list[dict],
     pdf_filter: str = "all",
     handle_filter: set[str] | None = None,
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[dict], int, int, dict]:
     """
-    Match JSON records against CSV records by DSpace UUID first, falling back
-    to Handle URL if no UUID match is found.
-    Collects file IDs from both DSpace (pdf_handle_paths) and Pure
-    (FileElectronicVersions). Multiple values are joined with '; '.
+    Match Pure JSON records against DSpace CSV records:
 
-    All DSpace paths and all Pure files are always written to the output row
-    regardless of whether their filenames matched, so no file information is
-    silently dropped.
+      1. by the record's DSpace UUID (record_dspace_uuid: the PrimaryId
+         identifier's, else the Id identifier's; case-insensitive);
+      2. only if that UUID isn't in the CSV (or the record has none): by
+         Handle -- the first link on the Pure record whose URL is a Handle
+         of an item in the CSV, in any of the accepted forms.
+
+    A Pure record belongs to ONE DSpace item, so it produces at most one row.
+    A record carrying several distinct DSpace UUIDs, or (when matched by
+    Handle) Handles of several CSV items, is listed in
+    info["multiple_dspace_ids"]; only the identifier above is used.
 
     pdf_filter controls which matched records are included:
       'all'                — include every matched record (default)
-      'full_match'         — only records where every DSpace PDF has a matching Pure file
-      'partial_match'      — only records where at least one DSpace PDF matched
-                             AND at least one did not
+      'full_match'         — every DSpace file and every Pure file is in a matched pair
+      'partial_match'      — at least one pair matched, but some file on either side did not
       'file_name_mismatch' — both sides have files but no filenames matched
       'dspace_only_pdf'    — DSpace has files, Pure has none
       'pure_only_pdf'      — Pure has files, DSpace has none
-      'no_pdf'             — only records where neither DSpace nor Pure have any files
+      'no_pdf'             — neither DSpace nor Pure have any files
 
     handle_filter, if not None, restricts output to records whose matched
     Handle URL is in the set (built from --handles and/or --xml-filter).
-    Pass None to disable handle filtering entirely.
 
-    Returns (output_rows, skipped_count, filtered_out_count).
+    Returns (output_rows, skipped_count, filtered_out_count, info):
+      info["linked_dspace_uuids"]  DSpace UUIDs (lower case) that some Pure
+                                   record links to (before the Handle / PDF
+                                   filters)
+      info["unmatched_pure"]       Pure records that carry a DSpace UUID or a
+                                   Handle, none of which is in the CSV
+      info["no_dspace_link"]       number of Pure records with neither
+      info["multiple_dspace_ids"]  Pure records with 2+ distinct DSpace UUIDs,
+                                   or matched by Handle with Handles of 2+
+                                   CSV items (only one is used)
     """
     output_rows = []
     skipped = 0
     filtered_out = 0
+    linked_dspace_uuids: set[str] = set()
+    unmatched_pure: list[dict] = []
+    no_dspace_link = 0
+    multiple_dspace_ids: list[dict] = []
 
     for json_rec in json_records:
-        # --- Priority 1: match by DSpace UUID ---
-        csv_rec    = None
-        handle_url = None
+        record_uuid, dspace_uuids = record_dspace_uuid(json_rec)
+        pure_handles = extract_handles_from_json_record(json_rec)
 
-        dspace_uuid_from_pure = extract_dspace_uuid_from_json_record(json_rec)
-        if dspace_uuid_from_pure and dspace_uuid_from_pure in csv_by_uuid:
-            csv_rec = csv_by_uuid[dspace_uuid_from_pure]
-            raw_handle = csv_rec.get("handle", "").strip()
-            handle_url = build_handle_url(raw_handle) if raw_handle else ""
+        # --- 1. The record's DSpace UUID ---
+        matches: list[tuple[dict, str]] = []
+        problem = ""
+        csv_rec = csv_by_uuid.get(record_uuid) if record_uuid else None
+        if csv_rec is not None:
+            matches.append((csv_rec, build_handle_url(csv_rec.get("handle", ""))))
 
-        # --- Priority 2: fall back to Handle ---
-        if csv_rec is None:
-            for url in extract_handles_from_json_record(json_rec):
-                if url in csv_by_handle:
-                    csv_rec    = csv_by_handle[url]
-                    handle_url = url
-                    break
+        # --- 2. Handle (only if the DSpace UUID didn't match) ---
+        if not matches:
+            handle_items: list[tuple[dict, str]] = []
+            for handle in pure_handles:
+                h_rec = csv_by_handle.get(handle)
+                if h_rec is not None and all(h_rec is not r for r, _ in handle_items):
+                    handle_items.append((h_rec, handle))
+            if handle_items:
+                matches.append(handle_items[0])
+                if len(handle_items) > 1:
+                    problem = "Handles of several DSpace items in the CSV"
+                    # The other Handles still point at DSpace items: not reported as unlinked.
+                    for other_rec, _ in handle_items[1:]:
+                        linked_dspace_uuids.add((other_rec.get("uuid") or "").strip().lower())
 
-        if csv_rec is None:
+        if len(dspace_uuids) > 1:
+            problem = "; ".join(p for p in ("several DSpace UUIDs", problem) if p)
+            # The other UUIDs still point at DSpace items: not reported as unlinked.
+            for other in dspace_uuids:
+                other_rec = csv_by_uuid.get(other)
+                if other_rec is not None:
+                    linked_dspace_uuids.add((other_rec.get("uuid") or "").strip().lower())
+        if problem:
+            title_obj = json_rec.get("title", {})
+            used_rec, used_handle = matches[0] if matches else (None, "")
+            multiple_dspace_ids.append({
+                "pure_uuid": json_rec.get("uuid", "") or "",
+                "pure_id": str(json_rec.get("pureId", "") or ""),
+                "title": title_obj.get("value", "").strip() if isinstance(title_obj, dict) else "",
+                "dspace_uuids": "; ".join(dspace_uuids),
+                "handles": "; ".join(pure_handles),
+                "used_dspace_uuid": (used_rec.get("uuid") or "").strip() if used_rec else "",
+                "used_handle": used_handle,
+                "problem": problem,
+            })
+
+        if not matches:
+            if dspace_uuids or pure_handles:
+                title_obj = json_rec.get("title", {})
+                unmatched_pure.append({
+                    "pure_uuid": json_rec.get("uuid", "") or "",
+                    "pure_id": str(json_rec.get("pureId", "") or ""),
+                    "title": title_obj.get("value", "").strip() if isinstance(title_obj, dict) else "",
+                    "dspace_uuids": "; ".join(dspace_uuids),
+                    "handles": "; ".join(pure_handles),
+                    "reason": ("DSpace UUID(s) and Handle(s) not in the CSV" if dspace_uuids and pure_handles
+                               else "DSpace UUID(s) not in the CSV" if dspace_uuids
+                               else "Handle(s) not in the CSV"),
+                })
+            else:
+                no_dspace_link += 1
             continue
 
-        # --- Apply Handle filter (--handles / --xml-filter) ---
-        if handle_filter is not None and handle_url not in handle_filter:
-            filtered_out += 1
-            continue
+        for csv_rec, handle_url in matches:
+            linked_dspace_uuids.add((csv_rec.get("uuid") or "").strip().lower())
 
-        # --- Core identifiers ---
-        dspace_uuid = csv_rec.get("uuid", "").strip()
-        pure_uuid   = json_rec.get("uuid", "")
-        pure_id     = str(json_rec.get("pureId", ""))
-        title_obj   = json_rec.get("title", {})
-        title       = (
-            title_obj.get("value", "").strip()
-            if isinstance(title_obj, dict) else ""
-        )
-
-        # --- DSpace file paths (all of them, unconditionally) ---
-        # bare_handle (no "http://hdl.handle.net/" prefix) is what DSpace
-        # file IDs are keyed on, same as create_pure_xml.py.
-        bare_handle = csv_rec.get("handle", "").strip()
-        pdf_handle_paths_raw = csv_rec.get("pdf_handle_paths", "").strip()
-        pdf_links_raw = csv_rec.get("pdf_links", "").strip()
-
-        # dspace_pdf_paths: plain filenames, used for filename-based matching
-        #                   against Pure files (unchanged from before).
-        # dspace_file_ids:  full "{handle}:{seq}/{file uuid}:{filename}" IDs,
-        #                   used for the output "dspace_file_id" column.
-        dspace_pdf_paths, dspace_file_ids = build_dspace_file_ids(
-            pdf_handle_paths_raw, pdf_links_raw, bare_handle
-        )
-
-        # --- Pure file metadata (all of them, unconditionally) ---
-        pure_fids, pure_fpids, pure_fnames = extract_file_ids_from_pure_record(json_rec)
-
-        # --- Attempt filename-based pairing ---
-        if dspace_pdf_paths and pure_fids:
-            matched_dspace_idx, _ = match_dspace_to_pure_files(
-                dspace_pdf_paths, pure_fnames
-            )
-        else:
-            matched_dspace_idx = set()
-
-        # --- Classify ---
-        file_match_type = classify_file_match(
-            dspace_pdf_paths, pure_fids, matched_dspace_idx
-        )
-
-        # --- Apply PDF filter ---
-        if pdf_filter != "all":
-            if file_match_type != pdf_filter:
+            # --- Apply Handle filter (--handles / --xml-filter) ---
+            if handle_filter is not None and handle_url not in handle_filter:
+                filtered_out += 1
                 continue
 
-        # --- Build output row — always emit ALL paths and ALL Pure files ---
-        row = {
-            "dspace_uuid":       dspace_uuid,
-            "pure_uuid":         pure_uuid,
-            "pure_id":           pure_id,
-            "title":             title,
-            "dspace_file_id":    "; ".join(dspace_file_ids),
-            "pure_file_id":      "; ".join(pure_fids),
-            "pure_file_pure_id": "; ".join(pure_fpids),
-            "pure_file_name":    "; ".join(pure_fnames),
-            "file_match_type":   file_match_type,
-            "handle":            handle_url,
-            # Internal fields used for duplicate scoring; stripped before CSV output.
-            "_modified_date":    json_rec.get("modifiedDate", ""),
-            "_dspace_filenames": "; ".join(dspace_pdf_paths),
-        }
+            row, _ = _build_rows_for_pair(csv_rec, json_rec, handle_url)
 
-        # Require at minimum the four core identifiers to be non-empty
-        core_fields = ("dspace_uuid", "pure_uuid", "pure_id", "handle")
-        if all(str(row[f]).strip() for f in core_fields):
-            output_rows.append(row)
-        else:
-            skipped += 1
+            # --- Apply PDF filter ---
+            if pdf_filter != "all" and row["file_match_type"] != pdf_filter:
+                continue
 
-    return output_rows, skipped, filtered_out
+            # Require at minimum the four core identifiers to be non-empty
+            core_fields = ("dspace_uuid", "pure_uuid", "pure_id", "handle")
+            if all(str(row[f]).strip() for f in core_fields):
+                output_rows.append(row)
+            else:
+                skipped += 1
+
+    info = {
+        "linked_dspace_uuids": linked_dspace_uuids,
+        "unmatched_pure": unmatched_pure,
+        "no_dspace_link": no_dspace_link,
+        "multiple_dspace_ids": multiple_dspace_ids,
+    }
+    return output_rows, skipped, filtered_out, info
 
 
 def _score_row(row: dict) -> tuple:
@@ -593,167 +846,147 @@ def _score_row(row: dict) -> tuple:
     Return a sort key for a candidate row (higher = better).
 
     Priority (all descending):
-      1. Number of DSpace filenames that matched a Pure filename
-         (derived from file_match_type and the file lists).
+      1. Number of matched DSpace/Pure file pairs.
       2. Total number of Pure files.
-      3. Tie-breaker: most recently modified (modifiedDate from the Pure record).
-
-    For criterion 1 we re-derive the matched count cheaply from the already-
-    computed file_match_type and the semicolon-separated file lists rather than
-    re-running the full matching logic.
-
-    Note: matching is done on plain DSpace filenames (the internal
-    '_dspace_filenames' field), not on 'dspace_file_id', since the latter
-    now holds the full "{handle}:{seq}/{file uuid}:{filename}" identifier
-    rather than a bare filename.
+      3. Tie-breaker: most recently modified (modifiedDate from the Pure record);
+         a missing or unparseable date ranks lowest.
     """
-    fmt = row.get("file_match_type", "")
-    dspace_filenames = [f for f in row.get("_dspace_filenames", "").split(";") if f.strip()]
-    pure_files       = [f for f in row.get("pure_file_id",      "").split(";") if f.strip()]
-    n_pure           = len(pure_files)
-
-    # With an exact recount:
-    if fmt in ("full_match", "partial_match"):
-        pure_names = [f.strip() for f in row.get("pure_file_name", "").split(";") if f.strip()]
-        _, matched_pure = match_dspace_to_pure_files(dspace_filenames, pure_names)
-        n_matched = len(matched_pure)
-    else:
-        n_matched = 0
-
     try:
         modified_dt = parse_iso_datetime(row.get("_modified_date", ""))
     except (ValueError, TypeError):
         modified_dt = datetime.min.replace(tzinfo=timezone.utc)
+    return (row.get("_n_matched", 0), row.get("_n_pure", 0), modified_dt)
 
-    return (n_matched, n_pure, modified_dt)
+
+def _row_key(row: dict) -> tuple[str, str]:
+    """A row is one (Pure record, DSpace item) pair."""
+    return row["pure_uuid"], row["dspace_uuid"]
 
 
 def resolve_duplicates(
     output_rows: list[dict],
 ) -> tuple[list[dict], list[dict], dict[str, list[dict]]]:
     """
-    Detect rows where the same handle or dspace_uuid maps to more than one
-    pure_uuid, select the best candidate for the main output, and collect all
-    candidates (winners and losers alike) for the duplicates file.
+    Detect rows where the same dspace_uuid or handle maps to more than one
+    Pure record, select the best candidate for the main output, and collect
+    all candidates (winners and losers alike) for the duplicates file.
 
     Selection criteria (descending priority):
-      1. Most DSpace filenames that matched a Pure filename.
+      1. Most matched DSpace/Pure file pairs.
       2. Most Pure files in total.
-      3. Most recently modified Pure record (tie-breaker for determinism).
+      3. Most recently modified Pure record.
+
+    Rows are identified by (pure_uuid, dspace_uuid), so a Pure record that is
+    linked to two different DSpace items keeps a row for each.
 
     Returns:
-        deduplicated_rows  — one row per unique (handle, dspace_uuid) pair;
-                             only the winner of each collision group is kept
-        duplicate_rows     — every row involved in any collision (winners and
-                             losers), each annotated with a 'duplicate_key'
-                             column showing which key triggered the group;
-                             preferred key is dspace_uuid, falling back to
-                             handle when no dspace_uuid collision exists
-        duplicate_groups   — raw dict keyed by collision key, for warning output
+        deduplicated_rows  — the main output: losers removed
+        duplicate_rows     — every row involved in any collision, annotated
+                             with a 'duplicate_key' column (dspace_uuid
+                             preferred, handle as fallback)
+        duplicate_groups   — dict keyed by collision key, for warning output
     """
-    # Group by dspace_uuid first (preferred key), then by handle (fallback).
     by_dspace_uuid: dict[str, list[dict]] = defaultdict(list)
     by_handle:      dict[str, list[dict]] = defaultdict(list)
-
     for row in output_rows:
-        by_dspace_uuid[row["dspace_uuid"]].append(row)
+        by_dspace_uuid[row["dspace_uuid"].lower()].append(row)
         by_handle[row["handle"]].append(row)
 
-    # pure_uuids involved in any collision, mapped to the winner of their group.
-    to_remove:   set[str]        = set()  # losers — dropped from main output
-
+    to_remove: set[tuple[str, str]] = set()
     duplicate_groups: dict[str, list[dict]] = {}
-    # pure_uuid → annotated duplicate row; built with dspace_uuid key preferred.
-    dup_by_pure_uuid: dict[str, dict] = {}
+    dup_by_key: dict[tuple[str, str], dict] = {}
+
+    reported_sets: set[frozenset] = set()
 
     def _process_group(key: str, rows: list[dict], prefer: bool) -> None:
-        """
-        Register a collision group.
-
-        prefer=True  — dspace_uuid pass: always record/overwrite the annotated
-                       row for each pure_uuid in this group (preferred key).
-        prefer=False — handle pass: only record if this pure_uuid has not yet
-                       been annotated by a dspace_uuid group (fallback key).
-        """
-        if len(rows) < 2:
+        if len({r["pure_uuid"] for r in rows}) < 2:
             return
+        row_set = frozenset(_row_key(r) for r in rows)
+        if row_set in reported_sets:
+            # Same collision already found under the other key (the DSpace
+            # UUID and the Handle of one item) -- reported once.
+            return
+        reported_sets.add(row_set)
         duplicate_groups[key] = rows
         winner = max(rows, key=_score_row)
         for row in rows:
-            uid = row["pure_uuid"]
-            annotated = dict(row, duplicate_key=key)
-            if prefer or uid not in dup_by_pure_uuid:
-                dup_by_pure_uuid[uid] = annotated
+            rk = _row_key(row)
+            if prefer or rk not in dup_by_key:
+                dup_by_key[rk] = dict(row, duplicate_key=key)
             if row["pure_uuid"] != winner["pure_uuid"]:
-                to_remove.add(uid)
+                to_remove.add(rk)
 
-    # dspace_uuid pass first — these entries take priority in the duplicates file.
     for key, rows in by_dspace_uuid.items():
         _process_group(key, rows, prefer=True)
-    # handle pass — fills in any pure_uuid not already covered above.
     for key, rows in by_handle.items():
         _process_group(key, rows, prefer=False)
 
-    # Preserve insertion order of output_rows in the duplicates file.
-    duplicate_rows: list[dict] = [
-        dup_by_pure_uuid[row["pure_uuid"]]
-        for row in output_rows
-        if row["pure_uuid"] in dup_by_pure_uuid
-    ]
+    duplicate_rows = [dup_by_key[_row_key(r)] for r in output_rows if _row_key(r) in dup_by_key]
 
-    # Main output: one winner per collision group, all non-duplicate rows kept.
-    seen_winners: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     deduplicated: list[dict] = []
     for row in output_rows:
-        uid = row["pure_uuid"]
-        if uid in to_remove:
+        rk = _row_key(row)
+        if rk in to_remove or rk in seen:
             continue
-        if uid in seen_winners:
-            continue
-        seen_winners.add(uid)
+        seen.add(rk)
         deduplicated.append(row)
-
     return deduplicated, duplicate_rows, duplicate_groups
 
 
-def write_output(output_rows: list[dict], output_path: str) -> None:
-    """Write matched records to a CSV file."""
-    fieldnames = [
-        "dspace_uuid", "pure_uuid", "pure_id", "title",
-        "dspace_file_id", "pure_file_id", "pure_file_pure_id", "pure_file_name",
-        "file_match_type", "handle",
-    ]
-    with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+RECORD_FIELDS = [
+    "dspace_uuid", "pure_uuid", "pure_id", "title",
+    "dspace_file_id", "pure_file_id", "pure_file_pure_id", "pure_file_name",
+    "file_match_type", "handle",
+]
+FILE_FIELDS = [
+    "dspace_uuid", "pure_uuid", "pure_id", "title",
+    "dspace_file_id", "pure_file_id", "pure_file_pure_id", "pure_file_name",
+    "file_match", "file_match_type", "handle",
+]
+UNMATCHED_DSPACE_FIELDS = ["dspace_uuid", "handle", "title", "dc.type", "collection_names", "pdf_count"]
+UNMATCHED_PURE_FIELDS = ["pure_uuid", "pure_id", "title", "dspace_uuids", "handles", "reason"]
+MULTIPLE_IDS_FIELDS = ["pure_uuid", "pure_id", "title", "dspace_uuids", "handles",
+                       "used_dspace_uuid", "used_handle", "problem"]
+
+
+def _write_csv(rows: list[dict], fieldnames: list[str], output_path: str) -> None:
+    folder = os.path.dirname(output_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(output_path, "w", newline="", encoding=OUTPUT_ENCODING) as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for row in output_rows:
-            writer.writerow({k: row[k] for k in fieldnames})
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def write_output(output_rows: list[dict], output_path: str) -> None:
+    """Write the record-level output (one row per matched record)."""
+    _write_csv(output_rows, RECORD_FIELDS, output_path)
+
+
+def write_file_output(output_rows: list[dict], output_path: str) -> None:
+    """Write the file-level output (one row per file, DSpace and Pure files paired)."""
+    file_rows = [file_row for row in output_rows for file_row in row["_file_rows"]]
+    _write_csv(file_rows, FILE_FIELDS, output_path)
 
 
 def write_duplicates_output(duplicate_rows: list[dict], output_path: str) -> None:
     """
     Write all rows involved in duplicate collisions to a separate CSV.
-    Identical columns to the main output plus a leading 'duplicate_key' column
-    that shows which handle or dspace_uuid triggered the group.
+    Identical columns to the record-level output plus a leading
+    'duplicate_key' column that shows which dspace_uuid or handle triggered
+    the group.
     """
-    fieldnames = [
-        "duplicate_key",
-        "dspace_uuid", "pure_uuid", "pure_id", "title",
-        "dspace_file_id", "pure_file_id", "pure_file_pure_id", "pure_file_name",
-        "file_match_type", "handle",
-    ]
-    with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in duplicate_rows:
-            writer.writerow({k: row[k] for k in fieldnames})
+    _write_csv(duplicate_rows, ["duplicate_key"] + RECORD_FIELDS, output_path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Match DSpace CSV and Pure JSON records by Handle URL, "
-            "collecting file IDs from both systems."
+            "Match DSpace CSV and Pure JSON records (by DSpace UUID, then Handle), "
+            "pair their files, and write the identifiers per record and per file."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -775,9 +1008,10 @@ def parse_args() -> argparse.Namespace:
         default="./pure_temp/temp_test_matched_records.csv",
         metavar="OUTPUT_FILE",
         help=(
-            "Base path for the main output CSV (default: matched_records.csv). "
-            "Today's date (YYYY-MM-DD) is appended before the extension automatically. "
-            "The duplicates file is written alongside it as duplicate_<name>."
+            "Base path for the output CSVs (default: ./pure_temp/temp_test_matched_records.csv). "
+            "The --pdf-filter value is added as a prefix and today's date (YYYY-MM-DD) as a "
+            "suffix to the file name. The per-file, duplicates and unmatched files are written "
+            "alongside it."
         ),
     )
     parser.add_argument(
@@ -797,9 +1031,10 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Filter matched records by PDF match type: "
             "'all' includes every match (default); "
-            "'full_match' includes only records where every DSpace PDF matched a Pure file; "
-            "'partial_match' includes only records where at least one DSpace PDF matched "
-            "AND at least one did not; "
+            "'full_match' includes only records where every DSpace file and every Pure file "
+            "is in a matched pair; "
+            "'partial_match' includes only records where at least one pair matched but some "
+            "file on either side did not; "
             "'file_name_mismatch' includes only records where both sides have files but "
             "no filenames matched; "
             "'dspace_only_pdf' includes only records where DSpace has files but Pure does not; "
@@ -812,7 +1047,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="YYYY-MM-DD",
         help=(
-            "Only include JSON records modified strictly after this date "
+            "Only include JSON records modified after the start of this date (UTC) "
             "(e.g. '2025-01-01'). Filter is off by default."
         ),
     )
@@ -846,13 +1081,26 @@ def parse_args() -> argparse.Namespace:
 
 def _dated_path(path: str, date_str: str) -> str:
     """
-    Insert a YYYY-MM-DD suffix before the file extension.
+    Insert a YYYY-MM-DD suffix before the file extension (file name only,
+    never inside a folder name).
     e.g. "matched_records.csv" → "matched_records_2026-06-09.csv"
     """
-    if "." in path:
-        stem, ext = path.rsplit(".", 1)
-        return f"{stem}_{date_str}.{ext}"
-    return f"{path}_{date_str}"
+    folder, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    return os.path.join(folder, f"{stem}_{date_str}{ext}")
+
+
+def _output_path(base: str, prefix: str, insert: str, date_str: str) -> str:
+    """
+    Output file path from the --output base path: '<prefix><insert><name>' in
+    the same folder, dated. Works with '/' and (on Windows) '\\' separators.
+    """
+    folder, name = os.path.split(base)
+    return _dated_path(os.path.join(folder, f"{prefix}{insert}{name}"), date_str)
+
+
+def _pdf_count(row: dict) -> int:
+    return len([p for p in (row.get("pdf_handle_paths") or "").split(";") if p.strip()])
 
 
 def main() -> None:
@@ -875,15 +1123,19 @@ def main() -> None:
             sys.exit(1)
 
     print(f"Loading CSV from: {args.csv}")
-    csv_by_handle, csv_by_uuid = load_csv_records(args.csv)
+    csv_by_handle, csv_by_uuid, csv_rows, handle_collisions = load_csv_records(args.csv)
     print(f"  → {len(csv_by_handle)} records with Handles loaded.")
+    if handle_collisions:
+        print(f"  → WARNING: {handle_collisions} CSV row(s) repeat a Handle used by an earlier row "
+              f"(the later row is used for Handle matching).")
 
     print(f"Loading JSON from: {args.json}")
-    with open(args.json, encoding="utf-8") as fh:
+    with open(args.json, encoding="utf-8-sig") as fh:
         json_records: list[dict] = json.load(fh)
     print(f"  → {len(json_records)} records loaded.")
 
-    if args.modified_by or modified_after_dt:
+    json_filtered = bool(args.modified_by or modified_after_dt)
+    if json_filtered:
         json_records = filter_json_records(
             json_records,
             modified_by=args.modified_by,
@@ -906,8 +1158,8 @@ def main() -> None:
             handle_filter |= from_xml
         print(f"  → {len(handle_filter)} handle(s) in combined filter.")
 
-    print("Matching records by Handle…")
-    output_rows, skipped, filtered_out = match_records(
+    print("Matching records by DSpace UUID, then Handle…")
+    output_rows, skipped, filtered_out, info = match_records(
         csv_by_handle, csv_by_uuid, json_records,
         pdf_filter=args.pdf_filter,
         handle_filter=handle_filter,
@@ -917,13 +1169,17 @@ def main() -> None:
         print(f"  → {skipped} matched records skipped due to missing core fields.")
     if filtered_out:
         print(f"  → {filtered_out} matched records excluded by the Handle filter.")
+    if info["multiple_dspace_ids"]:
+        print(f"  → WARNING: {len(info['multiple_dspace_ids'])} Pure record(s) carry several DSpace UUIDs "
+              f"(or Handles of several DSpace items) — only one is used (PrimaryId first, then Id).")
+    print(f"  → {info['no_dspace_link']} Pure record(s) have no DSpace UUID or Handle (not DSpace records).")
 
     # --- Duplicate resolution ---
     output_rows, duplicate_rows, duplicate_groups = resolve_duplicates(output_rows)
 
     if duplicate_groups:
         print(f"  → WARNING: {len(duplicate_groups)} duplicate keys detected "
-              f"(same handle or dspace_uuid maps to multiple pure_uuids).")
+              f"(same dspace_uuid or handle maps to multiple Pure records).")
         for key, rows in duplicate_groups.items():
             winner = max(rows, key=_score_row)
             losers = [r for r in rows if r["pure_uuid"] != winner["pure_uuid"]]
@@ -934,20 +1190,76 @@ def main() -> None:
     else:
         print("  → No duplicates found.")
 
-    # --- Write outputs with pdf_filter prefix and date suffix ---
-    base_name  = args.output.rsplit("/", 1)[-1]           # strip any directory
-    base_dir   = args.output[: len(args.output) - len(base_name)]  # may be ""
-    prefix     = f"{args.pdf_filter}_"
+    # --- Unmatched reports ---
+    unmatched_pure = info["unmatched_pure"]
+    if handle_filter is not None:
+        unmatched_pure = [
+            r for r in unmatched_pure
+            if set(filter(None, r["handles"].split("; "))) & handle_filter
+        ]
+    unmatched_dspace: list[dict] | None
+    if json_filtered:
+        # With --modified-by / --modified-after only part of Pure is read,
+        # so "no Pure record links to it" would be meaningless.
+        unmatched_dspace = None
+    else:
+        unmatched_dspace = []
+        for row in csv_rows:
+            dspace_uuid = (row.get("uuid") or "").strip()
+            if dspace_uuid.lower() in info["linked_dspace_uuids"]:
+                continue
+            handle_url = build_handle_url(row.get("handle", ""))
+            if handle_filter is not None and handle_url not in handle_filter:
+                continue
+            unmatched_dspace.append({
+                "dspace_uuid": dspace_uuid,
+                "handle": handle_url,
+                "title": (row.get("dc.title") or "").strip(),
+                "dc.type": (row.get("dc.type") or "").strip(),
+                "collection_names": (row.get("collection_names") or "").strip(),
+                "pdf_count": _pdf_count(row),
+            })
 
-    main_output = _dated_path(f"{base_dir}{prefix}{base_name}", today)
-    dup_output  = _dated_path(f"{base_dir}{prefix}duplicate_{base_name}", today)
+    # --- Write outputs with pdf_filter prefix and date suffix ---
+    prefix = f"{args.pdf_filter}_"
+    main_output = _output_path(args.output, prefix, "", today)
+    file_output = _output_path(args.output, prefix, "per_file_", today)
+    dup_output = _output_path(args.output, prefix, "duplicate_", today)
+    unmatched_dspace_output = _output_path(args.output, "", "unmatched_dspace_", today)
+    unmatched_pure_output = _output_path(args.output, "", "unmatched_pure_", today)
+    multiple_ids_output = _output_path(args.output, "", "multiple_dspace_ids_", today)
 
     write_output(output_rows, main_output)
     print(f"Output written to: {main_output}")
 
+    write_file_output(output_rows, file_output)
+    n_file_rows = sum(len(r["_file_rows"]) for r in output_rows)
+    print(f"Per-file output written to: {file_output} ({n_file_rows} rows)")
+
     if duplicate_rows:
         write_duplicates_output(duplicate_rows, dup_output)
         print(f"Duplicates written to: {dup_output}")
+
+    if unmatched_dspace is None:
+        print("  → Unmatched DSpace report not written (--modified-by / --modified-after "
+              "limit the Pure records read).")
+    elif unmatched_dspace:
+        _write_csv(unmatched_dspace, UNMATCHED_DSPACE_FIELDS, unmatched_dspace_output)
+        print(f"DSpace items no Pure record links to: {len(unmatched_dspace)} → {unmatched_dspace_output}")
+    else:
+        print("  → Every DSpace item is linked to a Pure record.")
+
+    if unmatched_pure:
+        _write_csv(unmatched_pure, UNMATCHED_PURE_FIELDS, unmatched_pure_output)
+        print(f"Pure records whose DSpace UUID / Handle is not in the CSV: {len(unmatched_pure)} "
+              f"→ {unmatched_pure_output}")
+    else:
+        print("  → Every Pure record with a DSpace UUID or Handle was found in the CSV.")
+
+    if info["multiple_dspace_ids"]:
+        _write_csv(info["multiple_dspace_ids"], MULTIPLE_IDS_FIELDS, multiple_ids_output)
+        print(f"Pure records with several DSpace UUIDs / Handles: {len(info['multiple_dspace_ids'])} "
+              f"→ {multiple_ids_output}")
 
 
 if __name__ == "__main__":

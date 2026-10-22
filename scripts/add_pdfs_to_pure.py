@@ -297,32 +297,45 @@ def resolve_embargo_and_access(dspace_row: dict):
     return embargo_date_iso, embargo_active, embargo_period
 
 
+def find_existing_file_ev(pure_record: dict, file_names, file_size: int = None):
+    """
+    Return the FileElectronicVersion on the record that already holds this
+    DSpace file, or None if the file still has to be uploaded.
+
+    A Pure file is a candidate when same_file_name() matches its fileName
+    against any of `file_names` (ignoring case, accents and punctuation, and
+    recognising "_NNN_" garbled names). Every candidate is checked, not just
+    the first:
+      - DSpace size unknown            -> first candidate (name alone counts)
+      - a candidate with the same size -> that candidate
+      - a candidate with unknown size  -> that candidate (cannot be ruled out)
+      - every candidate has a known, different size -> None (upload)
+    """
+    names = [n for n in (file_names or []) if n]
+    candidates = [
+        ev for ev in pure_record.get("electronicVersions", []) or []
+        if isinstance(ev, dict)
+        and ev.get("typeDiscriminator") == "FileElectronicVersion"
+        and any(same_file_name((ev.get("file") or {}).get("fileName", ""), n) for n in names)
+    ]
+    if not candidates:
+        return None
+    if file_size is None:
+        return candidates[0]
+    for ev in candidates:
+        if known_file_size(ev) == file_size:
+            return ev
+    for ev in candidates:
+        if known_file_size(ev) is None:
+            return ev
+    return None
+
+
 def already_has_file_ev(pure_record: dict, file_name: str = None, file_size: int = None) -> bool:
-    """
-    Return True if the record already has a FileElectronicVersion whose fileName
-    matches file_name after Pure-style normalization. Size is only used to
-    disambiguate when both sides have a known value — if either is unknown,
-    the filename match alone is sufficient.
-    """
+    """True if the record already holds this file (see find_existing_file_ev)."""
     if file_name is None:
         return False
-
-    norm_name = pure_normalize_filename(file_name)
-
-    for ev in pure_record.get("electronicVersions", []):
-        if ev.get("typeDiscriminator") != "FileElectronicVersion":
-            continue
-        file_block = ev.get("file", {})
-        ev_name = file_block.get("fileName", "")
-        ev_size = file_block.get("size", -1)
-        if pure_normalize_filename(ev_name) != norm_name:
-            continue
-        # Normalized names match. Only reject if both sizes are known and differ.
-        if file_size is not None and ev_size != -1 and file_size != ev_size:
-            return False
-        return True
-
-    return False
+    return find_existing_file_ev(pure_record, [file_name], file_size) is not None
 
 
 def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
@@ -378,45 +391,151 @@ def needs_metadata_update(ev: dict, dspace_row: dict) -> tuple[bool, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Duplicate FileElectronicVersion resolution
+# Duplicate FileElectronicVersion detection and resolution
 # ---------------------------------------------------------------------------
+#
+# This block is IDENTICAL in add_pdfs_to_pure.py and patch_records.py, so the
+# upload script and the --patch-duplicate-files patch use one and the same
+# rule for (a) whether two files are the same file and (b) which copy of a
+# duplicate stays. Change it in both scripts together.
+#
+# Two FileElectronicVersions are duplicates when
+#   - both sizes are known and identical, and
+#   - their file names are the same file name (same_file_name), checked twice:
+#       1. exact match after loose normalisation (file_name_key): HTML-entity
+#          decoding, Unicode NFKC, accents removed, Pure's own punctuation
+#          replacement, lower case. "Paper.PDF" = "paper.pdf",
+#          "Résumé.pdf" = "Resume.pdf", "a,b.pdf" = "a_b.pdf".
+#       2. as a garbled name (is_garbled_copy_of): Pure stores an un-decoded
+#          "&#769;" as "_769_", so "Me_769_liacin.pdf" is a garbled copy of
+#          "Méliacin.pdf". Every name containing a number between
+#          underscores is checked both ways, so "Smith_2019_final.pdf" twice
+#          is still an exact match.
+# Other metadata (licence, version type, access type, embargo, storage
+# location, creator) does not matter for deciding that two files are
+# duplicates; it only decides which copy stays (choose_file_version_to_keep).
 
-# Fields checked when scoring how "complete" a FileElectronicVersion's own
-# metadata is (not the nested file block, which is identical across true
-# duplicates by definition — same fileName + size).
 FILE_EV_METADATA_FIELDS = (
-    "licenseType", "accessType", "versionType", "visibleOnPortalDate",
+    "accessType", "licenseType", "versionType", "visibleOnPortalDate",
     "embargoPeriod", "title",
 )
 
+# Creator values treated as system/import accounts rather than real Pure users.
+SYSTEM_CREATORS = {"root", "atira", "sync_user", "admin", "system", ""}
 
-def find_duplicate_file_groups(pure_record: dict) -> dict:
-    """
-    Group a record's FileElectronicVersions by (fileName, size).
-    Returns {(fileName, size): [ev, ev, ...]} for groups with more than
-    one entry — i.e. only the genuine duplicates, keyed by object identity
-    so callers can safely tell entries apart even when every other field
-    (including fileName/size) is identical.
-    """
-    groups = defaultdict(list)
-    for ev in pure_record.get("electronicVersions", []):
-        if ev.get("typeDiscriminator") != "FileElectronicVersion":
-            continue
-        file_block = ev.get("file") or {}
-        file_name = file_block.get("fileName")
-        if not file_name:
-            continue
-        key = (file_name, file_block.get("size"))
-        groups[key].append(ev)
+OPEN_ACCESS_URI = "/dk/atira/pure/core/openaccesspermission/open"
 
-    return {key: evs for key, evs in groups.items() if len(evs) > 1}
+# A run of 2-6 digits between underscores: what Pure's storage-time filename
+# normalisation leaves of a literal, un-decoded HTML character reference
+# ("&#769;" -> "_769_"; "&" and ";" become "_", the digits survive).
+ENTITY_DIGIT_RUN_RE = re.compile(r'_\d{2,6}_')
+
+
+def _dedup_clean_name(name: str) -> str:
+    """HTML-entity decoding + NFKC (as clean_dspace_filename)."""
+    if not name:
+        return ""
+    return unicodedata.normalize("NFKC", html.unescape(name))
+
+
+def _dedup_strip_accents(name: str) -> str:
+    """Decompose accented characters and drop the combining marks ("é" -> "e")."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _dedup_drop_accented_letters(name: str) -> str:
+    """Drop every accented letter entirely ("Méliacin" -> "Mliacin")."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    out = []
+    for c in decomposed:
+        if unicodedata.combining(c):
+            if out:
+                out.pop()   # the base letter the mark belongs to
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+def _dedup_pure_punctuation(name: str) -> str:
+    """Pure replaces characters that are not alphanumeric, '-', '_', '.' or space with '_'."""
+    return re.sub(r'[^\w.\- ]', '_', name)
+
+
+def file_name_key(name: str) -> str:
+    """Loose comparison key for a file name (check 1, exact match)."""
+    step = _dedup_clean_name(name)
+    step = _dedup_strip_accents(step)
+    step = _dedup_pure_punctuation(step)
+    return step.lower()
+
+
+def accented_letter_count(name: str) -> int:
+    """Number of accented letters in a name (after entity decoding)."""
+    decomposed = unicodedata.normalize("NFKD", _dedup_clean_name(name))
+    return sum(1 for c in decomposed if unicodedata.combining(c))
+
+
+def is_garbled_copy_of(garbled: str, clean: str) -> bool:
+    """
+    True if `garbled` is `clean` with its accented letters turned into
+    "_NNN_" runs (check 2). Pure leaves "_NNN_" both for a combining mark
+    ("Me&#769;liacin" -> "Me_769_liacin", base letter kept) and for a
+    precomposed letter ("M&#233;liacin" -> "M_233_liacin", letter gone), so
+    both forms are compared. Plausibility: `clean` must have at least as many
+    accented letters as `garbled` has "_NNN_" runs (each run replaces one
+    accented letter), so an ordinary number in a name ("Report_2024_.pdf")
+    is never read as garbling of an unrelated file without accents.
+    """
+    if not garbled or not clean:
+        return False
+    garbled_clean = _dedup_clean_name(garbled)
+    runs = len(ENTITY_DIGIT_RUN_RE.findall(garbled_clean))
+    if runs == 0:
+        return False
+    if accented_letter_count(clean) < runs:
+        return False
+    garbled_key = _dedup_pure_punctuation(
+        ENTITY_DIGIT_RUN_RE.sub("", _dedup_strip_accents(garbled_clean))
+    ).lower()
+    clean_clean = _dedup_clean_name(clean)
+    candidates = {
+        _dedup_pure_punctuation(_dedup_strip_accents(clean_clean)).lower(),
+        _dedup_pure_punctuation(_dedup_drop_accented_letters(clean_clean)).lower(),
+    }
+    return garbled_key in candidates
+
+
+def same_file_name(name_a: str, name_b: str) -> bool:
+    """True if two file names name the same file (exact or garbled match)."""
+    if not name_a or not name_b:
+        return False
+    if file_name_key(name_a) == file_name_key(name_b):
+        return True
+    return is_garbled_copy_of(name_a, name_b) or is_garbled_copy_of(name_b, name_a)
+
+
+def is_garbled_file_name(name: str) -> bool:
+    """True if a name still carries literal "&#NNN;" markup. (A "_NNN_" run on
+    its own is not proof of garbling; it is only judged against a sibling in
+    is_garbled_copy_of.)"""
+    return bool(name) and _dedup_clean_name(name) != unicodedata.normalize("NFKC", name)
+
+
+def known_file_size(ev: dict):
+    """The file's size as an int, or None if unknown (missing, null, -1, not a number)."""
+    size = (ev.get("file") or {}).get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return None
+    return size
+
+
+def is_open_access_ev(ev: dict) -> bool:
+    return ((ev.get("accessType") or {}).get("uri") or "") == OPEN_ACCESS_URI
 
 
 def metadata_completeness_score(ev: dict) -> int:
-    """
-    Count how many of FILE_EV_METADATA_FIELDS are meaningfully populated
-    on a FileElectronicVersion. Higher = more complete metadata.
-    """
+    """How many of FILE_EV_METADATA_FIELDS are meaningfully populated."""
     score = 0
     for field in FILE_EV_METADATA_FIELDS:
         value = ev.get(field)
@@ -428,37 +547,66 @@ def metadata_completeness_score(ev: dict) -> int:
     return score
 
 
-# Creator values treated as system/import accounts rather than real Pure users.
-SYSTEM_CREATORS = {"root", "atira", "sync_user", "admin", "system", ""}
-
-
 def is_uploaded_by_real_user(ev: dict) -> bool:
-    """
-    Heuristic: entries created by a known system/import account (see
-    SYSTEM_CREATORS) are treated as system/import uploads; any other
-    creator is treated as a real Pure user.
-    """
+    """Entries created by a known system/import account (SYSTEM_CREATORS) are
+    system/import uploads; any other creator is a real Pure user."""
     creator = (ev.get("creator") or "").strip().lower()
     return creator not in SYSTEM_CREATORS
 
 
-def choose_duplicate_to_keep(duplicates: list) -> dict:
-    """
-    Given a list of FileElectronicVersion entries that are duplicates (same
-    fileName + size), choose which single entry to keep.
+def _ev_created_sort_value(ev: dict) -> float:
+    """Timestamp of ev['created'] (ISO 8601), or +inf if missing/unparsable."""
+    value = ev.get("created") or ""
+    if not value:
+        return float("inf")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        pass
+    match = re.match(r'^(.*?)(\.\d+)?([+-]\d{2}:\d{2})?$', text)
+    if not match:
+        return float("inf")
+    base, frac, offset = match.groups()
+    frac = "." + (frac[1:] + "000000")[:6] if frac else ""
+    try:
+        parsed = datetime.fromisoformat(f"{base}{frac}{offset or '+00:00'}")
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return float("inf")
 
-    Priority:
-      1. Most complete metadata (highest metadata_completeness_score).
-      2. Uploaded by a real Pure user rather than the root/import account.
-      3. Fallback: first entry in the record's original electronicVersions order.
+
+def choose_file_version_to_keep(duplicates: list) -> dict:
     """
+    Choose the single FileElectronicVersion to keep from a group of
+    duplicates (see find_duplicate_file_groups). Priority, each step only
+    breaking ties left by the previous one:
+      1. Open access (accessType "open") over any other access type.
+      2. Most complete metadata (metadata_completeness_score).
+      3. A clean file name over a garbled one ("_NNN_" / "&#NNN;" remnants).
+      4. Uploaded by a real Pure user rather than a system/import account.
+      5. Oldest (earliest 'created'; missing dates count as newest).
+      6. First in the record's electronicVersions order.
+    """
+    garbled_ids = set()
+    for ev in duplicates:
+        name = (ev.get("file") or {}).get("fileName", "")
+        if is_garbled_file_name(name) or any(
+            is_garbled_copy_of(name, (other.get("file") or {}).get("fileName", ""))
+            for other in duplicates if other is not ev
+        ):
+            garbled_ids.add(id(ev))
+
     best_ev = None
     best_key = None
     for idx, ev in enumerate(duplicates):
         key = (
+            1 if is_open_access_ev(ev) else 0,
             metadata_completeness_score(ev),
+            0 if id(ev) in garbled_ids else 1,
             1 if is_uploaded_by_real_user(ev) else 0,
-            -idx,  # earlier entries win ties (idx 0 sorts highest)
+            -_ev_created_sort_value(ev),
+            -idx,
         )
         if best_key is None or key > best_key:
             best_key = key
@@ -466,38 +614,74 @@ def choose_duplicate_to_keep(duplicates: list) -> dict:
     return best_ev
 
 
-def resolve_duplicate_file_versions(pure_record: dict) -> tuple[bool, list, list, dict]:
+def find_duplicate_file_groups(electronic_versions: list) -> list:
     """
-    Find and resolve duplicate FileElectronicVersions on a record, keeping
-    exactly one entry per (fileName, size) group per choose_duplicate_to_keep().
+    Group FileElectronicVersions that are the same file: both sizes known and
+    identical, and same_file_name. Grouping is transitive (A~B, B~C -> one
+    group). Returns a list of groups (lists of ev dicts, in record order)
+    with more than one entry. Entries without a file name or a known size
+    are never grouped.
+    """
+    files = [
+        ev for ev in (electronic_versions or [])
+        if isinstance(ev, dict)
+        and ev.get("typeDiscriminator") == "FileElectronicVersion"
+        and (ev.get("file") or {}).get("fileName")
+        and known_file_size(ev) is not None
+    ]
+    parent = list(range(len(files)))
 
-    Does NOT mutate pure_record — the caller decides whether/when to apply
-    the returned list. Returns (changed, deduped_versions, removed_evs, kept_by_group):
-      - changed: True if any duplicates were found and resolved
-      - deduped_versions: a new electronicVersions list with duplicates removed
-      - removed_evs: the FileElectronicVersion dicts that were dropped
-      - kept_by_group: {(fileName, size): kept_ev} for the groups that were deduped
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(files)):
+        name_i = files[i]["file"]["fileName"]
+        size_i = known_file_size(files[i])
+        for j in range(i + 1, len(files)):
+            if known_file_size(files[j]) != size_i:
+                continue
+            if same_file_name(name_i, files[j]["file"]["fileName"]):
+                parent[root(j)] = root(i)
+
+    groups = defaultdict(list)
+    for i, ev in enumerate(files):
+        groups[root(i)].append(ev)
+    return [evs for _, evs in sorted(groups.items()) if len(evs) > 1]
+
+
+def resolve_file_duplicates(electronic_versions: list) -> tuple:
     """
-    groups = find_duplicate_file_groups(pure_record)
+    Resolve every duplicate group to its keeper (choose_file_version_to_keep).
+    Does not mutate the input. Returns (changed, deduped_versions,
+    removed_evs, keeper_of), where keeper_of maps id(ev) -> kept ev for every
+    entry of every duplicate group (the keeper maps to itself).
+    """
+    electronic_versions = electronic_versions or []
+    groups = find_duplicate_file_groups(electronic_versions)
     if not groups:
-        return False, pure_record.get("electronicVersions", []), [], {}
+        return False, electronic_versions, [], {}
 
     to_remove_ids = set()
     removed = []
-    kept_by_group = {}
-    for key, evs in groups.items():
-        keeper = choose_duplicate_to_keep(evs)
-        kept_by_group[key] = keeper
+    keeper_of = {}
+    for evs in groups:
+        keeper = choose_file_version_to_keep(evs)
         for ev in evs:
+            keeper_of[id(ev)] = keeper
             if ev is not keeper:
                 to_remove_ids.add(id(ev))
                 removed.append(ev)
 
-    deduped_versions = [
-        ev for ev in pure_record.get("electronicVersions", [])
-        if id(ev) not in to_remove_ids
-    ]
-    return True, deduped_versions, removed, kept_by_group
+    deduped_versions = [ev for ev in electronic_versions if id(ev) not in to_remove_ids]
+    return True, deduped_versions, removed, keeper_of
+
+
+def resolve_duplicate_file_versions(pure_record: dict) -> tuple:
+    """Resolve the duplicate files of a whole record (see resolve_file_duplicates)."""
+    return resolve_file_duplicates(pure_record.get("electronicVersions", []))
 
 
 # ---------------------------------------------------------------------------
@@ -1105,12 +1289,12 @@ def get_file_info(
     base_url: str,
     uuid: str,
     expected_file_name: str = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    GET a research output from Pure and return (fileId, fileName) for the
-    FileElectronicVersion that matches expected_file_name (compared after
-    Pure-style normalization), or the first FileElectronicVersion found.
-    Returns ("", "") on failure or when no FileElectronicVersion exists.
+    GET a research output from Pure and return (fileId, file pureId, fileName)
+    for the FileElectronicVersion that matches expected_file_name (compared
+    with same_file_name), or the first FileElectronicVersion found.
+    Returns ("", "", "") on failure or when no FileElectronicVersion exists.
     """
     url = f"{base_url}research-outputs/{uuid}"
     try:
@@ -1118,16 +1302,15 @@ def get_file_info(
         resp.raise_for_status()
     except requests.HTTPError as exc:
         print(f"    ⚠️  GET file info — HTTP {exc.response.status_code} for uuid={uuid}")
-        return "", ""
+        return "", "", ""
     except requests.RequestException as exc:
         print(f"    ⚠️  GET file info — request failed for uuid={uuid}: {exc}")
-        return "", ""
+        return "", "", ""
 
     data = resp.json()
     first_file_id   = ""
     first_file_pure_id = ""
     first_file_name = ""
-    norm_expected   = pure_normalize_filename(expected_file_name) if expected_file_name else None
 
     for ev in data.get("electronicVersions", []):
         if ev.get("typeDiscriminator") != "FileElectronicVersion":
@@ -1140,7 +1323,7 @@ def get_file_info(
             first_file_id   = file_id
             first_file_pure_id = file_pure_id
             first_file_name = file_name
-        if norm_expected and pure_normalize_filename(file_name) == norm_expected:
+        if expected_file_name and same_file_name(file_name, expected_file_name):
             return file_id, file_pure_id,file_name
 
     return first_file_id, first_file_pure_id, first_file_name
@@ -1581,27 +1764,25 @@ def main():
 
             print(f"  📄 Processing file: {safe_file_name}")
 
-            # 2. Skip check — compare against Pure-normalized filename
+            # 2. Skip check — compare against the file names already in Pure
             if args.skip_existing:
-                norm_safe_file_name = pure_normalize_filename(safe_file_name)
                 # Files uploaded by the old script (before HTML-entity decoding
                 # and Unicode normalization were added) were sent to Pure as
                 # the raw unquoted name, so Pure's stored fileName may still be
                 # normalized from that uncleaned form (e.g. "Me_769_liacin.pdf"
-                # instead of "Méliacin.pdf"). Accept either normalized form so
-                # files already uploaded under the old, mangled name are still
-                # recognized and not uploaded again as duplicates.
-                norm_legacy_file_name = pure_normalize_filename(unquote(file_name))
-                acceptable_norm_names = {norm_safe_file_name, norm_legacy_file_name}
-                # Find the actual stored filename in Pure that normalizes to any accepted value
-                matched_ev_name = next(
-                    (ev.get("file", {}).get("fileName", "")
-                     for ev in pure_record.get("electronicVersions", [])
-                     if ev.get("typeDiscriminator") == "FileElectronicVersion"
-                     and pure_normalize_filename(ev.get("file", {}).get("fileName", "")) in acceptable_norm_names),
-                    None,
+                # instead of "Méliacin.pdf"). Both forms are checked, with
+                # same_file_name() (case, accents and punctuation ignored;
+                # "_NNN_" garbled names recognised), so files already uploaded
+                # under another spelling of the name are not uploaded again.
+                candidate_names = [safe_file_name, unquote(file_name)]
+                name_in_pure = any(
+                    isinstance(ev, dict)
+                    and ev.get("typeDiscriminator") == "FileElectronicVersion"
+                    and any(same_file_name((ev.get("file") or {}).get("fileName", ""), n)
+                            for n in candidate_names)
+                    for ev in pure_record.get("electronicVersions", []) or []
                 )
-                if matched_ev_name is not None:
+                if name_in_pure:
                     print(f"    ℹ️  Same filename found in Pure — checking size...")
                     known_size = None
                     if args.source == "local":
@@ -1620,29 +1801,19 @@ def main():
                             except Exception:
                                 known_size = None
 
-                    if already_has_file_ev(pure_record, file_name=matched_ev_name, file_size=known_size):
-                        # Find the matching FileEV using the actual stored name
-                        matching_ev = next(
-                            (ev for ev in pure_record.get("electronicVersions", [])
-                             if ev.get("typeDiscriminator") == "FileElectronicVersion"
-                             and ev.get("file", {}).get("fileName") == matched_ev_name),
-                            None
-                        )
-
+                    # Every Pure file with the same name is checked for the size,
+                    # not just the first one.
+                    matching_ev = find_existing_file_ev(pure_record, candidate_names, known_size)
+                    if matching_ev is not None:
                         # Look for duplicate FileElectronicVersions anywhere on this
-                        # record (same fileName + size). If the file we matched on
-                        # is one of a duplicate group, treat the chosen "keeper" as
-                        # the entry to check/update metadata on, not just whichever
-                        # duplicate happened to be found first above.
-                        dedup_changed, deduped_versions, removed_evs, kept_by_group = \
+                        # record (same file name + size, see find_duplicate_file_groups).
+                        # If the file we matched on is in a duplicate group, the
+                        # group's keeper is the entry to check/update metadata on.
+                        dedup_changed, deduped_versions, removed_evs, keeper_of = \
                             resolve_duplicate_file_versions(pure_record)
 
-                        target_ev = matching_ev
-                        if matching_ev is not None:
-                            for (dup_name, _dup_size), keeper in kept_by_group.items():
-                                if dup_name == matched_ev_name:
-                                    target_ev = keeper
-                                    break
+                        target_ev = keeper_of.get(id(matching_ev), matching_ev)
+                        matched_ev_name = (target_ev.get("file") or {}).get("fileName", "")
 
                         meta_changed, updated_ev = needs_metadata_update(target_ev, row) if target_ev else (False, None)
 
@@ -1730,10 +1901,10 @@ def main():
                             skipped_paths.append(safe_file_name)
                         else:
                             print(f"    ℹ️  Same filename and size, metadata up to date — skipping")
-                            if matching_ev:
-                                entry["pure_file_id"]      = matching_ev.get("file", {}).get("fileId", "")
-                                entry["pure_file_pure_id"] = matching_ev.get("file", {}).get("pureId", "") if matching_ev else ""
-                                entry["pure_file_name"]    = matching_ev.get("file", {}).get("fileName", "")
+                            if target_ev:
+                                entry["pure_file_id"]      = target_ev.get("file", {}).get("fileId", "")
+                                entry["pure_file_pure_id"] = target_ev.get("file", {}).get("pureId", "")
+                                entry["pure_file_name"]    = target_ev.get("file", {}).get("fileName", "")
                                 all_pure_file_ids.append(entry["pure_file_id"])
                                 all_pure_file_pure_ids.append(str(entry["pure_file_pure_id"]))
                                 all_pure_file_names.append(entry["pure_file_name"])
@@ -1946,4 +2117,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

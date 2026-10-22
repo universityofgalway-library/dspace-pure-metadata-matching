@@ -57,6 +57,7 @@ COLLECT_EXTERNAL_ORGS = False # True: attach external org data to contributors/r
 USE_TEST_ENV = False          # True: use UAT environment and test org config
 
 DSPACE_CSV                = "./dspace_data/export.csv"
+DSPACE_LOOKUP_CSV         = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"  # or None
 PURE_JSON                 = "./pure_data/research-outputs.json"
 PERSON_MAPPING_JSON       = "./mappings/persons.json"
 ORGANIZATION_MAPPING_JSON = "./mappings/organizations.json"
@@ -64,6 +65,8 @@ PUBLISHER_MAPPING_JSON    = "./pure_entities/pure_publishers.json"
 JOURNAL_MAPPING_JSON      = "./pure_entities/pure_journals.json"
 OUTPUT_DIR                = f"./record_matching/prod_all_output_{TODAY}"
 ```
+
+`DSPACE_LOOKUP_CSV` is the **full DSpace dump**, used only to *look up* DSpace items that Pure records refer to (DSpace UUID, Handle, repository DOI, collection, type, year) — its rows are never processed. Set it whenever `DSPACE_CSV` is a sample: otherwise a Pure record carrying the identifiers of an item that isn't in the sample (typically the redundant copy in the *Duplicates* collection) can't be recognised (see [Double matches and double deposits](#double-matches-and-double-deposits)). With it, a sample run looks items up exactly as a full run does. `None` = look items up in `DSPACE_CSV` only; the same file as `DSPACE_CSV` is not loaded twice; a configured file that doesn't exist stops the script. The default is the full prod dump in `match_records.py` and `None` in `match_records_v2.py` (whose `DSPACE_CSV` is already a full dump).
 
 `USE_TEST_ENV` also controls which org config file is loaded:
 - `True` → `./scripts/test_orgs_config.json`
@@ -88,6 +91,7 @@ The org config file is required and must be a JSON object with the following key
 | File | Format | Description |
 |------|--------|-------------|
 | `DSPACE_CSV` | CSV | DSpace metadata export — one record per row |
+| `DSPACE_LOOKUP_CSV` | CSV (optional) | Full DSpace dump, for lookups only (never processed) — see [Configuration](#configuration) |
 | `PURE_JSON` | JSON array | Pure research output records |
 | `PERSON_MAPPING_JSON` | JSON array | Author name → Pure person UUID mappings |
 | `ORGANIZATION_MAPPING_JSON` | JSON array | Org name → Pure org UUID mappings |
@@ -163,7 +167,12 @@ What happens then depends on whether the two DSpace items are the **same work** 
 
 **The DSpace *Duplicates* collection.** Items in the *Duplicates* collection are redundant copies of double deposits: they are never processed, and they **never own a Pure record**. When a Pure record carries the **DSpace UUID**, Handle or repository DOI of a *Duplicates* item, the *Publications* item that matches it (by publisher DOI or title, with the usual safeguards) **takes the record over**: the record is updated, and its DSpace UUID, Handle and repository DOI are **replaced** by those of the *Publications* item (the duplicate's are removed). A *Duplicates* item's DSpace UUID therefore does **not** link a record (it isn't used in step 0, and the record is a candidate in steps 1–4 like an unlinked one); it is never kept, whatever `DSPACE_UUID_PREFERENCE` says, and replacing it is not reported as a DSpace UUID mismatch. When comparing types and years for such a record, the *Duplicates* item's `dc.type` and year are used, as for a record linked by DSpace UUID. Every takeover is listed in `duplicate_takeovers_YYYY-MM-DD.csv`: `pure_uuid`, `pure_title`, `duplicate_dspace_uuid`, `duplicate_handle`, `duplicate_repository_doi`, `pure_dspace_uuids_before`, `pure_repository_ids_before`, `dspace_uuid`, `handle`, `repository_doi`, `match_type`; the status log records `duplicateTakeover`.
 
-This needs the *Duplicates* item to be in the DSpace CSV — use the full dump. If a Pure record carries the Handle or repository DOI of a DSpace item that is **not in the CSV** (e.g. a subset run), it can't be checked whether that item is a duplicate, so the row is **skipped** rather than given a new record (which could duplicate the Pure record); it is counted under *Skipped → Pure record carries the Handle / repository DOI of a DSpace item not in the CSV* and listed in `double_matches` with action `skipped (owner not in the CSV)`.
+This needs the *Duplicates* item to be known: in `DSPACE_CSV` or in `DSPACE_LOOKUP_CSV` (the full dump). Without it, a sample run can't recognise these records:
+
+- If a Pure record carries the Handle or repository DOI of a DSpace item that is in **neither** file, it can't be checked whether that item is a duplicate, so the row is **skipped** rather than given a new record (which could duplicate the Pure record); it is counted under *Skipped → Pure record carries the Handle / repository DOI of a DSpace item not in the CSV* and listed in `double_matches` with action `skipped (owner not in the CSV)`. The summary then reminds you to set `DSPACE_LOOKUP_CSV`.
+- If a Pure record carries the **DSpace UUID** of an item that is in neither file, the record counts as linked to that item, so the *Publications* twin can't reach it and **gets a new record**. At start-up the run log reports how many Pure records carry a DSpace UUID that is not in the DSpace data.
+
+With `DSPACE_LOOKUP_CSV` set to the full dump, both cases are taken over as in a full run.
 
 Every case is listed in `double_matches_YYYY-MM-DD.csv`: `pure_uuid`, `pure_title`, `first_dspace_uuid`, `first_handle`, `first_match_type` (or "record carries its Handle / repository DOI"), `dspace_uuid`, `handle`, `match_type`, `same_work`, `action`; the status log records `doubleMatch`.
 
@@ -183,6 +192,8 @@ Every case is listed in `double_matches_YYYY-MM-DD.csv`: `pure_uuid`, `pure_titl
 The DSpace item's type is the Pure type its `dc.type` maps to (an unmapped type counts as Other contribution, as for new records). On the Pure side, when the Pure record belongs to DSpace item(s) that are in the CSV, those items' `dc.type` is used — so a record created as Other contribution because its journal wasn't found doesn't distort the comparison; otherwise the Pure record's own type. Years: the Pure record's publication years plus those linked items' years. When the best fuzzy candidate is rejected, the next best that passes is used.
 
 **Publisher DOI matches** with a Pure record that already belongs to a **different** DSpace item (in the CSV or not) are only kept if the two describe the same output: the titles agree under the strict **word-level check** (see below) **and** the research output type is the same. Otherwise the DOI match is rejected — the same DOI on two different DSpace items is a data error (a DOI copied to the wrong item) or a DOI shared by several outputs (a book's DOI on its chapters, or chapter vs book). Such cases are listed in `publisher_doi_conflicts_YYYY-MM-DD.csv` and counted in the final summary. DOI matches with a Pure record that belongs to no DSpace item, or to this row's item, are unaffected.
+
+A Pure record linked **only to a *Duplicates*-collection item** (by that item's DSpace UUID, or by its Handle / repository DOI) belongs to no item and would be **taken over** by this row, so a publisher DOI match with it is only kept if the titles agree under the same **word-level check** (the output type is not checked here, since a *Duplicates* copy may carry a different `dc.type` than its *Publications* twin). This stops two different outputs that share a DOI — e.g. two conference abstracts in one journal supplement (10379/6330 and 10379/6331 share `10.1089/ten.tea.2015.5000.abstracts`) — from taking over each other's records. Such rejections are listed in `publisher_doi_conflicts` like the others.
 
 Every rejected candidate is printed in the processing log and recorded in the status log as `rejectedMatches` (`pureUUID`, `reason`).
 
@@ -209,7 +220,7 @@ Which item: the CSV row's — unless the Pure record is already linked to a **di
 | `"dspace"` (default) | The CSV row's DSpace UUID, Handle and repository DOI are written; the other item's are removed. |
 | `"pure"` | Pure's existing DSpace UUID is kept, with that item's Handle and repository DOI (taken from the CSV when the item is in it). |
 
-If that item's Handle or repository DOI isn't known (item not in the CSV, or it has none), Pure's existing ones are kept — except those the CSV shows belong to a different DSpace item; if more than one remains, a manual-review warning is printed. The status log records `dspaceUuidResolution` for every mismatch. New records always carry a single identity (the CSV row's).
+If that item's Handle or repository DOI isn't known (item in neither `DSPACE_CSV` nor `DSPACE_LOOKUP_CSV`, or it has none), Pure's existing ones are kept — except those the CSV shows belong to a different DSpace item; if more than one remains, a manual-review warning is printed. The status log records `dspaceUuidResolution` for every mismatch. New records always carry a single identity (the CSV row's).
 
 ### DSpace UUID mismatches
 
@@ -751,4 +762,4 @@ Lookup indices are built at startup for fast processing:
 - **Pure record indices:** DOIs, handles, titles → O(1) matching
 - **API caches:** person metadata and org validation results are cached after first fetch
 
-Typical throughput: ~1,000 records in 5–10 minutes with API calls enabled.
+Typical throughput: ~1,000 records in 5–10 minutes with API calls enabled.

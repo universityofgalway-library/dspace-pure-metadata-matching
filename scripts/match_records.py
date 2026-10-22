@@ -46,6 +46,16 @@ EXCLUDED_DSPACE_TYPES = {"dataset", "doctoral thesis", "master thesis"}
 
 DSPACE_CSV = "./dspace_data/prod_samples/unmatched_contributor_records_2026-10-06.csv"
 # DSPACE_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
+# Full DSpace dump used ONLY to look up DSpace items that Pure records refer to
+# (DSpace UUID, Handle, repository DOI, collection) -- its rows are never
+# processed. Needed whenever DSPACE_CSV is a sample: without it, a Pure record
+# carrying the DSpace UUID / Handle / repository DOI of an item that is not in
+# DSPACE_CSV (e.g. the redundant copy in the Duplicates collection) can't be
+# recognised, so the Publications item either skips it (owner not in the CSV)
+# or, if it carries that item's DSpace UUID, can't reach it and creates a new
+# record. With the full dump here such records are taken over exactly as in a
+# full run. None = look items up in DSPACE_CSV only.
+DSPACE_LOOKUP_CSV = "./dspace_data/all_data_prod/enriched_dspace_prod_items_2026-10-05.csv"
 PURE_JSON = "./pure_research_outputs/pure_prod_research-outputs_2026-10-06.json"
 PERSON_MAPPING_JSON = "./author_matching/prod_2026-10-05/updated_merged_prod_all_authors_enriched_2026-10-06.json"
 ORGANIZATION_MAPPING_JSON = "./pure_entities/prod_organizations_mapping_2026-10-06.json"
@@ -272,7 +282,7 @@ _duplicate_takeovers = []
 # Handle / repository DOI of such an item is taken over by the Publications
 # item that matches it, and gets that item's Handle / repository DOI instead.
 DUPLICATES_COLLECTION = "duplicates"
-OWNER_NOT_IN_CSV_ERROR = "Skipped: the Pure record carries the Handle / repository DOI of a DSpace item that is not in the CSV"
+OWNER_NOT_IN_CSV_ERROR = "Skipped: the Pure record carries the Handle / repository DOI of a DSpace item that is not in the CSV (nor in DSPACE_LOOKUP_CSV)"
 DOUBLE_DEPOSIT_ERROR = "Skipped: double deposit (the Pure record belongs to another DSpace item of the same work)"
 
 # Lookups over the whole DSpace CSV (filled in main): DSpace items by UUID,
@@ -1814,6 +1824,26 @@ def choose_repository_doi_ev(existing_evs, dspace_item_row, dspace_item_uuid, re
     return chosen
 
 
+def load_dspace_lookup_rows(lookup_csv, dspace_csv):
+    """
+    Rows of DSPACE_LOOKUP_CSV (used only to look up DSpace items, never
+    processed). [] when it isn't set or is the same file as DSPACE_CSV. A
+    configured file that doesn't exist stops the script: running without it
+    would silently skip (or duplicate) the records it is meant to fix.
+    """
+    if not lookup_csv:
+        return []
+    if os.path.abspath(lookup_csv) == os.path.abspath(dspace_csv):
+        return []
+    if not os.path.exists(lookup_csv):
+        sys.exit(f"❌ DSPACE_LOOKUP_CSV not found: {lookup_csv} — set it to the full DSpace dump, "
+                 f"or to None to look items up in DSPACE_CSV only")
+    with open(lookup_csv, 'r', encoding='utf-8-sig') as f:
+        rows = list(csv.DictReader(f))
+    print(f"✅ Loaded {len(rows)} DSpace items for lookups only from {lookup_csv}")
+    return rows
+
+
 def build_dspace_item_lookups(dspace_rows):
     """Fill _DSPACE_ITEMS from the DSpace CSV rows."""
     _DSPACE_ITEMS["by_uuid"] = {}
@@ -2313,12 +2343,35 @@ def publisher_doi_conflict(row, item, threshold):
     (title_words_agree, the strict check used for fuzzy title matches) AND
     the output types are the same. Returns a reason string, or None if there
     is no conflict. (threshold is kept for compatibility; no longer used.)
+
+    A record linked ONLY to a Duplicates-collection item (by its DSpace UUID,
+    or by its Handle / repository DOI) belongs to no item and would be taken
+    over by this row, so it must describe the same work: the titles must
+    agree at word level (title_words_agree). The output type is not checked
+    here -- a Duplicates copy may carry a different dc.type than its
+    Publications twin. Without this, two different outputs sharing a DOI
+    (e.g. two abstracts in one journal supplement) could take over each
+    other's records.
     """
     pure_uuids = owning_dspace_uuids(item)
     row_uuid = (row.get("uuid") or "").strip().lower()
-    if not pure_uuids or row_uuid in {u.lower() for u in pure_uuids}:
+    if row_uuid and row_uuid in {u.lower() for u in dspace_uuids_of(item)}:
         return None
     dspace_subtitle = (row.get("dc.title.subtitle") or row.get("dc.title.alternative") or "").strip()
+    if not pure_uuids:
+        duplicate_rows = [r for r in linked_dspace_rows(item) if is_duplicates_item(r)]
+        if not duplicate_rows:
+            return None
+        words_ok, extra_words = title_words_agree(
+            (row.get("dc.title") or "").strip(), dspace_subtitle,
+            ((item.get("title") or {}).get("value") or "").strip(),
+            ((item.get("subTitle") or {}).get("value") or "").strip(),
+        )
+        if not words_ok:
+            duplicate_ids = [(r.get("uuid") or "").strip() for r in duplicate_rows]
+            return (f"same publisher DOI, but the Pure record was created from Duplicates-collection item(s) "
+                    f"{duplicate_ids} and the titles differ (words without a counterpart: {extra_words})")
+        return None
     words_ok, extra_words = title_words_agree(
         (row.get("dc.title") or "").strip(), dspace_subtitle,
         ((item.get("title") or {}).get("value") or "").strip(),
@@ -4447,8 +4500,12 @@ def main():
             if row.get("pdf_handle_paths"):
                 row["pdf_handle_paths"] = clean_dspace_filename(row["pdf_handle_paths"])
             dspace_rows.append(row)
-    build_dspace_item_lookups(dspace_rows)
     print(f"✅ Loaded {len(dspace_rows)} records from {DSPACE_CSV}")
+    lookup_rows = load_dspace_lookup_rows(DSPACE_LOOKUP_CSV, DSPACE_CSV)
+    # Rows of DSPACE_CSV first: they take precedence over the lookup copy.
+    build_dspace_item_lookups(dspace_rows + lookup_rows)
+    if lookup_rows:
+        print(f"✅ DSpace items available for lookups (DSPACE_CSV + DSPACE_LOOKUP_CSV): {len(_DSPACE_ITEMS['by_uuid'])}")
 
     print("Loading Pure JSON...")
     with open(PURE_JSON, 'r', encoding='utf-8-sig') as f:
@@ -4500,6 +4557,16 @@ def main():
             unlinked_pure_items.append(item)
     print(f"✅ Pure records linked to a DSpace item: {len(pure_items) - len(unlinked_pure_items)} "
           f"(matched only by DSpace UUID) | without a DSpace UUID: {len(unlinked_pure_items)}")
+    unknown_linked = sum(
+        1 for item in pure_items
+        if owning_dspace_uuids(item)
+        and not any(u.lower() in _DSPACE_ITEMS["by_uuid"] for u in owning_dspace_uuids(item))
+    )
+    if unknown_linked:
+        print(f"⚠️ Pure records whose DSpace UUID is not in the DSpace data: {unknown_linked} — they can only be "
+              f"matched by that DSpace UUID; if any of them was created from a Duplicates-collection item, its "
+              f"Publications twin can't take it over and gets a new record. "
+              f"{'Set DSPACE_LOOKUP_CSV to the full DSpace dump.' if not DSPACE_LOOKUP_CSV else ''}")
     duplicates_linked = sum(1 for item in pure_items if duplicates_dspace_uuids_of(item))
     if duplicates_linked:
         print(f"ℹ️ Pure records carrying the DSpace UUID of a Duplicates-collection item: {duplicates_linked} "
@@ -5146,6 +5213,8 @@ def main():
     print(f"     ↳ No contributors in any field: {no_contributors_count}")
     print(f"     ↳ Double deposit (Pure record belongs to another DSpace item of the same work): {double_deposit_count}")
     print(f"     ↳ Pure record carries the Handle / repository DOI of a DSpace item not in the CSV: {owner_not_in_csv_count}")
+    if owner_not_in_csv_count and not DSPACE_LOOKUP_CSV:
+        print(f"       (set DSPACE_LOOKUP_CSV to the full DSpace dump so these can be checked and taken over)")
     print(f"   Matched to existing Pure record: {matched_count}")
     print(f"   Unmatched (new records created): {unmatched_new_record_count}")
     print(f"   Successfully processed: {success_count}")
@@ -5174,4 +5243,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
