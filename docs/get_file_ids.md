@@ -5,7 +5,7 @@ Matches records between a DSpace CSV export and a Pure JSON export — by DSpace
 - **per record** — one row per matched record, file columns semicolon-separated;
 - **per file** — one row per file, each DSpace file on the same row as the Pure file it matched.
 
-It also reports duplicates (several Pure records for one DSpace item) and unmatched records on both sides.
+It also reports duplicates (several Pure records for one DSpace item) and unmatched records on both sides. Optional scope filters can leave out DSpace items of certain types or keep only certain collections.
 
 The per-file output replaces the separate `reformat_csv_for_jens.py` script, which is no longer needed.
 
@@ -52,6 +52,19 @@ python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
 # Only include Handles found in a Pure XML import file
 python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
   --xml-filter sample_temp_pure_import.xml
+
+# Leave out doctoral and master theses
+python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+  --exclude-types "doctoral thesis" "master thesis"
+
+# Only include items in the Publications collection
+python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+  --collections Publications
+
+# Both: Publications items that aren't theses
+python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
+  --collections Publications \
+  --exclude-types "doctoral thesis" "master thesis"
 ```
 
 ---
@@ -68,8 +81,10 @@ python get_file_ids.py --csv dspace_export.csv --json pure_outputs.json \
 | `--pdf-filter` | No | `all` | Filter output by PDF match type — see [PDF Filter](#pdf-filter) |
 | `--handles` | No | `None` | Only include records whose Handle is in this comma-separated list — see [Handle Filter](#handle-filter) |
 | `--xml-filter` | No | `None` | Only include records whose Handle matches a record id in this Pure XML import file — see [Handle Filter](#handle-filter) |
+| `--exclude-types` | No | `None` | Leave out DSpace items whose `dc.type` is one of these types. Takes one or more values — see [Scope Filters](#scope-filters) |
+| `--collections` | No | `None` | Only include DSpace items in at least one of these collections (`collection_names`). Takes one or more values — see [Scope Filters](#scope-filters) |
 
-`--modified-by` and `--modified-after` can be combined with each other. `--handles` and `--xml-filter` can also be combined with each other (see [Handle Filter](#handle-filter)). If none of these are set, all Pure records are considered.
+`--modified-by` and `--modified-after` can be combined with each other. `--handles` and `--xml-filter` can also be combined with each other (see [Handle Filter](#handle-filter)). If none of these are set, all Pure records are considered. `--exclude-types` and `--collections` can be combined with each other and with every other filter; a record must pass all active filters to be included.
 
 ---
 
@@ -92,7 +107,9 @@ Optional columns used when present:
 |---|---|
 | `pdf_handle_paths` | Semicolon-separated paths to DSpace PDFs, e.g. `/10379/4728/1/file.pdf`. Drives file pairing against Pure file records, and supplies the sequence number and filename used to build `dspace_file_id` — see [DSpace File IDs](#dspace-file-ids). |
 | `pdf_links` | Semicolon-separated DSpace bitstream content URLs, e.g. `https://.../server/api/core/bitstreams/{uuid}/content`, aligned by position with `pdf_handle_paths`. Supplies the bitstream UUID used to build `dspace_file_id`. If missing, shorter than `pdf_handle_paths`, or a UUID can't be found in an entry, the corresponding `dspace_file_id` falls back to the raw `pdf_handle_paths` value instead of being dropped. |
-| `dc.title`, `dc.type`, `collection_names` | Copied into the [unmatched DSpace report](#unmatched-reports). |
+| `dc.title` | Copied into the [unmatched DSpace report](#unmatched-reports). |
+| `dc.type` | Copied into the unmatched DSpace report. Required when `--exclude-types` is used — see [Scope Filters](#scope-filters). |
+| `collection_names` | Copied into the unmatched DSpace report. Required when `--collections` is used — see [Scope Filters](#scope-filters). |
 
 ### Pure JSON
 
@@ -134,8 +151,9 @@ Optional fields:
 5. **A Pure record belongs to one DSpace item** and produces at most one row. A record that carries **several distinct DSpace UUIDs** (e.g. a `PrimaryId` and an `Id` with different values), or — when matched by Handle — Handles of **several DSpace items** in the CSV, is a data error: only the identifier chosen above is used, a warning is printed, and the record is listed in the [multiple DSpace IDs report](#multiple-dspace-ids). The other DSpace items it points at are not listed as unlinked in the unmatched DSpace report.
    Each **file** has its own identifier on both sides — the DSpace bitstream UUID (from `pdf_links`, see [DSpace File IDs](#dspace-file-ids)) and Pure's `fileId` / file `pureId` — these are never taken for the record's DSpace UUID.
 6. If a `--handles` and/or `--xml-filter` filter is active and the matched Handle isn't in it, the row is excluded and counted separately — see [Handle Filter](#handle-filter).
-7. On a match, identifiers and file information are collected from both records (see [File Pairing](#file-pairing) and [DSpace File IDs](#dspace-file-ids)). The `handle` value in the output is the canonical Handle URL of the matched DSpace item.
-8. Rows where any of the four core fields (`dspace_uuid`, `pure_uuid`, `pure_id`, `handle`) is empty are skipped and counted separately.
+7. If `--exclude-types` and/or `--collections` is active and the matched DSpace item is out of scope, the row is excluded and counted separately — see [Scope Filters](#scope-filters).
+8. On a match, identifiers and file information are collected from both records (see [File Pairing](#file-pairing) and [DSpace File IDs](#dspace-file-ids)). The `handle` value in the output is the canonical Handle URL of the matched DSpace item.
+9. Rows where any of the four core fields (`dspace_uuid`, `pure_uuid`, `pure_id`, `handle`) is empty are skipped and counted separately.
 
 ---
 
@@ -240,6 +258,48 @@ The filter is applied to each row's **matched** Handle (that of the DSpace item 
 
 ---
 
+## Scope Filters
+
+`--exclude-types` and `--collections` restrict output by the **DSpace item's** type and collection. Both are optional and off by default.
+
+### `--exclude-types`
+
+Leaves out DSpace items whose `dc.type` is one of the given types. Give one or more values after the option; quote a type that contains spaces:
+
+```
+--exclude-types "doctoral thesis" "master thesis"
+```
+
+### `--collections`
+
+Keeps only DSpace items that are in at least one of the given collections (`collection_names` column). Give one or more values; quote a name that contains spaces:
+
+```
+--collections Publications
+--collections Publications "Working Papers"
+```
+
+### How values are compared
+
+- **Case and whitespace are ignored:** `"Master Thesis"` matches `master  thesis` in the CSV.
+- **Several values in one field:** a `dc.type` or `collection_names` value may hold several values separated by `||` (DSpace's export separator) or `;`. An item is excluded if **any** of its types is in `--exclude-types`, and kept if **any** of its collections is in `--collections` — e.g. an item in `Datasets||Publications` passes `--collections Publications`.
+- **Repeating the option:** `--exclude-types "doctoral thesis" --exclude-types "master thesis"` is the same as listing both values after one option.
+- **Combined:** with both options, an item must be in a listed collection **and** not have an excluded type.
+
+### Applying the filters
+
+The filters are applied to the **matched DSpace item** of each row, after the [Handle Filter](#handle-filter). Excluded rows are left out of the per-record, per-file and duplicates outputs, and counted in the console output separately for each option.
+
+- The [unmatched DSpace report](#unmatched-reports) is limited to in-scope items.
+- A Pure record that matched an out-of-scope DSpace item still counts as matched, so it is **not** listed in the unmatched Pure report.
+
+### Checks
+
+- If `--exclude-types` is used and the CSV has no `dc.type` column, or `--collections` is used and it has no `collection_names` column, the script prints an error and exits with a non-zero status (rather than silently filtering nothing or everything).
+- A warning is printed for each `--collections` value that no DSpace item in the CSV is in — usually a typo.
+
+---
+
 ## Output Files
 
 All files are written next to the `--output` base path, with today's date added to the file name. The per-record, per-file and duplicates files also get the `--pdf-filter` value as a prefix. Folder paths with `/` or (on Windows) `\` both work. Files are UTF-8 **with a BOM**, so Excel shows accented characters correctly.
@@ -309,7 +369,7 @@ Identical to the per-record output, with one additional leading column:
 
 ### Unmatched DSpace items
 
-Every DSpace CSV row (with a handle) that **no Pure record links to** — neither by DSpace UUID nor by Handle — whatever the filters on the output. These are items that are missing from Pure, or whose Pure record lacks both the DSpace UUID and the Handle. The CSV contains all collections and types, so filter on `collection_names` and `dc.type` as needed.
+Every DSpace CSV row (with a handle) that **no Pure record links to** — neither by DSpace UUID nor by Handle — whatever the `--pdf-filter` on the output. These are items that are missing from Pure, or whose Pure record lacks both the DSpace UUID and the Handle. With `--exclude-types` / `--collections`, it's limited to in-scope items (see [Scope Filters](#scope-filters)); without them it covers all collections and types, so filter on `collection_names` and `dc.type` as needed.
 
 | Column | Description |
 |---|---|
@@ -370,8 +430,12 @@ Loading CSV from: dspace_export.csv
   → 15496 records with Handles loaded.
 Loading JSON from: pure_outputs.json
   → 123529 records loaded.
+  → Excluding dc.type: doctoral thesis, master thesis
+  → Only collections: publications
 Matching records by DSpace UUID, then Handle…
   → 12480 complete matches found.
+  → 640 matched records excluded by --exclude-types.
+  → 215 matched records excluded by --collections (not in any listed collection).
   → WARNING: 3 Pure record(s) carry several DSpace UUIDs (or Handles of several DSpace items) — only one is used (PrimaryId first, then Id).
   → 110950 Pure record(s) have no DSpace UUID or Handle (not DSpace records).
   → WARNING: 1 duplicate keys detected (same dspace_uuid or handle maps to multiple Pure records).
@@ -386,4 +450,4 @@ Pure records whose DSpace UUID / Handle is not in the CSV: 12 → unmatched_pure
 Pure records with several DSpace UUIDs / Handles: 3 → multiple_dspace_ids_matched_records_2026-06-09.csv
 ```
 
-The numbers above are illustrative. Lines for the `--modified-by`/`--modified-after` filter (`X records after filtering`), the Handle filter (`X handle(s) …`, `X matched records excluded by the Handle filter`), skipped rows, repeated CSV Handles and Pure records with several DSpace UUIDs / Handles only appear when they apply.
+The numbers above are illustrative. Lines for the `--modified-by`/`--modified-after` filter (`X records after filtering`), the Handle filter (`X handle(s) …`, `X matched records excluded by the Handle filter`), the scope filters (`Excluding dc.type: …`, `Only collections: …`, `X matched records excluded by --exclude-types` / `--collections`, and a warning for a collection no item is in), skipped rows, repeated CSV Handles and Pure records with several DSpace UUIDs / Handles only appear when they apply.

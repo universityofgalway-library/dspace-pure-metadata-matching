@@ -44,6 +44,18 @@ item), unmatched reports (DSpace items no Pure record links to; Pure
 records whose DSpace UUID / Handle isn't in the CSV) and the
 multiple_dspace_ids report.
 
+Scope filters on the DSpace side (both off by default):
+  --exclude-types  leave out DSpace items whose "dc.type" is one of the
+                   given types (e.g. "doctoral thesis" "master thesis").
+  --collections    keep only DSpace items in at least one of the given
+                   collections ("collection_names" column).
+Values are compared case-insensitively, with surrounding and repeated
+whitespace ignored; a field with several values (separated by "||" or ";")
+is excluded if ANY dc.type is excluded, and kept if ANY collection is
+listed. A matched record that is out of scope is left out of the main,
+per-file and duplicate outputs; an out-of-scope DSpace item is also left out
+of the unmatched DSpace report.
+
 Usage:
     python get_file_ids.py --csv input.csv --json input.json --output output.csv
     python get_file_ids.py --csv input.csv --json input.json --modified-by "john@example.com"
@@ -52,6 +64,9 @@ Usage:
     python get_file_ids.py --csv input.csv --json input.json --handles "10379/7309"
     python get_file_ids.py --csv input.csv --json input.json --handles "10379/7309,10379/1501,10379/5890"
     python get_file_ids.py --csv input.csv --json input.json --xml-filter "sample_xml.xml"
+    python get_file_ids.py --csv input.csv --json input.json --exclude-types "doctoral thesis" "master thesis"
+    python get_file_ids.py --csv input.csv --json input.json --collections Publications
+    python get_file_ids.py --csv input.csv --json input.json --collections Publications --exclude-types "doctoral thesis" "master thesis"
 """
 
 import argparse
@@ -232,6 +247,47 @@ def extract_handles_from_xml_filter(xml_path: str) -> set[str]:
         if raw_handle:
             handles.add(build_handle_url(raw_handle))
     return handles
+
+
+# Separators between values of a multi-valued DSpace CSV field ("||" is
+# DSpace's own metadata-export separator; ";" is used elsewhere in the CSV).
+_MULTI_VALUE_SPLIT_RE = re.compile(r"\|\||;")
+
+# DSpace CSV columns read by the scope filters.
+TYPE_COLUMN = "dc.type"
+COLLECTION_COLUMN = "collection_names"
+
+
+def normalize_scope_value(value: str) -> str:
+    """Compare form of a type or collection name: case-folded, whitespace collapsed."""
+    return " ".join((value or "").split()).casefold()
+
+
+def split_scope_values(field: str) -> set[str]:
+    """The normalized, non-empty values of a (possibly multi-valued) CSV field."""
+    return {
+        v for v in (normalize_scope_value(part) for part in _MULTI_VALUE_SPLIT_RE.split(field or ""))
+        if v
+    }
+
+
+def out_of_scope_reason(
+    csv_rec: dict,
+    exclude_types: set[str] | None,
+    collections: set[str] | None,
+) -> str | None:
+    """
+    Why a DSpace item is outside the --exclude-types / --collections scope,
+    or None if it is in scope. Both sets hold normalize_scope_value() forms.
+    """
+    if exclude_types:
+        hit = split_scope_values(csv_rec.get(TYPE_COLUMN, "")) & exclude_types
+        if hit:
+            return "excluded_type"
+    if collections:
+        if not split_scope_values(csv_rec.get(COLLECTION_COLUMN, "")) & collections:
+            return "collection"
+    return None
 
 
 def load_csv_records(csv_path: str) -> tuple[dict[str, dict], dict[str, dict], list[dict], int]:
@@ -701,6 +757,8 @@ def match_records(
     json_records: list[dict],
     pdf_filter: str = "all",
     handle_filter: set[str] | None = None,
+    exclude_types: set[str] | None = None,
+    collections: set[str] | None = None,
 ) -> tuple[list[dict], int, int, dict]:
     """
     Match Pure JSON records against DSpace CSV records:
@@ -728,6 +786,10 @@ def match_records(
     handle_filter, if not None, restricts output to records whose matched
     Handle URL is in the set (built from --handles and/or --xml-filter).
 
+    exclude_types / collections (normalized, see normalize_scope_value)
+    restrict output to DSpace items in scope (see out_of_scope_reason).
+    Records left out this way are counted in info["out_of_scope"].
+
     Returns (output_rows, skipped_count, filtered_out_count, info):
       info["linked_dspace_uuids"]  DSpace UUIDs (lower case) that some Pure
                                    record links to (before the Handle / PDF
@@ -746,6 +808,7 @@ def match_records(
     unmatched_pure: list[dict] = []
     no_dspace_link = 0
     multiple_dspace_ids: list[dict] = []
+    out_of_scope: dict[str, int] = defaultdict(int)
 
     for json_rec in json_records:
         record_uuid, dspace_uuids = record_dspace_uuid(json_rec)
@@ -819,6 +882,12 @@ def match_records(
                 filtered_out += 1
                 continue
 
+            # --- Apply scope filters (--exclude-types / --collections) ---
+            reason = out_of_scope_reason(csv_rec, exclude_types, collections)
+            if reason:
+                out_of_scope[reason] += 1
+                continue
+
             row, _ = _build_rows_for_pair(csv_rec, json_rec, handle_url)
 
             # --- Apply PDF filter ---
@@ -837,6 +906,7 @@ def match_records(
         "unmatched_pure": unmatched_pure,
         "no_dspace_link": no_dspace_link,
         "multiple_dspace_ids": multiple_dspace_ids,
+        "out_of_scope": dict(out_of_scope),
     }
     return output_rows, skipped, filtered_out, info
 
@@ -1076,6 +1146,33 @@ def parse_args() -> argparse.Namespace:
             "with --handles (the two sets of Handles are unioned)."
         ),
     )
+    parser.add_argument(
+        "--exclude-types",
+        nargs="+",
+        action="extend",
+        default=None,
+        metavar="TYPE",
+        dest="exclude_types",
+        help=(
+            "Leave out DSpace items whose 'dc.type' is one of these types. "
+            "Give one or more values; quote a type that contains spaces, e.g. "
+            "--exclude-types \"doctoral thesis\" \"master thesis\". Case-insensitive. "
+            "Filter is off by default."
+        ),
+    )
+    parser.add_argument(
+        "--collections",
+        nargs="+",
+        action="extend",
+        default=None,
+        metavar="COLLECTION",
+        help=(
+            "Only include DSpace items in at least one of these collections "
+            "('collection_names' column), e.g. --collections Publications. "
+            "Quote a name that contains spaces. Case-insensitive. "
+            "Filter is off by default."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1158,17 +1255,43 @@ def main() -> None:
             handle_filter |= from_xml
         print(f"  → {len(handle_filter)} handle(s) in combined filter.")
 
+    # --- Scope filters (--exclude-types / --collections) ---
+    exclude_types = {normalize_scope_value(t) for t in (args.exclude_types or [])} - {""}
+    collections = {normalize_scope_value(c) for c in (args.collections or [])} - {""}
+    csv_columns = set(csv_rows[0].keys()) if csv_rows else set()
+    for wanted, column, option in ((exclude_types, TYPE_COLUMN, "--exclude-types"),
+                                   (collections, COLLECTION_COLUMN, "--collections")):
+        if wanted and csv_rows and column not in csv_columns:
+            print(f"Error: {option} needs a '{column}' column in the CSV, which has none.",
+                  file=sys.stderr)
+            sys.exit(1)
+    if exclude_types:
+        print(f"  → Excluding dc.type: {', '.join(sorted(exclude_types))}")
+    if collections:
+        print(f"  → Only collections: {', '.join(sorted(collections))}")
+        known = set().union(*(split_scope_values(r.get(COLLECTION_COLUMN, "")) for r in csv_rows)) \
+            if csv_rows else set()
+        for c in sorted(collections - known):
+            print(f"  → WARNING: no DSpace item in the CSV is in collection '{c}'.")
+
     print("Matching records by DSpace UUID, then Handle…")
     output_rows, skipped, filtered_out, info = match_records(
         csv_by_handle, csv_by_uuid, json_records,
         pdf_filter=args.pdf_filter,
         handle_filter=handle_filter,
+        exclude_types=exclude_types or None,
+        collections=collections or None,
     )
     print(f"  → {len(output_rows)} complete matches found.")
     if skipped:
         print(f"  → {skipped} matched records skipped due to missing core fields.")
     if filtered_out:
         print(f"  → {filtered_out} matched records excluded by the Handle filter.")
+    if info["out_of_scope"].get("excluded_type"):
+        print(f"  → {info['out_of_scope']['excluded_type']} matched records excluded by --exclude-types.")
+    if info["out_of_scope"].get("collection"):
+        print(f"  → {info['out_of_scope']['collection']} matched records excluded by --collections "
+              f"(not in any listed collection).")
     if info["multiple_dspace_ids"]:
         print(f"  → WARNING: {len(info['multiple_dspace_ids'])} Pure record(s) carry several DSpace UUIDs "
               f"(or Handles of several DSpace items) — only one is used (PrimaryId first, then Id).")
@@ -1210,6 +1333,8 @@ def main() -> None:
                 continue
             handle_url = build_handle_url(row.get("handle", ""))
             if handle_filter is not None and handle_url not in handle_filter:
+                continue
+            if out_of_scope_reason(row, exclude_types or None, collections or None):
                 continue
             unmatched_dspace.append({
                 "dspace_uuid": dspace_uuid,
